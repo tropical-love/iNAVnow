@@ -1,0 +1,27 @@
+# 서버가 실행하면서 자동으로 만드는 캐시(ETF 목록·ISIN 매핑). 지워도 다시 생긴다.
+cache.json
+
+# 공개 서버로 돌릴 때 쓰는 비밀번호·포트
+.env
+
+node_modules/
+*.log
+
+# 서버가 실행 중 자기 PID를 남기는 파일 (manage.ps1이 종료 대상 확인용으로 읽음)
+server.pid
+
+# 공개 서버(GCP) 전용 인증 래퍼 — 실수로 복사돼도 커밋되지 않게 막는다
+auth.js
+
+# 안드로이드 빌드 산출물
+android/.gradle/
+android/build/
+android/app/build/
+
+# SDK 경로는 PC마다 다르다 — 각자 자기 경로로 만든다(android/README.md 참고)
+android/local.properties
+
+# 릴리스 서명 키와 비밀번호 — 유출되면 남이 같은 서명으로 앱을 만들 수 있다
+android/keystore.properties
+*.jks
+*.keystore

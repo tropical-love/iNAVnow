@@ -1,0 +1,178 @@
+// 회귀 검사 — 네트워크 없이 도는 것만. `node test.js`
+// 프레임워크를 두지 않는다. 여기 있는 건 전부 실제로 서비스를 깬 적이 있는 항목이다.
+// 인증(auth.js)은 공개 서버 전용이라 GitHub 배포판에는 없다 — 파일이 있을 때만 검사한다.
+const assert = require('assert');
+const http = require('http');
+
+process.env.ETF_PASS = 'testpass';
+const S = require('./server.js');
+let A = null;
+try { A = require('./auth.js'); } catch (e) { if (e.code !== 'MODULE_NOT_FOUND') throw e; }
+
+let n = 0;
+const ok = m => { n++; console.log('  ok', m); };
+
+// ---------- 1. 로그인 비번 파싱: 깨진 퍼센트 인코딩으로 프로세스가 죽던 자리 ----------
+if (A) {
+  assert.strictEqual(A.passOf('pass=testpass'), 'testpass');
+  assert.strictEqual(A.passOf('pass=a+b'), 'a b');
+  assert.strictEqual(A.passOf('pass=%ED%95%9C'), '한');
+  assert.strictEqual(A.passOf('pass=%'), '%');        // ← URIError를 던지던 입력
+  assert.strictEqual(A.passOf('pass=%E0%A4%A'), '%E0%A4%A');
+  assert.strictEqual(A.passOf(''), '');
+  ok('passOf가 깨진 인코딩에도 던지지 않는다');
+}
+
+// ---------- 2. 페이지 인라인 스크립트가 파싱되는지 ----------
+// 클라이언트 스크립트는 server.js의 템플릿 리터럴 안에 있어서 \n·${ 같은 것이 조용히 치환된다.
+// (실측: title 문자열에 \n을 쓰자 서버가 실제 개행으로 바꿔 스크립트 전체가 파싱 실패 → 페이지 백지.
+//  node --check server.js는 통과하므로 이 검사가 없으면 브라우저를 열어야만 알 수 있다)
+{
+  const vm = require('vm');
+  const blocks = [...S.HTML.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]);
+  assert.ok(blocks.length >= 2, `인라인 script 블록이 ${blocks.length}개뿐 — 추출 정규식을 확인할 것`);
+  blocks.forEach((src, i) => new vm.Script(src, { filename: `inline-script-${i}.js` })); // 파싱만, 실행 안 함
+  ok(`페이지 인라인 스크립트 ${blocks.length}개가 문법 오류 없이 파싱된다`);
+}
+
+// ---------- 3. cached(): 진행 중 호출 합치기 ----------
+(async () => {
+  let calls = 0;
+  const slow = () => new Promise(r => setTimeout(() => { calls++; r('v'); }, 30));
+  const rs = await Promise.all([1, 2, 3, 4, 5].map(() => S.cached('t:dedup', 1000, slow)));
+  assert.deepStrictEqual(rs, ['v', 'v', 'v', 'v', 'v']);
+  assert.strictEqual(calls, 1, `동시 5요청이 ${calls}회 호출 — 합쳐지지 않았다`);
+  ok('cached()가 동시 요청을 1회 호출로 합친다');
+
+  // 실패는 캐시하지 않는다(다음 요청이 다시 시도해야 한다)
+  let fails = 0;
+  const bad = () => { fails++; return Promise.reject(new Error('x')); };
+  await S.cached('t:fail', 1000, bad).catch(() => {});
+  await S.cached('t:fail', 1000, bad).catch(() => {});
+  assert.strictEqual(fails, 2);
+  assert.strictEqual(S.cache.get('t:fail'), undefined);
+  ok('실패한 호출은 캐시에 남지 않는다');
+
+  // ---------- 3. 공휴일 = 휴장 (라벨 + 날짜 계산 양쪽) ----------
+  const today = S.todayYmd();
+  const kst = new Date(Date.now() + 9 * 3600e3);
+  const hm = kst.getUTCHours() * 100 + kst.getUTCMinutes();
+  const weekday = kst.getUTCDay() !== 0 && kst.getUTCDay() !== 6;
+  if (weekday && hm >= 910 && hm < 1520) { // 본장 시간대에서만 검사 가능
+    S.noteKrStatus('CLOSE');
+    assert.strictEqual(S.krSession(), '휴장', '평일 본장 시간대 CLOSE인데 휴장이 아니다');
+    // 라벨만이 아니라 날짜 계산도: 오늘이 공휴일이면 isKrBiz(오늘)도 거짓이어야
+    // targetDt·nextBizYmd가 존재하지 않는 오늘 기준가를 목표로 삼지 않는다
+    assert.strictEqual(S.isKrBiz(today), false, '공휴일 판정 후에도 isKrBiz(오늘)이 참이다');
+    S.noteKrStatus('OPEN');
+    assert.strictEqual(S.krSession(), '본장');
+    assert.strictEqual(S.isKrBiz(today), true);
+    ok('본장 시간대 marketStatus=CLOSE면 라벨·날짜 계산 모두 휴장으로 본다');
+  } else {
+    S.noteKrStatus('CLOSE'); // 시간대 밖에서는 기록하지 않아야 한다
+    assert.strictEqual(S.isKrBiz(today), true, '시간대 밖 CLOSE가 오늘을 휴장으로 바꿨다');
+    ok('본장 시간대 밖의 CLOSE는 공휴일로 오판하지 않는다 (' + S.krSession() + ')');
+  }
+
+  // ---------- 3a. 달력 기반 공휴일 판정 — 시각 고정 주입 (marketStatus 창 밖에서도 잡는다) ----------
+  // 2026-06-03(수)은 실제 휴장일(지방선거), 06-04(목)은 거래일이라고 가정한 가짜 달력
+  const calSet = new Set(['20260602', '20260604']);
+  const KST = (y, mo, d, h, mi) => Date.UTC(y, mo - 1, d, h - 9, mi); // KST → UTC ms
+  const at0905 = KST(2026, 6, 3, 9, 5), at1800 = KST(2026, 6, 3, 18, 0);
+  assert.strictEqual(S.calClosedToday(calSet, at0905, at0905), null, '개장 전 달력으로 판정해버렸다');
+  assert.strictEqual(S.calClosedToday(calSet, at1800, at1800), '20260603', '공휴일 저녁인데 휴장으로 못 잡았다');
+  assert.strictEqual(S.calClosedToday(calSet, KST(2026, 6, 3, 9, 15), KST(2026, 6, 3, 15, 30)), '20260603',
+    '15:20 이후(marketStatus 창 밖)인데 휴장으로 못 잡았다');
+  const thu = KST(2026, 6, 4, 15, 30);
+  assert.strictEqual(S.calClosedToday(calSet, thu, thu), 'open', '거래일(봉 있음)을 휴장으로 오판했다');
+  const sat = KST(2026, 6, 6, 12, 0);
+  assert.strictEqual(S.calClosedToday(calSet, sat, sat), null, '주말은 판정 대상이 아니어야 한다');
+  ok('calClosedToday가 공휴일 09:05·15:30·18:00을 고정 시각으로 정확히 가른다');
+
+  // ---------- 3b. 거래일 달력이 캐시 TTL을 따라 갱신된다 (첫 로드 후 영원히 고정 금지) ----------
+  const mkDays = last => { // isKrBiz 활성화 요건(>40개)을 채우는 가짜 달력
+    const a = [];
+    for (let i = 0; i < 45; i++) a.push(String(20200101 + i));
+    a.push(last, today); // 오늘을 포함시킨다 — 빼면 calClosedToday가 오늘을 휴장으로 기록해 뒤 검사를 오염시킨다
+    return a;
+  };
+  S.cache.set('krbiz', { ts: Date.now(), ttl: 6 * 3600e3, data: mkDays('20250102') });
+  await S.loadKrDays();
+  assert.strictEqual(S.isKrBiz('20250102'), true);
+  assert.strictEqual(S.isKrBiz('20250103'), false);
+  S.cache.set('krbiz', { ts: Date.now(), ttl: 6 * 3600e3, data: mkDays('20250103') }); // 캐시 교체 = TTL 후 재조회 상황
+  await S.loadKrDays();
+  assert.strictEqual(S.isKrBiz('20250103'), true, 'loadKrDays가 첫 로드 결과에 영원히 고정돼 있다');
+  S.cache.delete('krbiz');
+  ok('loadKrDays가 매번 캐시를 거쳐 갱신을 반영한다');
+
+  // ---------- 3c. 세션 라벨 + 개장 전 등락 공백 (고정 시각 주입) ----------
+  // '휴장'은 주말·공휴일에만 — 애프터 마감 후 밤새 '휴장'으로 보이던 자리.
+  {
+    const KST2 = (d, h, mi) => Date.UTC(2026, 7, d, h - 9, mi); // 2026-08-xx KST → UTC ms
+    const lab = (d, h, mi) => S.krSession(KST2(d, h, mi));
+    assert.strictEqual(lab(4, 23, 16), '장마감', '평일 밤인데 휴장으로 나온다');  // 화 23:16 (실측 스크린샷)
+    assert.strictEqual(lab(5, 3, 0), '장마감');                                   // 수 새벽
+    assert.strictEqual(lab(5, 8, 8), 'NXT프리');                                  // 프리
+    assert.strictEqual(lab(5, 8, 55), '장전');                                    // 프리 종료~개장
+    assert.strictEqual(lab(5, 10, 0), '본장');
+    assert.strictEqual(lab(5, 16, 0), 'NXT애프터');
+    assert.strictEqual(lab(8, 12, 0), '휴장', '토요일은 휴장이어야 한다');
+    assert.strictEqual(lab(9, 12, 0), '휴장', '일요일은 휴장이어야 한다');
+    ok('세션 라벨: 휴장은 주말·공휴일만, 세션 창 밖은 장마감');
+
+    // 개장 전엔 네이버가 오늘로 넘어가 등락이 0으로 굳는다 → 0%가 아니라 표시 없음(null)
+    const basic = { closePrice: '45,225', fluctuationsRatio: '0', compareToPreviousClosePrice: '0' };
+    assert.strictEqual(S.marketPx(basic, 'NXT프리').changePct, null, '개장 전인데 0%로 표시된다');
+    assert.strictEqual(S.marketPx(basic, '장전').change, null);
+    assert.strictEqual(S.marketPx(basic, '장마감').changePct, 0, '장마감의 실제 0%까지 지웠다');
+    // 프리장에 체결이 있으면 그 등락을 쓴다
+    const preLive = { ...basic, overMarketPriceInfo: { overMarketStatus: 'OPEN', overPrice: '45,500',
+      fluctuationsRatio: '0.61', compareToPreviousClosePrice: '275' } };
+    assert.strictEqual(S.marketPx(preLive, 'NXT프리').changePct, 0.61);
+    ok('개장 전 등락은 비우고, 프리장 체결이 있으면 그 값을 쓴다');
+  }
+
+  // ---------- 4. 거래일 달력: close=null인 실거래일을 휴장으로 오판하지 않는다 ----------
+  const ts = d => Date.UTC(+d.slice(0, 4), +d.slice(5, 7) - 1, +d.slice(8, 10)) / 1000 - 32400; // 09:00 KST
+  const fixture = { // 2026-08-03(월)은 야후가 close를 비워 보낸 실거래일, 07-17(금)은 제헌절
+    chart: { result: [{ meta: { gmtoffset: 32400 },
+      timestamp: ['2026-07-16', '2026-07-20', '2026-07-31', '2026-08-03', '2026-08-04'].map(ts),
+      indicators: { quote: [{ close: [1, 2, 3, null, 4] }] } }] },
+  };
+  assert.deepStrictEqual(S.parseKrDays(fixture),
+    ['20260716', '20260720', '20260731', '20260803', '20260804']);
+  ok('parseKrDays가 close=null인 실거래일도 거래일로 센다');
+
+  // ---------- 5. 내장 Sectigo 중간 인증서가 진짜 그 인증서인지 ----------
+  // (체인 검증 자체는 Node TLS가 하므로, 여기서는 내장 PEM이 손상·교체되지 않았는지만 잠근다)
+  const { X509Certificate } = require('crypto');
+  const ca = new X509Certificate(S.SECTIGO_OV_CA);
+  assert.match(ca.subject, /CN=Sectigo RSA Organization Validation Secure Server CA/);
+  assert.match(ca.issuer, /CN=USERTrust RSA Certification Authority/);
+  assert.strictEqual(ca.fingerprint256,
+    '72:A3:4A:C2:B4:24:AE:D3:F6:B0:B0:47:55:B8:8C:C0:27:DC:CC:80:6F:DD:B2:2B:4C:D7:C4:77:73:97:3E:C0');
+  assert.ok(new Date(ca.validTo) > new Date(Date.now() + 90 * 86400e3),
+    '중간 인증서 만료 90일 전 — 잎 인증서 AIA의 crt.sectigo.com에서 새로 받아 교체할 것');
+  ok('내장 Sectigo 중간 인증서의 지문·주체·발급자가 맞다');
+
+  // ---------- 6. 인증 전 요청으로 서버가 죽지 않는다 (실제 소켓, auth.js가 있을 때만) ----------
+  if (A) {
+    await new Promise(r => A.server.listen(0, '127.0.0.1', r));
+    const port = A.server.address().port;
+    const post = body => new Promise((resolve, reject) => {
+      const rq = http.request({ host: '127.0.0.1', port, path: '/login', method: 'POST',
+        headers: { 'Content-Length': Buffer.byteLength(body) } }, rs => {
+        rs.resume(); rs.on('end', () => resolve(rs.statusCode));
+      });
+      rq.on('error', reject); rq.end(body);
+    });
+    assert.strictEqual(await post('pass=%'), 401);          // 죽지 않고 401
+    assert.strictEqual(await post('pass=testpass'), 302);   // 살아서 정상 로그인도 된다
+    ok('pass=% 요청 뒤에도 서버가 살아 있다');
+    A.server.close();
+  }
+
+  console.log(`\n${n}개 검사 통과`);
+  process.exit(0);
+})().catch(e => { console.error('\n실패:', e.message); process.exit(1); });

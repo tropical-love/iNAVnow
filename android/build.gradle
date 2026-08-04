@@ -1,0 +1,4 @@
+// 루트 빌드 스크립트 — 플러그인 버전만 선언한다(모듈은 app/build.gradle)
+plugins {
+    id 'com.android.application' version '8.5.2' apply false
+}

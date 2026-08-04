@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 액션바를 없앤다 — 웹 페이지가 자기 헤더를 그리므로 상단에 'iNAVnow' 바가 겹쳐 나왔다.
+         windowBackground은 페이지 배경변수와 같은 값 → 로딩 순간 흰 번쩍임이 없다.
+         (XML 주석 안에서는 하이픈 두 개를 쓸 수 없어 변수명을 그대로 적지 않는다) -->
+    <style name="Theme.iNAVnow" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">#f0f1f5</item>
+        <item name="android:statusBarColor">#f0f1f5</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+</resources>
