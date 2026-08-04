@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 런처가 전경을 원형·스퀘어클로 잘라내므로 가운데 66%만 안전하다.
+     원본 그림이 자기 둥근 테두리를 갖고 있어 꽉 채우면 네 귀가 잘린다 → tools/build-icon.js가
+     78% 크기로 축소해 넣은 ic_fg를 쓴다. 배경은 흰색이라 잘린 자리도 자연스럽다. -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/ic_bg" />
+    <foreground android:drawable="@drawable/ic_fg" />
+</adaptive-icon>

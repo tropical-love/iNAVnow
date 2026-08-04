@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 시스템이 다크모드일 때. 페이지의 다크 배경(#14161a)과 맞춘다.
+         (API 29+에서만 적용됨 — 그 이전에는 시스템 다크모드가 없어 values/ 쪽이 쓰인다) -->
+    <style name="Theme.iNAVnow" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#14161a</item>
+        <item name="android:statusBarColor">#14161a</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>
