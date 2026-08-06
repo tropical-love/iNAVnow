@@ -1145,7 +1145,7 @@ async function computeDomesticLev(stockCode, analysis, basic) {
   // 섹터 지수(코스피 200 정보기술 등)에는 코스피200 참고치를 붙이지 않는다 — 전혀 다른 값이다
   if (idxCode && domIndexSame(idxNm, idxLabel)) {
     try {
-      const d = await naverIndex(idxCode); // 지수·환율 카드와 같은 캐시를 쓴다(중복 호출 방지)
+      const d = await naverIndex(idxCode, krSession() === '본장'); // 지수·환율 카드와 같은 캐시
       idx = { label: idxLabel, value: num(d.closePrice), changePct: num(d.fluctuationsRatio),
         live: d.marketStatus === 'OPEN' };
     } catch (e) { /* 지수 참고치 실패는 무시 */ }
@@ -1238,7 +1238,17 @@ const NIGHT_INS = [['latest_kospi', '^KS200'], ['latest_kosdaq', '^KQ150']];
 
 // 야간선물만 25초를 지킨다 — 화면이 더 자주 물어도 이 캐시가 외부 호출을 25초에 한 번으로 묶는다
 const NIGHT_TTL = 25e3;
+// KRX 야간파생상품시장은 18:00~익일 06:00(호가 접수 17:50부터) — 그 밖의 시간에는 값이 움직이지 않으므로
+// 새로 부르지 않고 캐시에 남은 마지막 값을 쓴다. 06:00~09:00에는 그 값을 '마감'으로 계속 보여주고,
+// 09:00부터는 쓰지 않으므로 캐시가 비어 있어도 부르지 않는다.
+const nightSessionNow = () => { const hm = kstHm(); return hm >= 1750 || hm < 600; };
+
 async function nightFutures() {
+  if (!nightSessionNow()) {
+    const c = cache.get('night');
+    if (c?.data) return c.data; // 만료 여부와 무관하게 마지막 값을 그대로
+    if (kstHm() >= 900) return {};
+  }
   return cached('night', NIGHT_TTL, async () => {
     const out = {};
     let ok1 = false;
@@ -1282,8 +1292,16 @@ const nightUsable = q => !!q && Number.isFinite(q.chgPct)
 // 야간선물만 30초를 지킨다. 이 선들은 차단당하지 않는 한계로 확인된 값이라 더 줄이지 않는다.
 const IDX_TTL = LOCAL ? 8e3 : 17e3;
 const YF_TTL = 15e3;
-const naverIndex = code => cached(`idx:${code}`, IDX_TTL,
-  () => getJson(`https://m.stock.naver.com/api/index/${code}/basic`));
+// 지수는 정규장에만 움직인다 — 장외에는 새로 부르지 않고 마지막 값을 쓴다.
+// 단 장중에 받아 둔 값은 종가가 아니므로(marketStatus=OPEN) 마감 후 한 번은 다시 받아 종가로 바꾼다.
+const naverIndex = async (code, live) => {
+  const key = `idx:${code}`;
+  if (!live) {
+    const c = cache.get(key);
+    if (c?.data && c.data.marketStatus !== 'OPEN') return c.data;
+  }
+  return cached(key, IDX_TTL, () => getJson(`https://m.stock.naver.com/api/index/${code}/basic`));
+};
 
 async function marketQuotes() {
   const nf = await nightFutures();
@@ -1294,7 +1312,7 @@ async function marketQuotes() {
       return { name: futName, value: nq.value, chg: nq.chg, chgPct: nq.chgPct,
         closed: !nightLive(nq), night: true };
     }
-    const d = await naverIndex(code);
+    const d = await naverIndex(code, inMkt);
     // 등락률은 역산하지 않고 네이버가 주는 값을 그대로 쓴다(fluctuationsRatio에 부호가 들어 있다)
     const pct = num(d.fluctuationsRatio);
     return { name, value: num(d.closePrice), chg: navIdxChg(d),
