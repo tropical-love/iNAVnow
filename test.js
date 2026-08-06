@@ -133,6 +133,19 @@ if (A) {
     ok('개장 전 등락은 비우고, 프리장 체결이 있으면 그 값을 쓴다');
   }
 
+  // ---------- 3c-2. 지수 등락 부호 (하락을 상승으로 뒤집던 자리) ----------
+  // 네이버 지수 응답의 등락폭에는 부호가 이미 들어 있다. code로 한 번 더 부호를 씌우면 뒤집힌다
+  // (실측 2026-08-06 09:30 코스피 -198.43 → +198.43으로 표시됨).
+  {
+    const mk = (v, code) => ({ compareToPreviousClosePrice: v, compareToPreviousPrice: { code } });
+    assert.strictEqual(S.navIdxChg(mk('-187.08', '5')), -187.08, '하락(부호 포함)을 뒤집었다');
+    assert.strictEqual(S.navIdxChg(mk('239.31', '2')), 239.31, '상승을 잘못 바꿨다');
+    assert.strictEqual(S.navIdxChg(mk('187.08', '5')), -187.08, '절댓값으로 올 때 code 보정이 안 된다');
+    assert.strictEqual(S.navIdxChg(mk('0', '3')), 0);
+    assert.strictEqual(S.navIdxChg(mk('-1,234.56', '5')), -1234.56, '천단위 콤마를 못 읽는다');
+    ok('지수 등락 부호가 상승·하락 양쪽에서 맞는다');
+  }
+
   // ---------- 3d. 리밸런싱 감지 (편입 종목의 기준 평가액이 기준 NAV와 어긋나는 날을 알린다) ----------
   {
     const pdf = (d, jms) => ({ stdDt: d, list: jms.map(j => ({ jm: j, name: '종목' + j })) });

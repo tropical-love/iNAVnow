@@ -1146,8 +1146,8 @@ async function computeDomesticLev(stockCode, analysis, basic) {
   if (idxCode && domIndexSame(idxNm, idxLabel)) {
     try {
       const d = await cached(`idx:${idxCode}`, 10e3, () => getJson(`https://m.stock.naver.com/api/index/${idxCode}/basic`));
-      const cur = num(d.closePrice), chg = navIdxChg(d); // 등락 부호는 code에 있다(navIdxChg 참고)
-      idx = { label: idxLabel, value: cur, changePct: chg / (cur - chg) * 100, live: d.marketStatus === 'OPEN' };
+      idx = { label: idxLabel, value: num(d.closePrice), changePct: num(d.fluctuationsRatio),
+        live: d.marketStatus === 'OPEN' };
     } catch (e) { /* 지수 참고치 실패는 무시 */ }
   }
 
@@ -1219,10 +1219,13 @@ async function computeDomesticLev(stockCode, analysis, basic) {
 // 국내 지수는 네이버, 나스닥 선물·달러원은 야후. '마감' 배지 기준이 둘로 갈린다 —
 // 국내 지수는 정규장에만 움직이고(야간선물은 공개 시세가 없다), 선물·환율은 24시간 돌아가므로
 // 주말·휴장에만 값이 멈춘다. 그래서 후자는 시각으로 정하지 않고 '시세가 멈췄는지'로 본다.
-// 네이버 지수의 등락폭은 절댓값이고 부호는 compareToPreviousPrice.code에 있다(4·5 = 하락) —
-// 값만 파싱하면 하락장에서 상승으로 보인다.
-const navIdxChg = d => num(d.compareToPreviousClosePrice)
-  * (/^[45]$/.test(d.compareToPreviousPrice?.code || '') ? -1 : 1);
+// 네이버 지수의 등락폭에는 부호가 이미 들어 있다(실측 "-187.08"). 여기에 code로 다시 부호를 씌우면
+// 하락이 상승으로 뒤집힌다(실측 2026-08-06 09:30 코스피 -198 → +198). code는 값이 절댓값으로 올 때만
+// 쓰는 보정으로 두고, 부호가 이미 있으면 그대로 둔다.
+const navIdxChg = d => {
+  const v = num(d.compareToPreviousClosePrice);
+  return /^[45]$/.test(d.compareToPreviousPrice?.code || '') ? -Math.abs(v) : v;
+};
 
 // 코스피200·코스닥150 야간선물(KRX 야간시장, 대략 18:00~06:00).
 // 지켜야 할 것 — ① 캐시를 줄이지 않는다 ② 실패도 캐시해서 막혔을 때 반복해 두드리지 않는다
@@ -1280,13 +1283,14 @@ async function marketQuotes() {
     const inMkt = krSession() === '본장';
     const kr = async (code, name, nq, futName) => {
       const d = await getJson(`https://m.stock.naver.com/api/index/${code}/basic`);
-      const v = num(d.closePrice), chg = navIdxChg(d), base = v - chg;
+      // 등락률은 역산하지 않고 네이버가 주는 값을 그대로 쓴다(fluctuationsRatio에 부호가 들어 있다)
+      const v = num(d.closePrice), chg = navIdxChg(d), pct = num(d.fluctuationsRatio);
       // 정규장이 끝났고 야간선물을 쓸 수 있으면 그 카드로 갈아 보여준다(끝난 세션이면 '마감'만 붙는다)
       if (!inMkt && nightUsable(nq)) {
         return { name: futName, value: nq.value, chg: nq.chg, chgPct: nq.chgPct,
           closed: !nightLive(nq), night: true };
       }
-      return { name, value: v, chg, chgPct: base ? chg / base * 100 : null, closed: !inMkt };
+      return { name, value: v, chg, chgPct: Number.isFinite(pct) ? pct : null, closed: !inMkt };
     };
     const yf = async (sym, name) => {
       const m = (await getJson(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?range=1d&interval=5m`))
@@ -3121,6 +3125,6 @@ if (require.main === module) {
     try { fs.writeFileSync(__dirname + '/server.pid', String(process.pid)); } catch (e) {}
   });
 }
-module.exports = { server, handler, PORT, HTML, cached, cache, krSession, marketPx, notePdfSet, noteKrStatus, todayYmd, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
+module.exports = { server, handler, PORT, HTML, cached, cache, krSession, marketPx, navIdxChg, notePdfSet, noteKrStatus, todayYmd, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
 
 }
