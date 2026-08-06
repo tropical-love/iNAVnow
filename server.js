@@ -1145,7 +1145,7 @@ async function computeDomesticLev(stockCode, analysis, basic) {
   // 섹터 지수(코스피 200 정보기술 등)에는 코스피200 참고치를 붙이지 않는다 — 전혀 다른 값이다
   if (idxCode && domIndexSame(idxNm, idxLabel)) {
     try {
-      const d = await cached(`idx:${idxCode}`, 10e3, () => getJson(`https://m.stock.naver.com/api/index/${idxCode}/basic`));
+      const d = await naverIndex(idxCode); // 지수·환율 카드와 같은 캐시를 쓴다(중복 호출 방지)
       idx = { label: idxLabel, value: num(d.closePrice), changePct: num(d.fluctuationsRatio),
         live: d.marketStatus === 'OPEN' };
     } catch (e) { /* 지수 참고치 실패는 무시 */ }
@@ -1236,7 +1236,7 @@ const NIGHT_1 = 'https://moneyrecipe.blog/wp-content/uploads/data/kospi-night';
 const NIGHT_2 = 'https://yasun.gg/api/prices';
 const NIGHT_INS = [['latest_kospi', '^KS200'], ['latest_kosdaq', '^KQ150']];
 
-// 캐시는 화면 갱신 주기(MKT_MS 30초)보다 살짝 짧게 — 같게 두면 히트·미스가 엇갈려 실제 갱신이 60초로 벌어진다
+// 야간선물만 25초를 지킨다 — 화면이 더 자주 물어도 이 캐시가 외부 호출을 25초에 한 번으로 묶는다
 const NIGHT_TTL = 25e3;
 async function nightFutures() {
   return cached('night', NIGHT_TTL, async () => {
@@ -1277,36 +1277,44 @@ const nightLive = q => !!q && q.open && Date.now() - q.ts < 6 * 60e3 && Number.i
 const nightUsable = q => !!q && Number.isFinite(q.chgPct)
   && (nightLive(q) || (kstHm() < 900 && Date.now() - q.ts < 24 * 3600e3));
 
+// 카드마다 캐시를 따로 둔다 — 전체를 한 번 더 캐시하면 가장 긴 주기에 다 묶여 버린다.
+// 국내 지수는 종목 시세와 같은 선(로컬 10초·서버 20초)까지 당기고, 야후는 환율과 같은 15초,
+// 야간선물만 30초를 지킨다. 이 선들은 차단당하지 않는 한계로 확인된 값이라 더 줄이지 않는다.
+const IDX_TTL = LOCAL ? 8e3 : 17e3;
+const YF_TTL = 15e3;
+const naverIndex = code => cached(`idx:${code}`, IDX_TTL,
+  () => getJson(`https://m.stock.naver.com/api/index/${code}/basic`));
+
 async function marketQuotes() {
-  return cached('mkt', NIGHT_TTL, async () => {
-    const nf = await nightFutures();
-    const inMkt = krSession() === '본장';
-    const kr = async (code, name, nq, futName) => {
-      const d = await getJson(`https://m.stock.naver.com/api/index/${code}/basic`);
-      // 등락률은 역산하지 않고 네이버가 주는 값을 그대로 쓴다(fluctuationsRatio에 부호가 들어 있다)
-      const v = num(d.closePrice), chg = navIdxChg(d), pct = num(d.fluctuationsRatio);
-      // 정규장이 끝났고 야간선물을 쓸 수 있으면 그 카드로 갈아 보여준다(끝난 세션이면 '마감'만 붙는다)
-      if (!inMkt && nightUsable(nq)) {
-        return { name: futName, value: nq.value, chg: nq.chg, chgPct: nq.chgPct,
-          closed: !nightLive(nq), night: true };
-      }
-      return { name, value: v, chg, chgPct: Number.isFinite(pct) ? pct : null, closed: !inMkt };
-    };
-    const yf = async (sym, name) => {
-      const m = (await getJson(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?range=1d&interval=5m`))
-        .chart.result[0].meta;
-      const v = m.regularMarketPrice, prev = m.chartPreviousClose;
-      // 야후 선물은 최대 10분 지연될 수 있어 임계를 30분으로 둔다(평일 1시간 휴장도 '마감'으로 잡힌다 — 사실이다)
-      const stale = !m.regularMarketTime || Date.now() / 1000 - m.regularMarketTime > 1800;
-      return { name, value: v, chg: prev ? v - prev : null, chgPct: prev ? (v / prev - 1) * 100 : null, closed: stale };
-    };
-    const jobs = [kr('KOSPI', '코스피', nf['^KS200'], '코스피200 야간선물'), kr('KOSDAQ', '코스닥', nf['^KQ150'], '코스닥150 야간선물')]
-      .concat([['NQ=F', '나스닥 선물'], ['KRW=X', '달러/원']].map(([s, n]) => yf(s, n)));
-    const names = ['코스피', '코스닥', '나스닥 선물', '달러/원'];
-    const rs = await Promise.allSettled(jobs);
-    // 한 곳이 막혀도 나머지 카드는 살린다 — 실패분은 값 없이 자리만 지킨다
-    return rs.map((r, i) => r.status === 'fulfilled' ? r.value : { name: names[i], value: null, closed: false });
-  });
+  const nf = await nightFutures();
+  const inMkt = krSession() === '본장';
+  const kr = async (code, name, nq, futName) => {
+    // 야간선물 카드로 갈아 끼울 때는 지수를 아예 부르지 않는다(그 시간엔 값이 멈춰 있어 쓸 데가 없다)
+    if (!inMkt && nightUsable(nq)) {
+      return { name: futName, value: nq.value, chg: nq.chg, chgPct: nq.chgPct,
+        closed: !nightLive(nq), night: true };
+    }
+    const d = await naverIndex(code);
+    // 등락률은 역산하지 않고 네이버가 주는 값을 그대로 쓴다(fluctuationsRatio에 부호가 들어 있다)
+    const pct = num(d.fluctuationsRatio);
+    return { name, value: num(d.closePrice), chg: navIdxChg(d),
+      chgPct: Number.isFinite(pct) ? pct : null, closed: !inMkt };
+  };
+  const yf = async (sym, name) => {
+    const m = (await cached(`yfq:${sym}`, YF_TTL, () =>
+      getJson(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?range=1d&interval=5m`)))
+      .chart.result[0].meta;
+    const v = m.regularMarketPrice, prev = m.chartPreviousClose;
+    // 야후 선물은 최대 10분 지연될 수 있어 임계를 30분으로 둔다(평일 1시간 휴장도 '마감'으로 잡힌다 — 사실이다)
+    const stale = !m.regularMarketTime || Date.now() / 1000 - m.regularMarketTime > 1800;
+    return { name, value: v, chg: prev ? v - prev : null, chgPct: prev ? (v / prev - 1) * 100 : null, closed: stale };
+  };
+  const jobs = [kr('KOSPI', '코스피', nf['^KS200'], '코스피200 야간선물'), kr('KOSDAQ', '코스닥', nf['^KQ150'], '코스닥150 야간선물')]
+    .concat([['NQ=F', '나스닥 선물'], ['KRW=X', '달러/원']].map(([s, n]) => yf(s, n)));
+  const names = ['코스피', '코스닥', '나스닥 선물', '달러/원'];
+  const rs = await Promise.allSettled(jobs);
+  // 한 곳이 막혀도 나머지 카드는 살린다 — 실패분은 값 없이 자리만 지킨다
+  return rs.map((r, i) => r.status === 'fulfilled' ? r.value : { name: names[i], value: null, closed: false });
 }
 
 // ---------- 레버리지·인버스·합성: 기초 ETF 바스켓 × 배수로 추정 ----------
@@ -2690,9 +2698,9 @@ function showHome(){
 // ---------- 지수 · 환율 ----------
 // 국내 지수는 정규장에만 움직여 그 밖에는 '마감'이 붙고, 나스닥 선물·달러원은 24시간 돌아
 // 주말·휴장에만 붙는다(판단은 서버에서). 값은 localStorage에 남겨 홈 재진입 때 빈 칸이 없게 한다.
-// 지수·환율은 30초 주기 — 종목 화면(로컬 10초·서버 20초)과 따로 둔다. 야간선물이 남의 서비스라
-// 더 조이지 않고, 서버 캐시(25초)가 이 주기를 받쳐 외부 호출은 30초당 1회로 유지된다.
-const MKT_MS = 30000;
+// 지수·환율은 종목 화면과 같은 주기로 그린다. 실제 외부 호출 간격은 서버 캐시가 정한다 —
+// 국내 지수는 이 주기 그대로, 야후(선물·환율)는 15초, 야간선물은 25초로 각각 묶인다.
+const MKT_MS = ${REFRESH_MS};
 let MKT = null, MKTAT = 0, mktTimer = null;
 function mktStart(){
   if(!MKT){
