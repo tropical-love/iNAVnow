@@ -208,7 +208,8 @@ try {
   }
 } catch (e) {}
 // fxfix·navfix(기준환율 역산값)도 보존 — 재시작하면 표본이 사라져 아침마다 보정이 풀리던 문제
-const PERSIST_RE = /(:list$|^acefunds$|^etflist$|^krbiz$|^isin:|^tosscode:|^rise:id:|^plus:id:|^fxfix:|^navfix:|^provnav:|^fxclose:)/;
+// pdfset(전일 PDF 구성)도 보존 — 재시작하면 비교 대상이 사라져 리밸런싱을 못 잡는다
+const PERSIST_RE = /(:list$|^acefunds$|^etflist$|^krbiz$|^isin:|^tosscode:|^rise:id:|^plus:id:|^fxfix:|^navfix:|^provnav:|^fxclose:|^pdfset:)/;
 const PERSIST = k => PERSIST_RE.test(k);
 // 숨김 작업(세션 0)으로 돌면 콘솔이 없어 오류를 확인할 방법이 아예 없다 — 파일에도 남긴다.
 // 출력은 시작 로그와 오류뿐이라 거의 안 자라지만, 시작할 때 1MB를 넘으면 비운다.
@@ -846,6 +847,12 @@ function noteKrStatus(status) {
   krClosedToday = status === 'OPEN' ? null : todayYmd();
 }
 
+// KST 기준 HHMM (0930 = 9시 30분)
+const kstHm = (now = Date.now()) => {
+  const k = new Date(now + 9 * 3600e3);
+  return k.getUTCHours() * 100 + k.getUTCMinutes();
+};
+
 function krSession(now = Date.now()) { // now는 검사용 주입구 — 평소엔 시계
   // ponytail: KST 시계 기준 고정 창(NXT 프리 08:00~08:50, KRX 본장 09:00~15:30, NXT 애프터 15:30~20:00).
   const kst = new Date(now + 9 * 3600e3);
@@ -994,6 +1001,31 @@ function pdfShare(pdfList, analysis) {
   return 1 - (analysis.assetPortfolioList?.find(a => a.detailTypeCode === 'CASH')?.weight || 0) / 100;
 }
 
+// PDF 구성이 지난번과 달라졌는지 — 리밸런싱(편입·편출) 감지용.
+// 리밸런싱 당일 아침에는 PDF가 새 구성인데 기준 NAV는 아직 전날(옛 구성)이라, 새로 편입된 종목의
+// 기준 평가액과 기준 NAV의 시점이 어긋나 그 종목에서만 큰 오차가 난다.
+// 실측 2026-08-06 ACE 미국빅테크TOP7 Plus(스페이스X 편입·넷플릭스 편출): 스페이스X 추적변동 -11.6%
+// (다른 종목은 -1% 근처) → 기준 NAV가 08-06으로 갱신되자 +0.5%로 정상화.
+// 편입가를 알 방법이 없어 보정은 못 하고, 그런 날이라는 것만 알린다.
+function notePdfSet(stockCode, pdf) {
+  if (pdf.partial || !Array.isArray(pdf.list) || !pdf.stdDt) return null; // 상위10 추정은 구성이 원래 다르다
+  const codes = pdf.list.map(r => String(r.jm || '')).filter(Boolean).sort();
+  if (codes.length < 3) return null;
+  const key = `pdfset:${stockCode}`;
+  const prev = cache.get(key)?.data;
+  const cur = { d: String(pdf.stdDt), codes };
+  if (!prev || prev.d !== cur.d) {
+    cache.set(key, { ts: Date.now(), ttl: 30 * 86400e3, data: cur });
+    saveCache();
+  }
+  if (!prev || prev.d === cur.d) return null; // 처음 보는 종목이거나 같은 날짜 PDF면 비교 대상이 없다
+  const added = codes.filter(c => !prev.codes.includes(c));
+  const removed = prev.codes.filter(c => !codes.includes(c));
+  if (!added.length && !removed.length) return null;
+  const nameOf = c => pdf.list.find(r => String(r.jm) === c)?.name || c;
+  return { added: added.map(nameOf), removed, from: prev.d, to: cur.d };
+}
+
 function resolveNavRef(analysis, pdfList, extraNavs) {
   const nav = analysis.nav;
   const total = pdfList.reduce((s, r) => s + (r.valAm || 0), 0);
@@ -1133,10 +1165,10 @@ async function computeDomesticLev(stockCode, analysis, basic) {
     // ① 야간선물이 돌고 있으면 그것을 쓴다 — 이 상품 자체가 선물 기반이라 베이시스가 상쇄된다.
     //    섹터 지수에는 해당 야간선물이 없으므로 지수가 대표 지수와 같을 때만.
     const nq = nightSym && domIndexSame(idxNm, idxLabel) ? (await nightFutures())[nightSym] : null;
-    if (nightLive(nq) && Math.abs(nq.chgPct) >= 0.01) {
+    if (nightUsable(nq) && Math.abs(nq.chgPct) >= 0.01) {
       sessContrib = lev * nq.chgPct;
       inav = official * (1 + sessContrib / 100);
-      rolled = { name: idxLabel + ' 야간선물', pct: nq.chgPct, night: true, src: nq.src };
+      rolled = { name: idxLabel + ' 야간선물', pct: nq.chgPct, night: true };
     } else {
       // ② 없으면 같은 지수 1배수 ETF의 현물 바스켓으로 (선물 베이시스의 장외 변화는 못 잡는다)
       const bc = await domBaseCode(nm, stockCode, idxNm, idxLabel, base1x);
@@ -1192,16 +1224,13 @@ async function computeDomesticLev(stockCode, analysis, basic) {
 const navIdxChg = d => num(d.compareToPreviousClosePrice)
   * (/^[45]$/.test(d.compareToPreviousPrice?.code || '') ? -1 : 1);
 
-// 코스피200·코스닥150 야간선물(KRX 야간시장, 대략 18:00~05:00). 네이버·야후에 없어 외부 서비스를 쓴다.
-// 남의 서비스이므로 지켜야 할 것 — ① 캐시를 줄이지 않는다 ② 실패도 캐시해서 막혔을 때 두드리지 않는다
-// ③ 실패하면 조용히 지수+'마감'으로 되돌아간다(기능이 죽지 않는다) ④ 두 소스를 동시에 부르지 않는다
-// 1순위는 정적 JSON 두 개(합쳐 504B) — 세션 열림 여부(m.o)와 정규장 종가(p.r)를 함께 줘서
-// '정규장 이후 변동'을 추정 없이 계산할 수 있고, nginx 정적 파일이라 상대 서버에 부담이 거의 없다.
-// 막히면 yasun(값은 소수점까지 동일, 9.4KB)으로 폴백 — 레버리지 계산 입력이라 단일 실패점을 두지 않는다.
-// kred.dev도 같은 값을 주지만 현재가를 얻으려면 21KB 봉 배열이 필요하고 1분봉 경계라 최대 1분 늦어 뺐다
-// (실측 2026-08-05 22:18: 정적 JSON 1,026.55 / kred 1,027.25).
-const NIGHT_MR = 'https://moneyrecipe.blog/wp-content/uploads/data/kospi-night';
-const NIGHT_YASUN = 'https://yasun.gg/api/prices';
+// 코스피200·코스닥150 야간선물(KRX 야간시장, 대략 18:00~06:00).
+// 지켜야 할 것 — ① 캐시를 줄이지 않는다 ② 실패도 캐시해서 막혔을 때 반복해 두드리지 않는다
+// ③ 실패하면 조용히 지수+'마감'으로 되돌아간다(기능이 죽지 않는다) ④ 1순위가 답하면 2순위는 부르지 않는다
+// 1순위는 가벼운 정적 JSON 두 개(합쳐 504B) — 세션 열림 여부와 정규장 종가를 함께 줘서
+// '정규장 이후 변동'을 추정 없이 계산할 수 있다. 2순위는 형식만 다를 뿐 값은 같다.
+const NIGHT_1 = 'https://moneyrecipe.blog/wp-content/uploads/data/kospi-night';
+const NIGHT_2 = 'https://yasun.gg/api/prices';
 const NIGHT_INS = [['latest_kospi', '^KS200'], ['latest_kosdaq', '^KQ150']];
 
 // 캐시는 화면 갱신 주기(MKT_MS 30초)보다 살짝 짧게 — 같게 두면 히트·미스가 엇갈려 실제 갱신이 60초로 벌어진다
@@ -1209,35 +1238,41 @@ const NIGHT_TTL = 25e3;
 async function nightFutures() {
   return cached('night', NIGHT_TTL, async () => {
     const out = {};
-    let mrOk = false;
+    let ok1 = false;
     try {
       await Promise.all(NIGHT_INS.map(async ([file, key]) => {
-        const d = await getJson(`${NIGHT_MR}/${file}.json`);
-        mrOk = true;
+        const d = await getJson(`${NIGHT_1}/${file}.json`);
+        ok1 = true;
         const c = d.p?.c, r = d.p?.r; // c=현재가, r=정규장 종가(변동의 기준)
-        if (!d.m?.o || !(c > 0) || !(r > 0)) return; // m.o=false면 야간 세션이 닫혀 있다
+        if (!(c > 0) || !(r > 0)) return;
         out[key] = {
           value: c, chg: c - r, chgPct: (c / r - 1) * 100,
-          // m.u는 타임존 없는 KST 문자열 — 서버가 UTC(GCP)면 그냥 파싱하면 9시간 어긋난다
+          open: !!d.m?.o, // 세션이 닫혀도 마지막 값은 남긴다 — 새벽에는 그게 가장 최신이다
+          // 갱신 시각은 타임존 없는 KST 문자열 — 서버가 UTC(GCP)면 그냥 파싱하면 9시간 어긋난다
           ts: Date.parse(String(d.m.u).replace(' ', 'T') + '+09:00'),
-          src: 'moneyrecipe',
         };
       }));
     } catch (e) { /* 아래 폴백 */ }
-    if (mrOk) return out; // 1순위가 답했으면 '세션 없음'이라는 판단도 그대로 받는다
+    if (ok1) return out; // 1순위가 답했으면 '세션 없음'이라는 판단도 그대로 받는다
     try {
-      const arr = await getJson(NIGHT_YASUN);
+      const arr = await getJson(NIGHT_2);
       for (const [, key] of NIGHT_INS) {
         const r = Array.isArray(arr) ? arr.find(x => x.symbol === key) : null;
-        if (r && r.price > 0) out[key] = { value: r.price, chg: r.change, chgPct: r.changePercent, ts: r.timestamp, src: 'yasun.gg' };
+        // 이쪽은 세션 플래그가 없다 — 체결 시각이 최근이면 열린 것으로 본다
+        if (r && r.price > 0) out[key] = { value: r.price, chg: r.change, chgPct: r.changePercent,
+          ts: r.timestamp, open: Date.now() - r.timestamp < 6 * 60e3 };
       }
     } catch (e) { /* 둘 다 막히면 지수+'마감'으로 돌아간다 */ }
     return out;
   });
 }
 // 야간선물 등락의 기준값은 '당일 정규장 선물 종가'다(실측: 1,032.10 + 9.95 = 1,042.05 = 네이버 FUT 종가).
-// 그래서 chgPct를 그대로 '정규장 이후 변동률'로 쓸 수 있다. 세션 진행 여부는 마지막 체결 시각으로 본다.
-const nightLive = q => !!q && Date.now() - q.ts < 6 * 60e3 && Number.isFinite(q.chgPct);
+// 그래서 chgPct를 그대로 '정규장 이후 변동률'로 쓸 수 있다.
+const nightLive = q => !!q && q.open && Date.now() - q.ts < 6 * 60e3 && Number.isFinite(q.chgPct);
+// 세션이 끝난 뒤에도(대략 05:00~09:00) 그 마지막 값이 정규장 종가 다음으로 최신이다 —
+// 그 구간에는 값을 그대로 두고 '마감'만 붙인다. 15:30~18:00(야간 개장 전)에는 전날 밤 값이라 쓰지 않는다.
+const nightUsable = q => !!q && Number.isFinite(q.chgPct)
+  && (nightLive(q) || (kstHm() < 900 && Date.now() - q.ts < 24 * 3600e3));
 
 async function marketQuotes() {
   return cached('mkt', NIGHT_TTL, async () => {
@@ -1246,9 +1281,10 @@ async function marketQuotes() {
     const kr = async (code, name, nq, futName) => {
       const d = await getJson(`https://m.stock.naver.com/api/index/${code}/basic`);
       const v = num(d.closePrice), chg = navIdxChg(d), base = v - chg;
-      // 정규장이 끝났고 야간선물이 돌고 있으면 그 카드로 갈아 보여준다
-      if (!inMkt && nightLive(nq)) {
-        return { name: futName, value: nq.value, chg: nq.chg, chgPct: nq.chgPct, closed: false, night: true, src: nq.src };
+      // 정규장이 끝났고 야간선물을 쓸 수 있으면 그 카드로 갈아 보여준다(끝난 세션이면 '마감'만 붙는다)
+      if (!inMkt && nightUsable(nq)) {
+        return { name: futName, value: nq.value, chg: nq.chg, chgPct: nq.chgPct,
+          closed: !nightLive(nq), night: true };
       }
       return { name, value: v, chg, chgPct: base ? chg / base * 100 : null, closed: !inMkt };
     };
@@ -1399,6 +1435,7 @@ async function computeINav(stockCode, depth = 0) {
       catch (e2) { return officialOnly(stockCode, analysis, basic, e.message); }
     }
   }
+  const rebal = notePdfSet(stockCode, pdf); // 리밸런싱 감지(설명은 notePdfSet 주석에)
   // 추적 상한은 시세 조회 비용에 맞춰 국내/해외를 따로 잡는다.
   // 국내는 토스 배치 1회(정규장) → 사실상 전량 추적 가능. 해외는 야후 종목별 호출이라 상위 비중만.
   // (코스닥150 같은 국내 다종목 ETF의 반영률이 78%에 머물던 원인)
@@ -1796,7 +1833,13 @@ async function computeINav(stockCode, depth = 0) {
     // 상위10 추정처럼 정확도가 다른 경우에만 안내한다.
     note: pdf.partial
       ? `운용사 PDF를 받을 수 없어(사이트 차단) 네이버 상위 ${pdf.list.length}종목(비중 합 ${sumWg.toFixed(1)}%)으로 추정했습니다. 나머지 ${(100 - sumWg).toFixed(1)}%는 이 종목들의 평균 변동으로 외삽하므로, 상위 종목과 나머지가 다르게 움직인 날에는 오차가 큽니다.`
-      : undefined,
+      // 기준 NAV가 새 PDF보다 앞선 날짜일 때만 경고한다 — 갱신되고 나면 정상이므로 계속 띄우지 않는다
+      : rebal && dig8(navRefDateOut) < dig8(pdf.stdDt)
+        ? `구성종목이 바뀌었습니다(${rebal.from} → ${rebal.to}` +
+          (rebal.added.length ? ` · 편입 ${rebal.added.slice(0, 3).join('·')}${rebal.added.length > 3 ? ` 외 ${rebal.added.length - 3}` : ''}` : '') +
+          (rebal.removed.length ? ` · 편출 ${rebal.removed.length}종목` : '') +
+          `). 기준 NAV는 아직 ${analysis.navPerformanceReferenceDate} 기준이라 새로 편입된 종목의 기준 평가액과 시점이 어긋납니다 — 그 종목의 추적변동이 하루치만큼 부풀려져 iNAV 오차가 평소보다 큽니다. 다음 기준 NAV가 나오면 해소됩니다.`
+        : undefined,
     source: pdf.altSource || issuerKey,
     rows: rows.sort((a, b) => b.wg - a.wg).slice(0, 80),
     moreCount: Math.max(0, rows.length - 80),
@@ -3078,6 +3121,6 @@ if (require.main === module) {
     try { fs.writeFileSync(__dirname + '/server.pid', String(process.pid)); } catch (e) {}
   });
 }
-module.exports = { server, handler, PORT, HTML, cached, cache, krSession, marketPx, noteKrStatus, todayYmd, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
+module.exports = { server, handler, PORT, HTML, cached, cache, krSession, marketPx, notePdfSet, noteKrStatus, todayYmd, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
 
 }

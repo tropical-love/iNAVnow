@@ -44,6 +44,25 @@ public class MainActivity extends Activity {
                         + " @" + m.sourceId() + ":" + m.lineNumber());
                 return true;
             }
+            // WebView 기본 다이얼로그는 제목에 출처를 박는다 — 에셋을 file://로 여니
+            // "'file://' 페이지 내용:"이 그대로 보인다. 제목 없는 다이얼로그로 직접 띄운다.
+            @Override public boolean onJsAlert(WebView v, String url, String msg, android.webkit.JsResult r) {
+                new android.app.AlertDialog.Builder(MainActivity.this)
+                        .setMessage(msg)
+                        .setPositiveButton(android.R.string.ok, (d, w) -> r.confirm())
+                        .setOnCancelListener(d -> r.cancel())
+                        .show();
+                return true;
+            }
+            @Override public boolean onJsConfirm(WebView v, String url, String msg, android.webkit.JsResult r) {
+                new android.app.AlertDialog.Builder(MainActivity.this)
+                        .setMessage(msg)
+                        .setPositiveButton(android.R.string.ok, (d, w) -> r.confirm())
+                        .setNegativeButton(android.R.string.cancel, (d, w) -> r.cancel())
+                        .setOnCancelListener(d -> r.cancel()) // 뒤로가기·바깥 탭도 '취소'로 확실히 닫는다
+                        .show();
+                return true;
+            }
         });
 
         // index.html에 주입된 브리지 스크립트가 AndroidNet.request(id, spec)를 부르고,

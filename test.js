@@ -133,6 +133,24 @@ if (A) {
     ok('개장 전 등락은 비우고, 프리장 체결이 있으면 그 값을 쓴다');
   }
 
+  // ---------- 3d. 리밸런싱 감지 (편입 종목의 기준 평가액이 기준 NAV와 어긋나는 날을 알린다) ----------
+  {
+    const pdf = (d, jms) => ({ stdDt: d, list: jms.map(j => ({ jm: j, name: '종목' + j })) });
+    S.cache.delete('pdfset:TEST');
+    assert.strictEqual(S.notePdfSet('TEST', pdf('20260805', ['A', 'B', 'C'])), null, '처음 보는 종목은 비교 대상이 없다');
+    assert.strictEqual(S.notePdfSet('TEST', pdf('20260805', ['A', 'B', 'C'])), null, '같은 날짜 PDF는 비교하지 않는다');
+    const r = S.notePdfSet('TEST', pdf('20260806', ['A', 'C', 'D']));
+    assert.deepStrictEqual(r && r.added, ['종목D'], '편입 종목을 못 잡았다');
+    assert.deepStrictEqual(r && r.removed, ['B'], '편출 종목을 못 잡았다');
+    assert.strictEqual(r.from, '20260805'); assert.strictEqual(r.to, '20260806');
+    // 구성이 그대로면 날짜만 바뀌어도 리밸런싱이 아니다
+    assert.strictEqual(S.notePdfSet('TEST', pdf('20260807', ['A', 'C', 'D'])), null);
+    // 상위10 추정(partial)은 구성이 원래 다르므로 비교하지 않는다
+    assert.strictEqual(S.notePdfSet('TEST', { ...pdf('20260810', ['A']), partial: true }), null);
+    S.cache.delete('pdfset:TEST');
+    ok('notePdfSet이 PDF 편입·편출을 잡고, 같은 구성·상위10 추정은 넘긴다');
+  }
+
   // ---------- 4. 거래일 달력: close=null인 실거래일을 휴장으로 오판하지 않는다 ----------
   const ts = d => Date.UTC(+d.slice(0, 4), +d.slice(5, 7) - 1, +d.slice(8, 10)) / 1000 - 32400; // 09:00 KST
   const fixture = { // 2026-08-03(월)은 야후가 close를 비워 보낸 실거래일, 07-17(금)은 제헌절
