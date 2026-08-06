@@ -703,10 +703,12 @@ async function fxCloseSpot(cur, d8) { // d8 = '20260803'
   });
 }
 
+const fxKeyD = s => String(s || '').replace(/\D/g, '').slice(0, 8);
 // 특정 일자의 원화 환율 근사: ① 다른 ETF의 PDF에서 역산해 둔 정확값(fxfix 캐시)
 // ② 해당 통화 일봉 ③ USD 교차환율 — CNYKRW=X처럼 야후에 과거 일봉이 없는 통화가 있다(실측).
 async function fxFixOf(cur, dateStr) {
-  const hit = cache.get(`fxfix:${cur}:${dateStr}`);
+  // 키는 숫자만 남겨 통일한다 — 호출처가 '2026-08-05'와 '20260805'를 섞어 쓰면 같은 날이 다른 칸에 저장된다
+  const hit = cache.get(`fxfix:${cur}:${fxKeyD(dateStr)}`);
   if (hit && Date.now() - hit.ts < hit.ttl && hit.data) return hit.data;
   const dig = s => String(s || '').replace(/\D/g, '');
   const direct = ((await dailyCloses(`${cur}KRW=X`).catch(() => null)) || [])
@@ -755,7 +757,7 @@ async function resolveFxRef(holdings, quoteOf) {
     if (vals.length) {
       fxRef[cur] = medOf(vals); fxRefDate[cur] = chosen.date;
       // 역산한 고시환율을 날짜별로 남겨 둔다 — 평가금액이 없는 운용사(PLUS)의 기준액 합성에 재사용
-      cache.set(`fxfix:${cur}:${chosen.date}`, { ts: Date.now(), ttl: 7 * 86400e3, data: fxRef[cur] });
+      cache.set(`fxfix:${cur}:${fxKeyD(chosen.date)}`, { ts: Date.now(), ttl: 7 * 86400e3, data: fxRef[cur] });
       saveCache();
       continue;
     }
@@ -1655,9 +1657,12 @@ async function computeINav(stockCode, depth = 0) {
       if (!bar) return;
       // 환율 기준: 잠정(마감 iNAV) 프레임은 마감 15:30 시점 스팟 — 마감 이후 환율 변동이
       // 그 시점부터 측정되도록. 본장(당일 기준가) 프레임은 고시환율(다른 ETF 역산값 우선).
+      // ⚠ 기준일은 미국 종가일(bar.d)이 아니라 목표 프레임의 한국 날짜(targetD)다 —
+      // 한국 8/6 기준가는 '미국 8/5 종가 × 8/6 고시환율'로 만들어진다. bar.d로 부르면 하루 밀려
+      // 환율 변동이 통째로 어긋난다(실측 2026-08-06: 1,433.75가 잡혀 iNAV가 공식 대비 −1.2%).
       const fix = !inKrMarket
-        ? await fxCloseSpot(h.t.cur, targetD).catch(() => fxFixOf(h.t.cur, bar.d)).catch(() => null)
-        : await fxFixOf(h.t.cur, bar.d).catch(() => null);
+        ? await fxCloseSpot(h.t.cur, targetD).catch(() => fxFixOf(h.t.cur, targetD)).catch(() => null)
+        : await fxFixOf(h.t.cur, targetD).catch(() => null);
       if (fix) newRef.set(h, h.qty * bar.c * fix);
     }));
     // 일봉을 못 구한 종목이 소수(비중 2% 이하)면 그 종목만 빼고 진행 — 일시적 야후 실패로
@@ -1732,23 +1737,35 @@ async function computeINav(stockCode, depth = 0) {
   // 기준 NAV의 성격(확정 기준가 s / 마감 iNAV 잠정 p)에 따라 내포 환율이 다르므로 표본을 분리한다
   // (기준가=아침 최초고시, 마감 iNAV=15:30 스팟 — 섞으면 중앙값이 오염된다)
   const navSrc = navInfo.prov ? 'p' : 's';
+  // 표본 칸은 '한국 기준일'로 가른다. 미국 종가일(fxRefDate)로 가르면 어제와 오늘 표본이 같은 칸에
+  // 섞여, 지난 환율이 오늘 기준을 끌어당긴다(실측 2026-08-06: 1,416.6이 1,433.95로 밀려 iNAV −1.1%).
+  const navFixKey = (cur, src) => `navfix:${cur}:${dig8(navRefDateOut)}:${src}`;
   const fit = navInfo.cuShares && navInfo.cuEst ? navInfo.cuShares / navInfo.cuEst : null;
   const wgByCur = {};
   for (const h of holdings) if (h.t && h.valRef > 0) wgByCur[h.t.cur] = (wgByCur[h.t.cur] || 0) + h.wg;
   const totW = Object.values(wgByCur).reduce((s, x) => s + x, 0);
   const domCur = Object.entries(wgByCur).filter(([c]) => c !== 'KRW').sort((a, b) => b[1] - a[1])[0];
-  if (fit && Math.abs(fit - 1) < 0.015 && domCur && domCur[1] / totW > 0.9
+  // 보정에 쓸 표본은 '이번 계산 결과를 넣기 전'의 것이어야 한다. 넣고 나서 읽으면 표본이 자기 하나뿐일 때
+  // s = fit이 되어, CU 역산 오차를 그대로 기준액에 되돌려 넣는 자기참조가 된다
+  // (실측 2026-08-06 ACE 미국빅테크TOP7 Plus: 환율 기준을 고쳐도 1,433.55로 되돌아와 iNAV가 공식 대비 −1.1%).
+  const priorFix = {};
+  for (const cur of Object.keys(fxRefDate)) {
+    const rec = cache.get(navFixKey(cur, navSrc));
+    if (rec && Date.now() - rec.ts < rec.ttl && rec.data.length) priorFix[cur] = medOf(rec.data);
+  }
+  // 기준 NAV를 우리가 재구성한 경우(재앵커·지연 보정)에는 fit이 환율 차이가 아니라 그 재구성 오차를
+  // 담는다 — 그걸 표본에 넣으면 환율 보정이 엉뚱한 값을 따라간다. 공식 기준가를 그대로 쓸 때만 모은다.
+  if (fit && !navInfo.adjusted && Math.abs(fit - 1) < 0.015 && domCur && domCur[1] / totW > 0.9
       && fxRef[domCur[0]] && fxRefDate[domCur[0]]) {
-    const key = `navfix:${domCur[0]}:${fxRefDate[domCur[0]]}:${navSrc}`;
+    const key = navFixKey(domCur[0], navSrc);
     const samples = (cache.get(key)?.data || []).slice(-14);
     samples.push(fxRef[domCur[0]] * fit);
     cache.set(key, { ts: Date.now(), ttl: 7 * 86400e3, data: samples });
     saveCache();
   }
   let refit = false;
-  for (const [cur, date] of Object.entries(fxRefDate)) {
-    const rec = cache.get(`navfix:${cur}:${date}:${navSrc}`);
-    const navFix = rec && Date.now() - rec.ts < rec.ttl && rec.data.length ? medOf(rec.data) : null;
+  for (const cur of Object.keys(fxRefDate)) {
+    const navFix = priorFix[cur] ?? null;
     if (!navFix || !fxRef[cur]) continue;
     const s = navFix / fxRef[cur];
     if (Math.abs(s - 1) < 0.0005 || Math.abs(s - 1) > 0.015) continue;
