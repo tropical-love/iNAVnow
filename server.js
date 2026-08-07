@@ -2109,7 +2109,9 @@ const HTML = `<!doctype html>
   .pfbar { position: relative; height: 20px; border-radius: 6px; background: var(--soft2); overflow: hidden; margin: 8px 0 7px; }
   .pfbar i { position: absolute; inset: 0 auto 0 0; background: var(--gold); opacity: .82; border-radius: 6px; }
   .pfbar span { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
-    font-size: 11.5px; font-weight: 600; color: var(--fg); }
+    gap: 4px; font-size: 11.5px; font-weight: 600; color: var(--fg); }
+  /* 평가금액은 비중보다 한 단계 작게 — 비중이 주 정보다 */
+  .pfbar span b { font-size: 10px; font-weight: 500; opacity: .78; }
   .pfrow .dt { display: flex; justify-content: space-between; align-items: baseline; gap: 8px;
     font-size: 13px; font-variant-numeric: tabular-nums; }
   .pfrow .dt .muted { font-size: 12.5px; }
@@ -2690,9 +2692,13 @@ function startLoop(){ if(!timer) timer = setInterval(refresh, ${REFRESH_MS}); }
 function stopLoop(){ if(timer){ clearInterval(timer); timer = null; } }
 // 마지막 응답이 갱신 주기 안이면 다시 받지 않는다(있으면 그걸 그린다).
 // 재진입·탭 복귀마다 무조건 refresh()를 부르면 12초 전에 받아 둔 값이 있어도 전체를 다시 훑는다.
+// 재사용 창은 갱신 주기보다 넉넉하게 둔다 — 포트폴리오 계산은 종목당 몇 초씩 걸려서, 주기(10초)로
+// 자르면 계산이 끝날 즈음 첫 종목은 이미 만료다. 그러면 방금 받은 값을 두고 또 받게 된다.
+// 창 안이면 그 값으로 그리고 조회를 건너뛴다 — 어차피 정기 타이머가 한 주기 안에 갱신한다.
+const REUSE_MS = 60000;
 function refreshIfStale(){
   const last = dLoad(CODE);
-  if(last && last.d && Date.now() - last.at < ${REFRESH_MS}){
+  if(last && last.d && Date.now() - last.at < REUSE_MS){
     if(!D){ D = last.d; render(); }
     return;
   }
@@ -2960,7 +2966,8 @@ function pfRender(){
           '<button type="button" title="삭제" onclick="pfDel('+i+')">'+ICON_DEL+'</button>'+
         '</span></div>'+
       '<div class="pfbar" title="'+(r.val!=null?bLbl:'원금')+' 기준 비중 '+fmt(w,1)+'%">'+
-        '<i style="width:'+w.toFixed(1)+'%"></i><span>'+fmt(w,1)+'%</span></div>'+
+        '<i style="width:'+w.toFixed(1)+'%"></i><span>'+fmt(w,1)+'%'+
+        (mine!=null ? '<b>('+fmt(mine,0)+')</b>' : '')+'</span></div>'+
       '<div class="dt"><span class="muted">'+fmt(r.h.qty,0)+'주 · 평균 '+fmt(r.h.avg,dp(r.h.avg))+'원'+
         (r.unit!=null ? ' → '+bLbl+' '+fmt(r.unit,dp(r.unit))+'원' : '')+'</span>'+
         '<span class="'+(d!=null?cls(d):'muted')+'">'+
@@ -2979,8 +2986,13 @@ async function pfCalc(){
   for(let i=0;i<PF.length;i++){
     const h = PF[i];
     try {
-      const d = await (await fetch('/api/inav?code='+encodeURIComponent(h.code))).json();
+      // 종목 페이지가 갱신 주기 안에 받아 둔 게 있으면 그대로 쓴다 — 같은 응답을 두 번 받지 않는다
+      const cached = dLoad(h.code);
+      const fresh = cached && cached.d && Date.now() - cached.at < REUSE_MS;
+      const d = fresh ? cached.d : await (await fetch('/api/inav?code='+encodeURIComponent(h.code))).json();
       if(d && d.inav != null) PFV[h.code] = { inav: d.inav, price: d.marketPrice };
+      // 반대로 여기서 받은 응답도 남긴다 — 이 종목을 눌러 들어가면 다시 받지 않는다
+      if(!fresh && d && d.inav != null) dSave(h.code, d);
       if(!pfBPinned && d && d.krSession) PFB = pfDefBasis(d.krSession); // 공휴일 교정
       if(d && d.etfName && d.etfName !== h.name){ h.name = d.etfName; pfSet(PF); } // 운용사 개명 반영
     } catch(e){ /* 한 종목 실패가 나머지 계산을 막지 않는다 */ }
