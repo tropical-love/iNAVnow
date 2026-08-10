@@ -200,17 +200,20 @@ const fs = NODE ? require('fs') : null;
 const CACHE_FILE = NODE ? __dirname + '/cache.json' : null;
 const CACHE_LS = 'engineCache';
 const cache = new Map(); // key -> {ts, ttl, data}
+// fxfix·navfix(기준환율 역산값)도 보존 — 재시작하면 표본이 사라져 아침마다 보정이 풀리던 문제
+// pdfset(전일 PDF 구성)도 보존 — 재시작하면 비교 대상이 사라져 리밸런싱을 못 잡는다
+// ⚠ 선언이 아래 로드 코드보다 뒤에 있으면 TDZ ReferenceError가 catch에 삼켜져 캐시가 통째로
+// 로드되지 않는다(실측 2026-08-10: 디스크에 39개가 있는데 메모리는 0개 — 앱이 켤 때마다 PDF를
+// 다시 받던 원인). 반드시 로드보다 위에 둔다.
+const PERSIST_RE = /(:list$|^acefunds$|^etflist$|^krbiz$|^pdf:|^blk:|^isin:|^tosscode:|^rise:id:|^plus:id:|^fxfix:|^navfix:|^provnav:|^fxclose:|^pdfset:)/;
+const PERSIST = k => PERSIST_RE.test(k);
 try {
   const raw = NODE ? fs.readFileSync(CACHE_FILE, 'utf8') : localStorage.getItem(CACHE_LS);
   // 만료된 단기 캐시는 싣지 않는다 — 안 그러면 저장분이 계속 자라 용량 한계에 부딪힌다
   if (raw) for (const [k, v] of Object.entries(JSON.parse(raw))) {
     if (PERSIST_RE.test(k) || Date.now() - v.ts < v.ttl) cache.set(k, v);
   }
-} catch (e) {}
-// fxfix·navfix(기준환율 역산값)도 보존 — 재시작하면 표본이 사라져 아침마다 보정이 풀리던 문제
-// pdfset(전일 PDF 구성)도 보존 — 재시작하면 비교 대상이 사라져 리밸런싱을 못 잡는다
-const PERSIST_RE = /(:list$|^acefunds$|^etflist$|^krbiz$|^pdf:|^blk:|^isin:|^tosscode:|^rise:id:|^plus:id:|^fxfix:|^navfix:|^provnav:|^fxclose:|^pdfset:)/;
-const PERSIST = k => PERSIST_RE.test(k);
+} catch (e) { console.error('캐시 로드 실패:', e.message); } // 조용히 삼키면 위와 같은 버그를 못 본다
 // 숨김 작업(세션 0)으로 돌면 콘솔이 없어 오류를 확인할 방법이 아예 없다 — 파일에도 남긴다.
 // 출력은 시작 로그와 오류뿐이라 거의 안 자라지만, 시작할 때 1MB를 넘으면 비운다.
 // isTTY로 숨김 실행만 골라내려 했지만 세션 0에서도 참으로 나와 로그가 안 남았다 — 그냥 항상 남긴다.
@@ -586,8 +589,10 @@ const issuerBlocked = key => {
 function noteIssuerFail(key, err) {
   if (!key) return;
   const m = String(err && err.message || '');
-  const hard = /\b(40[13]|429|503)\b|cloudflare|just a moment/i.test(m);
-  cache.set(`blk:${key}`, { ts: Date.now(), ttl: hard ? 24 * 3600e3 : 600e3, data: m.slice(0, 120) });
+  // 잠깐 끊긴 것(타임아웃·연결 리셋·DNS)만 10분 쉬고, 그 밖의 실패는 하루 쉰다.
+  // 차단은 403·429뿐 아니라 빈 응답·형식 변경 등 여러 모습으로 오기 때문에 이쪽을 기본으로 둔다.
+  const soft = /타임아웃|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|socket hang up|aborted/i.test(m);
+  cache.set(`blk:${key}`, { ts: Date.now(), ttl: soft ? 600e3 : 24 * 3600e3, data: m.slice(0, 120) });
   saveCache();
 }
 
@@ -1466,13 +1471,14 @@ async function computeINav(stockCode, depth = 0) {
   }
 
   const [issuerKey, adapter] = adapterOf(analysis.issuerName);
-  let pdf;
+  let pdf, skipped = false;
   try {
     if (!adapter) throw new Error(`지원하지 않는 운용사: ${analysis.issuerName || '알 수 없음'}`);
-    if (issuerBlocked(issuerKey)) throw new Error(`${issuerKey} 오늘 차단됨 — 폴백 사용`);
+    if (issuerBlocked(issuerKey)) { skipped = true; throw new Error(`${issuerKey} 오늘 차단됨 — 폴백 사용`); }
     pdf = await adapter.pdf(stockCode);
   } catch (e) {
-    noteIssuerFail(issuerKey, e); // 차단성 실패면 오늘은 더 두드리지 않는다
+    // 건너뛰어서 던진 것까지 다시 기록하면 차단 기한이 매번 새로 쓰여(24시간 → 10분) 계속 재시도한다
+    if (!skipped) noteIssuerFail(issuerKey, e);
     // 폴백은 기초 ETF를 계산하는 중(depth 1)에도 필요하다. 예전엔 여기서 바로 throw해서
     // 레버리지 상품의 기초가 KODEX면 운용사 차단 한 번에 전체가 에러로 끝났다.
     // ① FunETF — 전 운용사 전체 PDF(실제 구성종목). 운용사 API와 같은 품질이라 최우선 대체.
