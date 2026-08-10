@@ -72,6 +72,32 @@ const SHIM = BRIDGE + `<script src="engine.js"></script>
       if(s.startsWith('/api/inav'))  return J(await ENGINE.computeINav(q.get('code') || ENGINE.DEFAULT_CODE));
       if(s.startsWith('/api/etfs'))  return J(await ENGINE.etfList());
       if(s.startsWith('/api/market'))return J(await ENGINE.marketQuotes());
+      if(s.startsWith('/api/pdfinfo')){ // 하루치 자료 상태 / 수동 초기화
+        const C = ENGINE.cache;
+        if(q.get('clear') === '1'){
+          let n = 0;
+          for(const k of [...C.keys()]) if(/^(pdf:|blk:)/.test(k)){ C.delete(k); n++; }
+          ENGINE.saveCache();
+          return J({cleared: n});
+        }
+        const items = [];
+        for(const [k, v] of C) if(k.startsWith('pdf:')) items.push({at: v.ts, stdDt: (v.data && v.data.stdDt) || null});
+        const blocked = [...C.keys()].filter(function(k){ return k.startsWith('blk:') && ENGINE.issuerBlocked(k.slice(4)); }).map(function(k){ return k.slice(4); });
+        return J({
+          count: items.length,
+          oldest: items.length ? Math.min.apply(null, items.map(function(x){ return x.at; })) : null,
+          newest: items.length ? Math.max.apply(null, items.map(function(x){ return x.at; })) : null,
+          dates: [...new Set(items.map(function(x){ return x.stdDt; }).filter(Boolean))].sort(),
+          ttlMs: ENGINE.PDF_TTL, blocked: blocked,
+        });
+      }
+      if(s.startsWith('/api/px')){ // ETF 자체 시세만 (포트폴리오 현재가 빠른 갱신)
+        const cs = (q.get('codes')||'').split(',').filter(function(c){ return /^[0-9A-Z]{6}$/.test(c); }).slice(0,30);
+        const m = cs.length ? await ENGINE.krQuotes(cs) : {};
+        return J(Object.fromEntries(cs.map(function(c){
+          return [c, m[c] ? {price:m[c].last, prev:m[c].prevClose, session:m[c].session} : null];
+        })));
+      }
       if(s.startsWith('/api/stats')) return J(ENGINE.stats);
       if(s.startsWith('/api/pf'))    return E('이 앱은 포트폴리오를 기기에 저장합니다', 404); // 로컬 저장으로 유도
     } catch(e){ return E(e.message); }

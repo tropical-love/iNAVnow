@@ -209,7 +209,7 @@ try {
 } catch (e) {}
 // fxfix·navfix(기준환율 역산값)도 보존 — 재시작하면 표본이 사라져 아침마다 보정이 풀리던 문제
 // pdfset(전일 PDF 구성)도 보존 — 재시작하면 비교 대상이 사라져 리밸런싱을 못 잡는다
-const PERSIST_RE = /(:list$|^acefunds$|^etflist$|^krbiz$|^isin:|^tosscode:|^rise:id:|^plus:id:|^fxfix:|^navfix:|^provnav:|^fxclose:|^pdfset:)/;
+const PERSIST_RE = /(:list$|^acefunds$|^etflist$|^krbiz$|^pdf:|^blk:|^isin:|^tosscode:|^rise:id:|^plus:id:|^fxfix:|^navfix:|^provnav:|^fxclose:|^pdfset:)/;
 const PERSIST = k => PERSIST_RE.test(k);
 // 숨김 작업(세션 0)으로 돌면 콘솔이 없어 오류를 확인할 방법이 아예 없다 — 파일에도 남긴다.
 // 출력은 시작 로그와 오류뿐이라 거의 안 자라지만, 시작할 때 1MB를 넘으면 비운다.
@@ -293,7 +293,10 @@ async function findSiblingCode(nm, selfCode) {
   return f ? f.code : null;
 }
 
-const getAnalysis = code => cached(`an:${code}`, 300e3,
+// PDF는 하루 한 번 갱신되는 자료다. 10분으로 두면 5분 주기 포트폴리오 계산에서 두 번째마다 다시 받고,
+// 운용사 사이트가 느려 그때마다 홈이 2.5초 → 13초로 늘어난다(실측 2026-08-06).
+const PDF_TTL = 60 * 60e3;
+const getAnalysis = code => cached(`an:${code}`, 30 * 60e3,
   () => getJson(`https://m.stock.naver.com/api/stock/${code}/etfAnalysis`));
 
 // 기초지수 이름에서 배수·표기 차이를 걷어내 비교용 열쇠로 만든다
@@ -348,7 +351,7 @@ const ADAPTERS = {
   ace: {
     async pdf(stockCode) {
       const fund = await fundCdOf(stockCode);
-      const pdf = await cached(`pdf:ace:${fund.fundCd}`, 600e3, () =>
+      const pdf = await cached(`pdf:ace:${fund.fundCd}`, PDF_TTL, () =>
         getJson(`https://papi.aceetf.co.kr/api/funds/${fund.fundCd}/pdf?page=1&size=100`));
       return {
         fundNm: fund.fundNm, stdDt: pdf.std_DT,
@@ -375,7 +378,7 @@ const ADAPTERS = {
       });
       const f = list.find(x => x.stkTicker === stockCode);
       if (!f) throw new Error(`KODEX 목록에 ${stockCode} 없음`);
-      const d = await cached(`pdf:kodex:${f.fId}`, 600e3, () =>
+      const d = await cached(`pdf:kodex:${f.fId}`, PDF_TTL, () =>
         getJson(`https://www.samsungfund.com/api/v1/kodex/product-pdf/${f.fId}.do?gijunYMD=${todayYmd('.')}`));
       return {
         fundNm: f.fNm, stdDt: d.pdf.gijunYMD,
@@ -405,7 +408,7 @@ const ADAPTERS = {
       });
       const f = list.find(x => x.ETF_CD6 === stockCode);
       if (!f) throw new Error(`SOL 목록에 ${stockCode} 없음`);
-      const d = await cached(`pdf:sol:${f.FUND_CD}`, 600e3, () =>
+      const d = await cached(`pdf:sol:${f.FUND_CD}`, PDF_TTL, () =>
         getJson(`https://www.soletf.com/api/etf/pds/pdf/${f.FUND_CD}`));
       return {
         fundNm: d.fundName || f.ETF_NAME, stdDt: d.workDt,
@@ -425,7 +428,7 @@ const ADAPTERS = {
       const list = await cached('kiwoom:list', 86400e3, () =>
         kiwoomPostJson('https://www.kiwoometf.com/service/main/productListAjax', ''));
       const f = (list.products || []).find(x => x.gcode === stockCode);
-      const d = await cached(`pdf:kiwoom:${stockCode}`, 600e3, () =>
+      const d = await cached(`pdf:kiwoom:${stockCode}`, PDF_TTL, () =>
         kiwoomPostJson('https://www.kiwoometf.com/service/etf/KO02010200MAjax4', `schGubun1=${stockCode}&startDate=${todayYmd()}`));
       if (!d.pdfList || !d.pdfList.length) throw new Error(`KIWOOM PDF 없음 (${stockCode})`);
       return {
@@ -445,7 +448,7 @@ const ADAPTERS = {
   tiger: { // 미래에셋자산운용 (investments.miraeasset.com) — HTML 조각 응답, 내부ID=국내 ISIN
     async pdf(stockCode) {
       const ksd = krIsin(stockCode);
-      const html = await cached(`pdf:tiger:${ksd}`, 600e3, () =>
+      const html = await cached(`pdf:tiger:${ksd}`, PDF_TTL, () =>
         getText(`https://investments.miraeasset.com/tigeretf/ko/product/search/detail/pdfListAjax.ajax?ksdFund=${ksd}&listCnt=9999`));
       const list = parseTrRows(html)
         .filter(r => r.length >= 5 && r[0] && !/^(KRD|CASH)/.test(r[0]))
@@ -469,7 +472,7 @@ const ADAPTERS = {
         return m ? m[1] : null;
       });
       if (!fundCd) throw new Error(`RISE 목록에 ${stockCode} 없음`);
-      const html = await cached(`pdf:rise:${fundCd}`, 600e3, () =>
+      const html = await cached(`pdf:rise:${fundCd}`, PDF_TTL, () =>
         postText('https://www.riseetf.co.kr/prod/finder/productViewSearchTabJquery3', `fundCd=${fundCd}&searchDate=`));
       const list = parseTrRows(html)
         .filter(r => r.length >= 5 && r[1] && !/^(CASH|KRD)/.test(r[1]))
@@ -486,7 +489,7 @@ const ADAPTERS = {
 
   oneq: { // 하나자산운용 (1qetf.com) — 코스콤 F-필드 포맷, etf_code=단축코드 직통
     async pdf(stockCode) {
-      const d = await cached(`pdf:1q:${stockCode}`, 600e3, () =>
+      const d = await cached(`pdf:1q:${stockCode}`, PDF_TTL, () =>
         postJson('https://www.1qetf.com/pages/ETFproducts/ajax/process.php', `mode=get.pdf&etf_code=${stockCode}`));
       if (!d.success || !d.results || !d.results.length) throw new Error(`1Q PDF 없음 (${stockCode})`);
       return {
@@ -511,7 +514,7 @@ const ADAPTERS = {
         return (d.content || []).find(x => x.nameCode === stockCode) || null;
       });
       if (!found) throw new Error(`PLUS 목록에 ${stockCode} 없음`);
-      const d = await cached(`pdf:plus:${found.id}`, 600e3, () =>
+      const d = await cached(`pdf:plus:${found.id}`, PDF_TTL, () =>
         getJson(`https://www.plusetf.co.kr/api/v1/product/pdf/list?n=${found.id}&page=0&d=${todayYmd()}&pageSize=1000`));
       return {
         fundNm: found.displayName, stdDt: d.content?.[0]?.wkdate,
@@ -527,7 +530,7 @@ const ADAPTERS = {
 // 페이지에서 _csrf 토큰과 기준일을 뽑아 같은 세션 쿠키로 API를 호출해야 한다(토큰 없이 부르면 빈 배열).
 async function funetfPdf(stockCode) {
   const isin = krIsin(stockCode);
-  return cached(`pdf:funetf:${isin}`, 600e3, async () => {
+  return cached(`pdf:funetf:${isin}`, PDF_TTL, async () => {
     const pageUrl = `https://www.funetf.co.kr/product/etf/view/${isin}`;
     const res = await fetchOrThrow(pageUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
     if (!res.ok) throw new Error(`${res.status} funetf page`);
@@ -571,6 +574,21 @@ async function naverTop10Pdf(stockCode, analysis) {
     .filter(r => r.qty > 0 && r.wg > 0);
   if (!list.length) throw new Error('네이버 상위10으로도 추적 불가(해외형·채권형)');
   return { fundNm: '', stdDt: analysis.navPerformanceReferenceDate || '-', list, partial: true };
+}
+
+// 운용사 사이트가 막혀 있으면(이 PC 한국 IP에서 KODEX가 Cloudflare에 걸린다) 매 조회마다 실패를
+// 되풀이해 호출과 대기 시간만 쓴다. 차단성 실패는 그날 하루 기억하고 곧바로 폴백으로 간다.
+// 일시적 네트워크 오류(타임아웃 등)는 10분만 쉬어, 잠깐 끊긴 것을 하루치로 오판하지 않는다.
+const issuerBlocked = key => {
+  const r = cache.get(`blk:${key}`);
+  return !!(r && Date.now() - r.ts < r.ttl);
+};
+function noteIssuerFail(key, err) {
+  if (!key) return;
+  const m = String(err && err.message || '');
+  const hard = /\b(40[13]|429|503)\b|cloudflare|just a moment/i.test(m);
+  cache.set(`blk:${key}`, { ts: Date.now(), ttl: hard ? 24 * 3600e3 : 600e3, data: m.slice(0, 120) });
+  saveCache();
 }
 
 function adapterOf(issuerName) {
@@ -1451,8 +1469,10 @@ async function computeINav(stockCode, depth = 0) {
   let pdf;
   try {
     if (!adapter) throw new Error(`지원하지 않는 운용사: ${analysis.issuerName || '알 수 없음'}`);
+    if (issuerBlocked(issuerKey)) throw new Error(`${issuerKey} 오늘 차단됨 — 폴백 사용`);
     pdf = await adapter.pdf(stockCode);
   } catch (e) {
+    noteIssuerFail(issuerKey, e); // 차단성 실패면 오늘은 더 두드리지 않는다
     // 폴백은 기초 ETF를 계산하는 중(depth 1)에도 필요하다. 예전엔 여기서 바로 throw해서
     // 레버리지 상품의 기초가 KODEX면 운용사 차단 한 번에 전체가 에러로 끝났다.
     // ① FunETF — 전 운용사 전체 PDF(실제 구성종목). 운용사 API와 같은 품질이라 최우선 대체.
@@ -2261,6 +2281,14 @@ const HTML = `<!doctype html>
     <label><input type="checkbox" id="showinav"> 타이틀에 현재 iNAV 표시</label>
     <div class="hint">갱신될 때마다 제목 뒤에 <b>_숫자</b>로 붙습니다(종목명 미표시 모드 제외).</div>
   </div>
+  <div class="sec">
+    <div class="muted">구성종목 자료(PDF)</div>
+    <div class="row" style="gap:10px">
+      <span class="hint" id="pdfinfo" style="margin:0">확인 중…</span>
+      <button type="button" id="pdfrf" onclick="pdfReload()">지금 다시 받기</button>
+    </div>
+    <div class="hint">운용사가 하루 한 번 올리는 자료라 오래 들고 있습니다. 리밸런싱이 늦게 반영됐을 때만 눌러 주세요.</div>
+  </div>
 </div></dialog>
 <dialog id="pfdlg"><form class="dlg" method="dialog" onsubmit="return pfSave()">
   <div class="row"><h2 id="pfdlgh">포트폴리오 추가</h2><button type="button" class="x" onclick="pfdlg.close()">✕</button></div>
@@ -2425,7 +2453,32 @@ function syncCfgUI(){
   si.checked = CFG.showInav && CFG.titleMode!=='noname';
   si.disabled = CFG.titleMode === 'noname';
 }
-function openCfg(){ syncCfgUI(); document.getElementById('cfgdlg').showModal(); }
+function openCfg(){ syncCfgUI(); document.getElementById('cfgdlg').showModal(); pdfInfo(); }
+// 하루 한 번만 받는 자료(구성종목 PDF)의 상태. 리밸런싱이 늦게 올라온 날 손으로 새로 받을 수 있게 한다.
+async function pdfInfo(){
+  const el = document.getElementById('pdfinfo');
+  el.textContent = '확인 중…';
+  try {
+    const d = await (await fetch('/api/pdfinfo')).json();
+    if(!d.count){ el.textContent = '아직 받은 자료가 없습니다.'; return; }
+    const mins = Math.round((Date.now() - d.newest) / 60000);
+    const ago = mins < 1 ? '방금' : mins < 60 ? mins+'분 전' : Math.floor(mins/60)+'시간 '+(mins%60)+'분 전';
+    el.textContent = d.count+'종목 · 마지막 수신 '+ago
+      + (d.dates.length ? ' · 기준일 '+d.dates.join(', ') : '')
+      + (d.blocked.length ? ' · 오늘 차단: '+d.blocked.join(',') : '');
+  } catch(e){ el.textContent = '상태를 읽지 못했습니다.'; }
+}
+async function pdfReload(){
+  const btn = document.getElementById('pdfrf'), el = document.getElementById('pdfinfo');
+  btn.disabled = true; el.textContent = '지우는 중…';
+  try {
+    await fetch('/api/pdfinfo?clear=1');
+    el.textContent = '지웠습니다. 다음 조회 때 새로 받습니다.';
+    // 화면에 보이는 값도 새로 받게 한다(홈이면 포트폴리오, 종목 화면이면 그 종목)
+    if(HOME){ PFCAT = null; if(typeof pfCalc === 'function') pfCalc(); } else { refresh(); }
+  } catch(e){ el.textContent = '초기화에 실패했습니다.'; }
+  btn.disabled = false;
+}
 document.getElementById('theme').onchange = function(){ CFG.theme = this.value; saveCfg(); };
 [...document.querySelectorAll('input[name=tm]')].forEach(r=>{
   r.onchange = function(){ CFG.titleMode = r.value; saveCfg(); if(r.value==='office') document.getElementById('otitle').focus(); };
@@ -2835,24 +2888,27 @@ let PF = PF_REMOTE ? [] : pfLocal();
 let PF_OK = !PF_REMOTE; // 서버 저장을 실제로 쓸 수 있는지
 let PF_DOWN = '';    // 서버 모드에서 목록을 못 불러온 상태 — 편집을 막는다(빈 목록으로 덮어쓰면 원본이 날아간다)
 let PFV = {};        // code → 최근 계산한 {inav, price}
-let PFAT = null;     // 계산 기준 시각
+let PFAT = null;     // 화면에 보이는 기준 시각(현재가만 갱신해도 움직인다)
+let PFCAT = null;    // iNAV 전체 계산 시각 — 재계산 판단은 이걸로 한다
+                     // (현재가 갱신이 PFAT를 밀면 5분 조건이 매번 리셋돼 iNAV가 영영 안 바뀐다)
 let PFERR = '';      // 저장 실패 안내
 let PFBUSY = false, pfEditIdx = -1, pfPick = null;
-const PF_TTL = 5 * 60e3; // 자동 재계산 간격
+const PF_TTL = 60e3; // iNAV 전체 재계산 간격. 더 줄여도 외부 호출은 시세 캐시(30초)에 묶여 늘지 않지만,
+                     // 장외에는 3종목 계산에 4.7초가 들어 30초로 하면 거의 쉬지 않고 돈다
 // 종목 상세 ↔ 홈 이동은 매번 '새 문서'라 PFV·PFAT가 메모리에서 사라진다(앱은 file:// 이동이라 특히).
 // 남겨 두지 않으면 5분이 안 지났는데도 홈에 올 때마다 전 종목을 다시 조회한다.
 const PFCSTORE = 'pfCalc';
 (function pfLoadCalc(){
   try {
     const d = JSON.parse(localStorage.getItem(PFCSTORE) || 'null');
-    if(d && d.at && d.v){ PFV = d.v; PFAT = new Date(d.at); }
+    if(d && d.at && d.v){ PFV = d.v; PFAT = new Date(d.at); PFCAT = new Date(d.cat || d.at); }
   } catch(e){}
 })();
 function pfSaveCalc(){
   try {
     const v = {}; // 지운 종목의 값은 남기지 않는다
     PF.forEach(function(h){ if(PFV[h.code]) v[h.code] = PFV[h.code]; });
-    localStorage.setItem(PFCSTORE, JSON.stringify({at: PFAT ? +PFAT : Date.now(), v: v}));
+    localStorage.setItem(PFCSTORE, JSON.stringify({at: PFAT ? +PFAT : Date.now(), cat: PFCAT ? +PFCAT : null, v: v}));
   } catch(e){}
 }
 // 평가 기준: 정규장 중엔 '현재가'(실제로 팔릴 값), 그 밖에는 'iNAV'(체결가가 멈춰 있어 유일한 단서)가 기본.
@@ -2976,6 +3032,21 @@ function pfRender(){
   }).join('');
 }
 
+// 현재가만 갱신 — /api/px는 ETF 시세 배치 한 번이라 종목 화면과 같은 주기로 돌려도 부담이 없다.
+// iNAV는 그대로 두고 price만 바꾸므로, 현재가 기준으로 보고 있으면 값이 즉시 따라 움직인다.
+async function pfPxTick(){
+  if(!PF.length || PF_DOWN || PFBUSY) return;
+  try {
+    const d = await (await fetch('/api/px?codes='+encodeURIComponent(PF.map(function(h){ return h.code; }).join(',')))).json();
+    let any = false;
+    PF.forEach(function(h){
+      const v = d && d[h.code];
+      if(v && v.price > 0){ PFV[h.code] = Object.assign({}, PFV[h.code], { price: v.price }); any = true; }
+    });
+    if(any){ PFAT = new Date(); pfSaveCalc(); pfRender(); }
+  } catch(e){ /* 실패하면 다음 주기에 다시 */ }
+}
+
 async function pfCalc(){
   if(PFBUSY || PF_DOWN || !PF.length) return;
   PFBUSY = true;
@@ -2983,8 +3054,11 @@ async function pfCalc(){
   btn.disabled = true; // disabled인 동안만 CSS가 회전시킨다
   // 순차 조회 — 한꺼번에 던지면 ETF 하나가 구성종목 수백 개를 훑으므로 외부 API 부담이 크다.
   // 앞 종목이 채운 시세 캐시를 뒤 종목이 재사용하는 이점도 있다.
-  for(let i=0;i<PF.length;i++){
-    const h = PF[i];
+  // 순차로 둔다. 병렬로 바꿔 봤지만 종목마다 구성종목 시세를 각자 100건씩 동시에 던져
+  // 커넥션 풀에서 밀려 오히려 3배 느렸다(실측 3종목: 순차 4.7초·100회 → 병렬 13.4초·263회).
+  // in-flight 병합은 같은 키만 합치므로 서로 다른 종목의 조회는 합쳐지지 않는다.
+  for(const h of PF){
+    await (async function(h){
     try {
       // 종목 페이지가 갱신 주기 안에 받아 둔 게 있으면 그대로 쓴다 — 같은 응답을 두 번 받지 않는다
       const cached = dLoad(h.code);
@@ -2996,9 +3070,10 @@ async function pfCalc(){
       if(!pfBPinned && d && d.krSession) PFB = pfDefBasis(d.krSession); // 공휴일 교정
       if(d && d.etfName && d.etfName !== h.name){ h.name = d.etfName; pfSet(PF); } // 운용사 개명 반영
     } catch(e){ /* 한 종목 실패가 나머지 계산을 막지 않는다 */ }
-    pfRender(); // 한 종목씩 끝날 때마다 반영 — 여러 종목이면 값이 차례로 채워진다
+    pfRender(); // 끝난 종목부터 화면에 채운다
+    })(h);
   }
-  PFAT = new Date();
+  PFAT = PFCAT = new Date();
   pfSaveCalc(); // 다음 페이지 로드가 5분 안이면 이 값을 그대로 쓴다
   PFBUSY = false; btn.disabled = false;
   pfRender();
@@ -3090,10 +3165,13 @@ if(HOME){
   // 별도 타이머를 관리하지 않고 30초마다 나이만 재는 방식이라 이중 발화가 없다.
   function pfTick(){
     if(!(BG_OK || !document.hidden)) return; // 안 보이는 탭에서는 건너뛴다
-    if(!PFAT || Date.now() - +PFAT >= PF_TTL) pfCalc();
+    if(!PFCAT || Date.now() - +PFCAT >= PF_TTL) pfCalc();
   }
-  pfLoad().then(function(){ pfRender(); pfTick(); }); // 서버 저장이면 목록을 받아온 뒤 판단
+  pfLoad().then(function(){ pfRender(); pfTick(); pfPxTick(); }); // 서버 저장이면 목록을 받아온 뒤 판단
   setInterval(pfTick, 30e3);
+  // 현재가는 ETF 자체 시세만 있으면 되므로(구성종목을 훑지 않는다) 종목 화면과 같은 주기로 돌린다.
+  // iNAV 전체 재계산은 위 pfTick이 5분마다 맡는다.
+  setInterval(function(){ if(BG_OK || !document.hidden) pfPxTick(); }, MKT_MS);
 }
 else {
   renderRecent();
@@ -3138,6 +3216,42 @@ const handler = async (req, res) => {
     }
     return;
   }
+  if (u.pathname === '/api/pdfinfo') {
+    // 하루 한 번만 받아도 되는 자료(구성종목 PDF·차단 기록)의 상태와 수동 초기화
+    if (u.searchParams.get('clear') === '1') {
+      let n = 0;
+      for (const k of [...cache.keys()]) if (/^(pdf:|blk:)/.test(k)) { cache.delete(k); n++; }
+      saveCache();
+      send(req, res, JSON.stringify({ cleared: n }), JSON_T);
+      return;
+    }
+    const items = [];
+    for (const [k, v] of cache) if (k.startsWith('pdf:')) items.push({ src: k.split(':')[1], at: v.ts, stdDt: v.data?.stdDt || null });
+    const blocked = [...cache.keys()].filter(k => k.startsWith('blk:') && issuerBlocked(k.slice(4))).map(k => k.slice(4));
+    send(req, res, JSON.stringify({
+      count: items.length,
+      oldest: items.length ? Math.min(...items.map(x => x.at)) : null,
+      newest: items.length ? Math.max(...items.map(x => x.at)) : null,
+      dates: [...new Set(items.map(x => x.stdDt).filter(Boolean))].sort(),
+      ttlMs: PDF_TTL, blocked,
+    }), JSON_T);
+    return;
+  }
+  if (u.pathname === '/api/px') {
+    // ETF 자체 시세만 — 구성종목을 훑지 않으므로 포트폴리오 현재가를 종목 화면과 같은 주기로 갱신할 수 있다
+    try {
+      const codes = (u.searchParams.get('codes') || '').split(',')
+        .filter(c => /^[0-9A-Z]{6}$/.test(c)).slice(0, 30);
+      const q = codes.length ? await krQuotes(codes) : {};
+      send(req, res, JSON.stringify(Object.fromEntries(codes.map(c =>
+        [c, q[c] ? { price: q[c].last, prev: q[c].prevClose, session: q[c].session } : null]))), JSON_T);
+    } catch (e) {
+      console.error('/api/px 실패:', e.message);
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
   if (u.pathname === '/api/inav') {
     try {
       const before = stats.calls;
@@ -3159,7 +3273,8 @@ const handler = async (req, res) => {
 
 // 안드로이드에서는 HTTP 서버가 없다 — 페이지가 이 함수들을 직접 부른다(에셋 index.html의 fetch shim).
 if (!NODE) {
-  globalThis.ENGINE = { computeINav, etfList, marketQuotes, stats, cache, krSession, todayYmd, DEFAULT_CODE };
+  globalThis.ENGINE = { computeINav, etfList, marketQuotes, krQuotes, stats, cache, saveCache,
+    issuerBlocked, PDF_TTL, krSession, todayYmd, DEFAULT_CODE };
 } else {
 
 // async 핸들러가 던지면 unhandled rejection으로 프로세스가 죽는다 — 요청 하나로 서비스가 내려간다.
