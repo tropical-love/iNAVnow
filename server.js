@@ -262,12 +262,16 @@ function saveCache() {
 const inflight = new Map();
 function cached(key, ttl, fn) {
   const c = cache.get(key);
-  if (c && Date.now() - c.ts < c.ttl) return Promise.resolve(c.data);
+  // PDF는 저장된 TTL을 믿지 않고 지금 정책으로 다시 잰다 — 저장분이 옛 규칙(고정 60분)을 물고 있으면
+  // 정책을 바꿔도 한 번 더 만료되고, 기준일이 낡은 자료를 짧게 쥐는 판단도 못 한다
+  const eff = c ? (key.startsWith('pdf:') ? pdfTtlFor(c.data, c.ts) : c.ttl) : 0;
+  if (c && Date.now() - c.ts < eff) return Promise.resolve(c.data);
   const hit = inflight.get(key);
   if (hit) return hit;
   const p = (async () => {
     const data = await fn();
-    cache.set(key, { ts: Date.now(), ttl, data });
+    // ttl에 함수를 주면 받아 온 값을 보고 정한다 — PDF는 기준일이 아직 낡았을 때만 짧게 쥔다
+    cache.set(key, { ts: Date.now(), ttl: typeof ttl === 'function' ? ttl(data) : ttl, data });
     if (PERSIST(key) || !NODE) saveCache(); // 안드로이드는 단기 캐시도 남긴다(1초 디바운스)
     return data;
   })().finally(() => inflight.delete(key));
@@ -303,7 +307,28 @@ async function findSiblingCode(nm, selfCode) {
 // 다음 경계까지 남은 시간을 TTL로 주면, 경계를 넘긴 뒤 첫 조회에서만 새로 받는다.
 // 그 시각에 앱이 꺼져 있었어도 켜서 처음 보는 순간 갱신된다(만료 상태이므로).
 const PDF_MARKS = [800, 1540, 1900];
+// 운용사 응답에서 기준일을 꺼낸다 — 필드 이름이 어댑터마다 다르다(실측: std_DT·gijunYMD·workDt·
+// businessDate·wkdate·F12506). 못 찾으면 빈 문자열이고, 그때는 경계 TTL을 그대로 쓴다.
+const pdfStdDt = d => {
+  if (!d || typeof d !== 'object') return '';
+  for (const v of [d.stdDt, d.std_DT, d.workDt, d.pdf && d.pdf.gijunYMD,
+    d.pdfList && d.pdfList[0] && d.pdfList[0].businessDate,
+    d.content && d.content[0] && d.content[0].wkdate,
+    d.results && d.results[0] && d.results[0].F12506]) {
+    const s8 = fxKeyD(v);
+    if (s8.length === 8) return s8;
+  }
+  return '';
+};
 const hmToMin = hm => Math.floor(hm / 100) * 60 + (hm % 100);
+// 받아 온 자료의 기준일이 아직 지난 영업일이면 다음 경계까지 기다리지 않는다 — 늦게 올리는 운용사가
+// 있어서(실측 2026-08-10 18:15: 키움·ACE는 08-11자, PLUS는 아직 08-10자) 08:00에 낡은 것을 받으면
+// 하루 종일 그걸 쓰게 된다. 30분 뒤 다시 확인하고, 새 기준일을 받으면 경계 방식으로 돌아간다.
+function pdfTtlFor(data, at = Date.now()) {
+  const d8 = pdfStdDt(data);
+  if (d8 && d8 < todayYmd()) return 30 * 60e3;
+  return pdfTtl(at);
+}
 function pdfTtl(now = Date.now()) {
   const cur = hmToMin(kstHm(now));
   const next = PDF_MARKS.find(m => hmToMin(m) > cur);
@@ -365,7 +390,7 @@ const ADAPTERS = {
   ace: {
     async pdf(stockCode) {
       const fund = await fundCdOf(stockCode);
-      const pdf = await cached(`pdf:ace:${fund.fundCd}`, pdfTtl(), () =>
+      const pdf = await cached(`pdf:ace:${fund.fundCd}`, pdfTtlFor, () =>
         getJson(`https://papi.aceetf.co.kr/api/funds/${fund.fundCd}/pdf?page=1&size=100`));
       return {
         fundNm: fund.fundNm, stdDt: pdf.std_DT,
@@ -392,7 +417,7 @@ const ADAPTERS = {
       });
       const f = list.find(x => x.stkTicker === stockCode);
       if (!f) throw new Error(`KODEX 목록에 ${stockCode} 없음`);
-      const d = await cached(`pdf:kodex:${f.fId}`, pdfTtl(), () =>
+      const d = await cached(`pdf:kodex:${f.fId}`, pdfTtlFor, () =>
         getJson(`https://www.samsungfund.com/api/v1/kodex/product-pdf/${f.fId}.do?gijunYMD=${todayYmd('.')}`));
       return {
         fundNm: f.fNm, stdDt: d.pdf.gijunYMD,
@@ -422,7 +447,7 @@ const ADAPTERS = {
       });
       const f = list.find(x => x.ETF_CD6 === stockCode);
       if (!f) throw new Error(`SOL 목록에 ${stockCode} 없음`);
-      const d = await cached(`pdf:sol:${f.FUND_CD}`, pdfTtl(), () =>
+      const d = await cached(`pdf:sol:${f.FUND_CD}`, pdfTtlFor, () =>
         getJson(`https://www.soletf.com/api/etf/pds/pdf/${f.FUND_CD}`));
       return {
         fundNm: d.fundName || f.ETF_NAME, stdDt: d.workDt,
@@ -442,7 +467,7 @@ const ADAPTERS = {
       const list = await cached('kiwoom:list', 86400e3, () =>
         kiwoomPostJson('https://www.kiwoometf.com/service/main/productListAjax', ''));
       const f = (list.products || []).find(x => x.gcode === stockCode);
-      const d = await cached(`pdf:kiwoom:${stockCode}`, pdfTtl(), () =>
+      const d = await cached(`pdf:kiwoom:${stockCode}`, pdfTtlFor, () =>
         kiwoomPostJson('https://www.kiwoometf.com/service/etf/KO02010200MAjax4', `schGubun1=${stockCode}&startDate=${todayYmd()}`));
       if (!d.pdfList || !d.pdfList.length) throw new Error(`KIWOOM PDF 없음 (${stockCode})`);
       return {
@@ -462,7 +487,7 @@ const ADAPTERS = {
   tiger: { // 미래에셋자산운용 (investments.miraeasset.com) — HTML 조각 응답, 내부ID=국내 ISIN
     async pdf(stockCode) {
       const ksd = krIsin(stockCode);
-      const html = await cached(`pdf:tiger:${ksd}`, pdfTtl(), () =>
+      const html = await cached(`pdf:tiger:${ksd}`, pdfTtlFor, () =>
         getText(`https://investments.miraeasset.com/tigeretf/ko/product/search/detail/pdfListAjax.ajax?ksdFund=${ksd}&listCnt=9999`));
       const list = parseTrRows(html)
         .filter(r => r.length >= 5 && r[0] && !/^(KRD|CASH)/.test(r[0]))
@@ -486,7 +511,7 @@ const ADAPTERS = {
         return m ? m[1] : null;
       });
       if (!fundCd) throw new Error(`RISE 목록에 ${stockCode} 없음`);
-      const html = await cached(`pdf:rise:${fundCd}`, pdfTtl(), () =>
+      const html = await cached(`pdf:rise:${fundCd}`, pdfTtlFor, () =>
         postText('https://www.riseetf.co.kr/prod/finder/productViewSearchTabJquery3', `fundCd=${fundCd}&searchDate=`));
       const list = parseTrRows(html)
         .filter(r => r.length >= 5 && r[1] && !/^(CASH|KRD)/.test(r[1]))
@@ -503,7 +528,7 @@ const ADAPTERS = {
 
   oneq: { // 하나자산운용 (1qetf.com) — 코스콤 F-필드 포맷, etf_code=단축코드 직통
     async pdf(stockCode) {
-      const d = await cached(`pdf:1q:${stockCode}`, pdfTtl(), () =>
+      const d = await cached(`pdf:1q:${stockCode}`, pdfTtlFor, () =>
         postJson('https://www.1qetf.com/pages/ETFproducts/ajax/process.php', `mode=get.pdf&etf_code=${stockCode}`));
       if (!d.success || !d.results || !d.results.length) throw new Error(`1Q PDF 없음 (${stockCode})`);
       return {
@@ -528,7 +553,7 @@ const ADAPTERS = {
         return (d.content || []).find(x => x.nameCode === stockCode) || null;
       });
       if (!found) throw new Error(`PLUS 목록에 ${stockCode} 없음`);
-      const d = await cached(`pdf:plus:${found.id}`, pdfTtl(), () =>
+      const d = await cached(`pdf:plus:${found.id}`, pdfTtlFor, () =>
         getJson(`https://www.plusetf.co.kr/api/v1/product/pdf/list?n=${found.id}&page=0&d=${todayYmd()}&pageSize=1000`));
       return {
         fundNm: found.displayName, stdDt: d.content?.[0]?.wkdate,
@@ -544,7 +569,7 @@ const ADAPTERS = {
 // 페이지에서 _csrf 토큰과 기준일을 뽑아 같은 세션 쿠키로 API를 호출해야 한다(토큰 없이 부르면 빈 배열).
 async function funetfPdf(stockCode) {
   const isin = krIsin(stockCode);
-  return cached(`pdf:funetf:${isin}`, pdfTtl(), async () => {
+  return cached(`pdf:funetf:${isin}`, pdfTtlFor, async () => {
     const pageUrl = `https://www.funetf.co.kr/product/etf/view/${isin}`;
     const res = await fetchOrThrow(pageUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
     if (!res.ok) throw new Error(`${res.status} funetf page`);
@@ -2481,9 +2506,10 @@ async function pdfInfo(){
     const mins = Math.round((Date.now() - d.newest) / 60000);
     const ago = mins < 1 ? '방금' : mins < 60 ? mins+'분 전' : Math.floor(mins/60)+'시간 '+(mins%60)+'분 전';
     const nx = new Date(Date.now() + (d.ttlMs || 0));
-    el.textContent = d.count+'종목 · 마지막 수신 '+ago
+    el.textContent = d.count+'건 보관 · 마지막 수신 '+ago
       + (d.dates.length ? ' · 기준일 '+d.dates.join(', ') : '')
       + ' · 다음 갱신 '+nx.toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'})
+      + (d.stale ? ' · 아직 지난 기준일 '+d.stale+'종목(30분 뒤 다시 확인)' : '')
       + (d.blocked.length ? ' · 오늘 차단: '+d.blocked.join(',') : '');
   } catch(e){ el.textContent = '상태를 읽지 못했습니다.'; }
 }
@@ -3244,15 +3270,26 @@ const handler = async (req, res) => {
       send(req, res, JSON.stringify({ cleared: n }), JSON_T);
       return;
     }
+    // 건수는 아직 유효한 자료만 센다(만료분·폴백 중복은 '자료 건수'일 뿐 종목 수가 아니다).
+    // 기준일은 원본 응답이 아니라 정규화해 둔 pdfset에서 읽는다 — 어댑터마다 필드 이름이 달라
+    // 원본을 그대로 읽으면 일부 운용사가 빠진다(Codex 지적).
     const items = [];
-    for (const [k, v] of cache) if (k.startsWith('pdf:')) items.push({ src: k.split(':')[1], at: v.ts, stdDt: v.data?.stdDt || null });
+    for (const [k, v] of cache) {
+      if (!k.startsWith('pdf:')) continue;
+      const alive = Date.now() - v.ts < pdfTtlFor(v.data, v.ts);
+      items.push({ at: v.ts, stdDt: pdfStdDt(v.data) || null, alive });
+    }
+    const live = items.filter(x => x.alive);
+    const dates = [...new Set([...cache.entries()]
+      .filter(([k]) => k.startsWith('pdfset:'))
+      .map(([, v]) => fxKeyD(v.data?.d)).filter(x => x.length === 8))].sort();
+    const stale = dates.filter(d => d < todayYmd()).length;
     const blocked = [...cache.keys()].filter(k => k.startsWith('blk:') && issuerBlocked(k.slice(4))).map(k => k.slice(4));
     send(req, res, JSON.stringify({
-      count: items.length,
-      oldest: items.length ? Math.min(...items.map(x => x.at)) : null,
-      newest: items.length ? Math.max(...items.map(x => x.at)) : null,
-      dates: [...new Set(items.map(x => x.stdDt).filter(Boolean))].sort(),
-      ttlMs: pdfTtl(), marks: PDF_MARKS, blocked,
+      count: live.length, total: items.length,
+      oldest: live.length ? Math.min(...live.map(x => x.at)) : null,
+      newest: live.length ? Math.max(...live.map(x => x.at)) : null,
+      dates, stale, ttlMs: pdfTtl(), marks: PDF_MARKS, blocked,
     }), JSON_T);
     return;
   }
@@ -3293,7 +3330,7 @@ const handler = async (req, res) => {
 // 안드로이드에서는 HTTP 서버가 없다 — 페이지가 이 함수들을 직접 부른다(에셋 index.html의 fetch shim).
 if (!NODE) {
   globalThis.ENGINE = { computeINav, etfList, marketQuotes, krQuotes, stats, cache, saveCache,
-    issuerBlocked, pdfTtl, PDF_MARKS, krSession, todayYmd, DEFAULT_CODE };
+    issuerBlocked, pdfTtl, pdfTtlFor, pdfStdDt, fxKeyD, PDF_MARKS, krSession, todayYmd, DEFAULT_CODE };
 } else {
 
 // async 핸들러가 던지면 unhandled rejection으로 프로세스가 죽는다 — 요청 하나로 서비스가 내려간다.
@@ -3314,6 +3351,6 @@ if (require.main === module) {
     try { fs.writeFileSync(__dirname + '/server.pid', String(process.pid)); } catch (e) {}
   });
 }
-module.exports = { server, handler, PORT, HTML, cached, cache, krSession, marketPx, navIdxChg, pdfTtl, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
+module.exports = { server, handler, PORT, HTML, cached, cache, krSession, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
 
 }

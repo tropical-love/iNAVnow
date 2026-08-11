@@ -80,14 +80,16 @@ const SHIM = BRIDGE + `<script src="engine.js"></script>
           ENGINE.saveCache();
           return J({cleared: n});
         }
-        const items = [];
-        for(const [k, v] of C) if(k.startsWith('pdf:')) items.push({at: v.ts, stdDt: (v.data && v.data.stdDt) || null});
+        const live = [];
+        for(const [k, v] of C) if(k.startsWith('pdf:') && Date.now() - v.ts < ENGINE.pdfTtlFor(v.data, v.ts)) live.push(v.ts);
+        const dates = [...new Set([...C.entries()].filter(function(e){ return e[0].startsWith('pdfset:'); })
+          .map(function(e){ return ENGINE.fxKeyD(e[1].data && e[1].data.d); }).filter(function(x){ return x.length === 8; }))].sort();
         const blocked = [...C.keys()].filter(function(k){ return k.startsWith('blk:') && ENGINE.issuerBlocked(k.slice(4)); }).map(function(k){ return k.slice(4); });
         return J({
-          count: items.length,
-          oldest: items.length ? Math.min.apply(null, items.map(function(x){ return x.at; })) : null,
-          newest: items.length ? Math.max.apply(null, items.map(function(x){ return x.at; })) : null,
-          dates: [...new Set(items.map(function(x){ return x.stdDt; }).filter(Boolean))].sort(),
+          count: live.length,
+          oldest: live.length ? Math.min.apply(null, live) : null,
+          newest: live.length ? Math.max.apply(null, live) : null,
+          dates: dates, stale: dates.filter(function(d){ return d < ENGINE.todayYmd(); }).length,
           ttlMs: ENGINE.pdfTtl(), marks: ENGINE.PDF_MARKS, blocked: blocked,
         });
       }

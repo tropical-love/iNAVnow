@@ -162,6 +162,24 @@ if (A) {
     ok('PDF 갱신 경계가 장 시작 전·마감 직후·저녁 세 번으로 계산된다');
   }
 
+  // ---------- 3c-4. PDF 기준일이 낡으면 짧게 쥔다 (늦게 올리는 운용사 대응) ----------
+  {
+    const KST = (h, mi) => Date.UTC(2026, 7, 10, h - 9, mi);
+    const today = S.todayYmd();
+    const yst = String(+today - 1); // 같은 달 안이면 이렇게도 충분하다(검사용)
+    // 어댑터마다 다른 필드에서 기준일을 꺼낸다
+    assert.strictEqual(S.pdfStdDt({ std_DT: '2026-08-11' }), '20260811', 'ACE 필드');
+    assert.strictEqual(S.pdfStdDt({ pdf: { gijunYMD: '20260811' } }), '20260811', 'KODEX 필드');
+    assert.strictEqual(S.pdfStdDt({ pdfList: [{ businessDate: '2026.08.11' }] }), '20260811', 'KIWOOM 필드');
+    assert.strictEqual(S.pdfStdDt({ content: [{ wkdate: '20260810' }] }), '20260810', 'PLUS 필드');
+    assert.strictEqual(S.pdfStdDt({ nothing: 1 }), '', '못 찾으면 빈 문자열');
+    // 낡은 기준일 → 30분, 오늘·다음 영업일자 → 경계까지
+    assert.strictEqual(S.pdfTtlFor({ stdDt: yst }, KST(8, 5)), 30 * 60e3, '낡은 자료를 하루 쥐고 있다');
+    assert.strictEqual(S.pdfTtlFor({ stdDt: today }, KST(8, 5)), S.pdfTtl(KST(8, 5)), '오늘자인데 짧게 쥔다');
+    assert.strictEqual(S.pdfTtlFor({}, KST(8, 5)), S.pdfTtl(KST(8, 5)), '기준일을 못 찾으면 경계 TTL');
+    ok('기준일이 낡은 PDF만 30분 뒤 다시 확인한다');
+  }
+
   // ---------- 3d. 리밸런싱 감지 (편입 종목의 기준 평가액이 기준 NAV와 어긋나는 날을 알린다) ----------
   {
     const pdf = (d, jms) => ({ stdDt: d, list: jms.map(j => ({ jm: j, name: '종목' + j })) });
