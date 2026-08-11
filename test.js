@@ -146,6 +146,22 @@ if (A) {
     ok('지수 등락 부호가 상승·하락 양쪽에서 맞는다');
   }
 
+  // ---------- 3c-3. PDF 갱신 경계 (하루 세 번만 새로 받는다) ----------
+  {
+    const KST = (h, mi) => Date.UTC(2026, 7, 10, h - 9, mi);
+    const mins = (h, mi) => Math.round(S.pdfTtl(KST(h, mi)) / 60000);
+    assert.deepStrictEqual(S.PDF_MARKS, [800, 1540, 1900], '갱신 시점이 바뀌었다 — 아래 기대값도 함께 고칠 것');
+    assert.strictEqual(mins(7, 30), 30, '07:30 → 08:00');
+    assert.strictEqual(mins(8, 1), 459, '08:01 → 15:40');
+    assert.strictEqual(mins(15, 29), 11, '15:29 → 15:40');
+    assert.strictEqual(mins(15, 45), 195, '15:45 → 19:00');
+    assert.strictEqual(mins(19, 5), 775, '19:05 → 다음날 08:00');
+    assert.strictEqual(mins(2, 0), 360, '02:00 → 08:00');
+    // 경계 직전에도 최소 1분은 살아 있어야 한다(0으로 떨어지면 매 조회가 새로 받는다)
+    assert.ok(S.pdfTtl(KST(7, 59)) >= 60e3 && S.pdfTtl(KST(15, 39)) >= 60e3);
+    ok('PDF 갱신 경계가 장 시작 전·마감 직후·저녁 세 번으로 계산된다');
+  }
+
   // ---------- 3d. 리밸런싱 감지 (편입 종목의 기준 평가액이 기준 NAV와 어긋나는 날을 알린다) ----------
   {
     const pdf = (d, jms) => ({ stdDt: d, list: jms.map(j => ({ jm: j, name: '종목' + j })) });

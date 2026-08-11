@@ -88,7 +88,7 @@ const SHIM = BRIDGE + `<script src="engine.js"></script>
           oldest: items.length ? Math.min.apply(null, items.map(function(x){ return x.at; })) : null,
           newest: items.length ? Math.max.apply(null, items.map(function(x){ return x.at; })) : null,
           dates: [...new Set(items.map(function(x){ return x.stdDt; }).filter(Boolean))].sort(),
-          ttlMs: ENGINE.PDF_TTL, blocked: blocked,
+          ttlMs: ENGINE.pdfTtl(), marks: ENGINE.PDF_MARKS, blocked: blocked,
         });
       }
       if(s.startsWith('/api/px')){ // ETF 자체 시세만 (포트폴리오 현재가 빠른 갱신)
