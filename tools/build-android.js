@@ -75,10 +75,21 @@ const SHIM = BRIDGE + `<script src="engine.js"></script>
       if(s.startsWith('/api/pdfinfo')){ // 하루치 자료 상태 / 수동 초기화
         const C = ENGINE.cache;
         if(q.get('clear') === '1'){
-          let n = 0;
-          for(const k of [...C.keys()]) if(/^(pdf:|blk:)/.test(k)){ C.delete(k); n++; }
+          // 차단 기록은 남기고, codes를 주면 그 종목이 쓴 키만 지운다(서버 라우트와 같은 규칙)
+          const only = (q.get('codes')||'').split(',').filter(function(c){ return /^[0-9A-Z]{6}$/.test(c); });
+          let n = 0, miss = 0;
+          if(only.length){
+            only.forEach(function(c){
+              const keys = ENGINE.pdfKeysOf(c);
+              if(!keys.length){ miss++; return; }
+              keys.forEach(function(k){ if(C.delete(k)) n++; }); // 거쳐 온 출처를 모두 비운다
+              // pdfset(전일 구성 기록)은 남긴다 — 리밸런싱 비교 기준이다
+            });
+          } else {
+            for(const k of [...C.keys()]) if(k.startsWith('pdf:')){ C.delete(k); n++; }
+          }
           ENGINE.saveCache();
-          return J({cleared: n});
+          return J({cleared: n, miss: miss, scope: only.length ? 'codes' : 'all'});
         }
         const items = [];
         const live = [];

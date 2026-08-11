@@ -215,6 +215,65 @@ if (A) {
     ok('notePdfSet이 PDF 편입·편출을 잡고, 같은 구성·상위10 추정은 넘긴다');
   }
 
+  // ---------- 3e. 수동 갱신(clear=1)이 차단 기록을 지우지 않는다 ----------
+  // 지우면 429로 막힌 운용사를 버튼 누를 때마다 다시 두드려 차단이 길어진다.
+  {
+    await new Promise(r => S.server.listen(0, '127.0.0.1', r));
+    const port = S.server.address().port;
+    S.cache.set('pdf:test:zzz', { ts: Date.now(), ttl: 60e3, data: { stdDt: '20260811' } });
+    S.cache.set('blk:testissuer', { ts: Date.now(), ttl: 24 * 3600e3, data: '429 ...' });
+    const res = await fetch('http://127.0.0.1:' + port + '/api/pdfinfo?clear=1');
+    const body = await res.json();
+    assert.strictEqual(res.status, 200);
+    assert.ok(body.cleared >= 1, 'PDF를 지우지 않았다');
+    assert.strictEqual(S.cache.has('pdf:test:zzz'), false, 'PDF가 남아 있다');
+    assert.strictEqual(S.cache.has('blk:testissuer'), true, '차단 기록까지 지웠다 — 429를 다시 유발한다');
+
+    // codes를 주면 그 종목이 쓴 키만 지운다 — 화면과 무관한 종목 자료는 남아야 한다.
+    // 111111은 옛 형식(문자열 하나)으로 저장된 종목 — 갱신 뒤에도 읽혀야 한다
+    S.cache.set('pdfkey:111111', { ts: Date.now(), ttl: 60e3, data: 'pdf:aaa:mine' });
+    S.cache.set('pdf:aaa:mine', { ts: Date.now(), ttl: 60e3, data: { stdDt: '20260811' } });
+    S.cache.set('pdf:bbb:other', { ts: Date.now(), ttl: 60e3, data: { stdDt: '20260811' } });
+    S.cache.set('pdfset:111111', { ts: Date.now(), ttl: 60e3, data: { d: '20260811', codes: ['x'] } });
+    // 555555는 운용사 원본 → FunETF 폴백을 오간 종목. 둘 다 지워야 차단이 풀렸을 때
+    // 남은 원본 캐시를 재사용해 '새로 받은 척'하지 않는다
+    S.cache.delete('pdfkey:555555');
+    S.notePdfKey('555555', 'pdf:aaa:orig');
+    S.notePdfKey('555555', 'pdf:funetf:KR7555555001');
+    S.cache.set('pdf:aaa:orig', { ts: Date.now(), ttl: 60e3, data: { stdDt: '20260811' } });
+    S.cache.set('pdf:funetf:KR7555555001', { ts: Date.now(), ttl: 60e3, data: { stdDt: '20260811' } });
+    const r2 = await (await fetch('http://127.0.0.1:' + port + '/api/pdfinfo?clear=1&codes=111111,222222,555555')).json();
+    assert.strictEqual(r2.scope, 'codes');
+    assert.strictEqual(r2.cleared, 3, '거쳐 온 출처를 모두 지워야 한다(111111 1건 + 555555 2건)');
+    assert.strictEqual(r2.miss, 1, '한 번도 계산하지 않은 종목은 miss로 세어야 한다');
+    assert.strictEqual(S.cache.has('pdf:aaa:orig'), false, '이전 출처(운용사 원본) 자료가 남아 있다');
+    assert.strictEqual(S.cache.has('pdf:funetf:KR7555555001'), false, '마지막 출처(폴백) 자료가 남아 있다');
+    assert.strictEqual(S.cache.has('pdf:aaa:mine'), false, '지정 종목 자료가 남아 있다');
+    assert.strictEqual(S.cache.has('pdf:bbb:other'), true, '무관한 종목 자료까지 지웠다');
+    // pdfset은 응답 캐시가 아니라 리밸런싱 비교 이력이다 — 지우면 다음 PDF가 '처음 보는 구성'이 되어
+    // 편입·편출을 못 잡는다. 하필 이 버튼은 리밸런싱이 늦을 때 누르라고 안내한다
+    assert.strictEqual(S.cache.has('pdfset:111111'), true, '리밸런싱 비교 이력을 지웠다 — 편입·편출을 놓친다');
+    ['pdf:bbb:other', 'pdfkey:111111', 'pdfkey:555555', 'pdfset:111111', 'blk:testissuer'].forEach(k => S.cache.delete(k));
+    S.server.close();
+    ok('수동 갱신은 지정 종목 자료만 비우고, 차단 기록·리밸런싱 이력·무관한 종목은 남긴다');
+  }
+
+  // ---------- 3f. PDF 키는 받아 온 뒤에만 남긴다 ----------
+  // 실패한 키가 남으면 삭제 API가 'miss 0 / cleared 0'을 돌려줘 지운 것처럼 보인다.
+  {
+    S.cache.delete('pdfkey:333333');
+    await S.pdfCached('333333', 'pdf:zzz:fail', () => Promise.reject(new Error('사이트 차단'))).catch(() => {});
+    assert.strictEqual(S.cache.has('pdfkey:333333'), false, '실패한 PDF의 키가 남았다');
+    await S.pdfCached('333333', 'pdf:zzz:ok', () => Promise.resolve({ stdDt: '20260811' }));
+    await S.pdfCached('333333', 'pdf:funetf:zzz', () => Promise.resolve({ stdDt: '20260811' })); // 폴백으로 갈아탄 경우
+    assert.deepStrictEqual(S.pdfKeysOf('333333'), ['pdf:zzz:ok', 'pdf:funetf:zzz'], '거쳐 온 출처를 모두 기억하지 않았다');
+    // 합성·레버리지는 기초 ETF 키 목록 전체를 자기 코드에도 연결한다(computeSynthetic과 같은 형태)
+    for (const k of S.pdfKeysOf('333333')) S.notePdfKey('444444', k);
+    assert.deepStrictEqual(S.pdfKeysOf('444444'), ['pdf:zzz:ok', 'pdf:funetf:zzz'], '기초 ETF 키 목록이 연결되지 않았다');
+    ['pdfkey:333333', 'pdfkey:444444', 'pdf:zzz:ok', 'pdf:funetf:zzz'].forEach(k => S.cache.delete(k));
+    ok('PDF 키는 성공한 뒤에만 남고, 합성 ETF에는 기초 ETF 키가 연결된다');
+  }
+
   // ---------- 4. 거래일 달력: close=null인 실거래일을 휴장으로 오판하지 않는다 ----------
   const ts = d => Date.UTC(+d.slice(0, 4), +d.slice(5, 7) - 1, +d.slice(8, 10)) / 1000 - 32400; // 09:00 KST
   const fixture = { // 2026-08-03(월)은 야후가 close를 비워 보낸 실거래일, 07-17(금)은 제헌절
