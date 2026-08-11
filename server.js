@@ -2557,7 +2557,9 @@ async function pdfInfo(){
       + (d.dates.length ? ' · 기준일 '+d.dates.join(', ') : '')
       + ' · 다음 갱신 '+nx.toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'})
       + (d.stale ? ' · 아직 지난 기준일 '+d.stale+'종목'+(d.retrying ? '(30분 뒤 다시 확인)' : '(다음 갱신 때 확인)') : '')
-      + (d.blocked.length ? ' · 오늘 차단: '+d.blocked.join(',') : '');
+      // 차단은 운용사 단위 상태라 종목 범위로 좁히지 않는다 — KODEX 종목은 차단되면 폴백 자료를
+      // 쓰므로 '이 종목이 쓴 운용사'로 걸러 버리면 정작 차단됐다는 사실이 안 보인다. 대신 범위를 밝힌다
+      + (d.blocked.length ? ' · 오늘 차단(전체 기준): '+d.blocked.join(',') : '');
   } catch(e){ el.textContent = '상태를 읽지 못했습니다.'; }
 }
 // 눌렀을 때 '다음 조회 때 받는다'고 미루지 않고, 지금 화면에 필요한 종목을 실제로 다시 받는다.

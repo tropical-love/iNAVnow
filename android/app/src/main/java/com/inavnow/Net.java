@@ -94,61 +94,83 @@ public class Net {
         return false;
     }
 
+    /** 리다이렉트를 따라가는 최대 횟수 — 지금 쓰는 API 중 리다이렉트하는 곳은 없다 */
+    private static final int MAX_HOPS = 3;
+
     private JSONObject doRequest(JSONObject s) throws Exception {
-        String url = s.getString("url");
         String method = s.optString("method", "GET");
         String body = s.isNull("body") ? null : s.optString("body", null);
         String extraCa = s.isNull("extraCa") ? null : s.optString("extraCa", null);
         int timeout = s.optInt("timeout", 8000);
-
-        URL parsed = new URL(url);
-        if (!allowed(parsed)) throw new SecurityException("허용하지 않는 주소: " + parsed.getProtocol() + "://" + parsed.getHost());
-
-        HttpURLConnection c = (HttpURLConnection) parsed.openConnection();
-        // kiwoometf.com은 중간 인증서를 빼먹고 보낸다 — 그 인증서를 보태 정상 검증을 켠다.
-        // 검증을 끄는 게 아니라 신뢰 앵커를 보태는 것이라 MITM 방어가 유지된다.
-        if ("sectigo-ov".equals(extraCa) && c instanceof HttpsURLConnection) {
-            ((HttpsURLConnection) c).setSSLSocketFactory(sectigoFactory());
-        }
-        c.setRequestMethod(method);
-        c.setConnectTimeout(timeout);
-        c.setReadTimeout(timeout);
-        c.setInstanceFollowRedirects(true);
-
         JSONObject hs = s.optJSONObject("headers");
-        if (hs != null) {
-            for (java.util.Iterator<String> it = hs.keys(); it.hasNext(); ) {
-                String k = it.next();
-                c.setRequestProperty(k, hs.getString(k));
+
+        URL target = new URL(s.getString("url"));
+        for (int hop = 0; ; hop++) {
+            // 이동할 때마다 다시 검사한다 — 플랫폼의 자동 추적에 맡기면 허용된 사이트가 30x로
+            // 다른 호스트를 가리키는 순간 목록 밖으로 나가 버린다(첫 URL만 검사되므로)
+            if (!allowed(target)) {
+                throw new SecurityException("허용하지 않는 주소: " + target.getProtocol() + "://" + target.getHost());
             }
-        }
-        if (body != null) {
-            c.setDoOutput(true);
-            byte[] b = body.getBytes("UTF-8");
-            c.setFixedLengthStreamingMode(b.length);
-            try (OutputStream os = c.getOutputStream()) { os.write(b); }
-        }
 
-        int status = c.getResponseCode();
-        // 4xx·5xx는 getInputStream이 던지므로 errorStream으로 받는다(엔진이 상태코드로 분기한다)
-        InputStream in = status >= 400 ? c.getErrorStream() : c.getInputStream();
-        byte[] bytes = readAll(in);
+            HttpURLConnection c = (HttpURLConnection) target.openConnection();
+            // kiwoometf.com은 중간 인증서를 빼먹고 보낸다 — 그 인증서를 보태 정상 검증을 켠다.
+            // 검증을 끄는 게 아니라 신뢰 앵커를 보태는 것이라 MITM 방어가 유지된다.
+            if ("sectigo-ov".equals(extraCa) && c instanceof HttpsURLConnection) {
+                ((HttpsURLConnection) c).setSSLSocketFactory(sectigoFactory());
+            }
+            c.setRequestMethod(method);
+            c.setConnectTimeout(timeout);
+            c.setReadTimeout(timeout);
+            c.setInstanceFollowRedirects(false); // 직접 따라간다(위 재검사를 거치게)
 
-        JSONObject rh = new JSONObject();
-        for (Map.Entry<String, List<String>> e : c.getHeaderFields().entrySet()) {
-            if (e.getKey() == null) continue; // 상태 라인
-            List<String> v = e.getValue();
-            // Set-Cookie는 여러 개가 올 수 있다 — 배열로 넘겨 JS가 각각 읽게 한다(funetf 로그인 흐름)
-            if (v.size() > 1) rh.put(e.getKey(), new org.json.JSONArray(v));
-            else rh.put(e.getKey(), v.get(0));
+            if (hs != null) {
+                for (java.util.Iterator<String> it = hs.keys(); it.hasNext(); ) {
+                    String k = it.next();
+                    c.setRequestProperty(k, hs.getString(k));
+                }
+            }
+            if (body != null) {
+                c.setDoOutput(true);
+                byte[] b = body.getBytes("UTF-8");
+                c.setFixedLengthStreamingMode(b.length);
+                try (OutputStream os = c.getOutputStream()) { os.write(b); }
+            }
+
+            int status = c.getResponseCode();
+            String loc = c.getHeaderField("Location");
+            if (isRedirect(status) && loc != null && hop < MAX_HOPS) {
+                URL next = new URL(target, loc); // 상대 경로 Location도 받는다
+                c.disconnect();
+                // 303, 그리고 관행상 301·302는 GET으로 바꿔 따라간다. 307·308은 메서드와 본문을 지킨다.
+                if (status == 303 || status == 301 || status == 302) { method = "GET"; body = null; }
+                target = next;
+                continue;
+            }
+
+            // 4xx·5xx는 getInputStream이 던지므로 errorStream으로 받는다(엔진이 상태코드로 분기한다)
+            InputStream in = status >= 400 ? c.getErrorStream() : c.getInputStream();
+            byte[] bytes = readAll(in);
+
+            JSONObject rh = new JSONObject();
+            for (Map.Entry<String, List<String>> e : c.getHeaderFields().entrySet()) {
+                if (e.getKey() == null) continue; // 상태 라인
+                List<String> v = e.getValue();
+                // Set-Cookie는 여러 개가 올 수 있다 — 배열로 넘겨 JS가 각각 읽게 한다(funetf 로그인 흐름)
+                if (v.size() > 1) rh.put(e.getKey(), new org.json.JSONArray(v));
+                else rh.put(e.getKey(), v.get(0));
+            }
+            c.disconnect();
+
+            JSONObject out = new JSONObject();
+            out.put("status", status);
+            out.put("headers", rh);
+            out.put("bodyB64", Base64.encodeToString(bytes, Base64.NO_WRAP));
+            return out;
         }
-        c.disconnect();
+    }
 
-        JSONObject out = new JSONObject();
-        out.put("status", status);
-        out.put("headers", rh);
-        out.put("bodyB64", Base64.encodeToString(bytes, Base64.NO_WRAP));
-        return out;
+    private static boolean isRedirect(int status) {
+        return status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
     }
 
     private static byte[] readAll(InputStream in) throws Exception {

@@ -27,5 +27,6 @@ cd android && gradle assembleRelease
 1단계가 `server.js` → `assets/`를 만듭니다. **`server.js`를 고치면 반드시 1단계를 다시 돌려야 합니다.**
 산출물은 `app/build/outputs/apk/release/inavnow.apk`입니다.
 
-`android/keystore.properties`가 없으면 디버그 키로 서명되므로, 배포용으로 쓰실 거면 키를 직접 만드세요
-(`keytool -genkeypair -keystore android/inavnow.jks -alias inavnow -keyalg RSA -keysize 2048 -validity 10000`).
+`android/keystore.properties`가 없으면 `assembleRelease`가 멈춥니다 — 배포용 키를 직접 만드시거나
+(`keytool -genkeypair -keystore android/inavnow.jks -alias inavnow -keyalg RSA -keysize 2048 -validity 10000`),
+시험용이면 `assembleDebug`를 쓰세요.

@@ -308,6 +308,37 @@ if (A) {
     ok('PDF 상태 집계가 codes로 준 종목 범위만 센다');
   }
 
+  // ---------- 3g-2. 포트폴리오 부분 실패를 성공으로 확정하지 않는다 ----------
+  // 실패 종목의 이전 값이 '방금 계산한 값'으로 저장되면 다음 주기까지 새 값처럼 쓰인다.
+  // 브라우저 함수지만 순수 로직이라 페이지에서 떼어 내 실제로 돌려 본다.
+  {
+    const vm = require('vm');
+    const src = /\nfunction pfMarkCalc\(staleNames\)\{[\s\S]*?\n\}/.exec(S.HTML);
+    assert.ok(src, 'pfMarkCalc를 페이지에서 찾지 못했다(이름이 바뀌었으면 이 검사도 고칠 것)');
+    let saved = 0; // vm 안에서 부르는 것도 세도록 클로저로 둔다
+    const ctx = { PF_TTL: 60e3, PF_RETRY: 20e3, PFSTALE: [], PFAT: null, PFCAT: null,
+      pfSaveCalc: () => { saved++; } };
+    vm.runInNewContext(src[0] + '\n;this.run = pfMarkCalc;', ctx);
+
+    ctx.run([]); // 전 종목 성공
+    assert.deepStrictEqual(ctx.PFSTALE, []);
+    assert.strictEqual(+ctx.PFCAT, +ctx.PFAT, '전부 성공했는데 계산 시각이 화면 시각과 다르다');
+    assert.ok(Date.now() - +ctx.PFCAT < 1000, '계산 시각이 지금이 아니다');
+    assert.strictEqual(saved, 1, '저장을 부르지 않았다 — 페이지를 옮기면 사라진다');
+
+    ctx.run(['KODEX 200', 'TIGER 미국S&P500']); // 일부 실패
+    assert.deepStrictEqual(ctx.PFSTALE, ['KODEX 200', 'TIGER 미국S&P500'], '못 받은 종목을 남기지 않았다');
+    assert.ok(+ctx.PFAT > +ctx.PFCAT, '실패가 있는데 계산 시각을 지금으로 밀었다');
+    // 재계산 판단은 PFCAT으로 한다 → 남은 대기시간이 PF_RETRY 이하여야 다음 검사에서 다시 시도한다
+    const wait = ctx.PF_TTL - (Date.now() - +ctx.PFCAT);
+    assert.ok(wait > 0 && wait <= ctx.PF_RETRY, `다음 재시도까지 ${wait}ms — PF_RETRY 안에 들어오지 않는다`);
+
+    ctx.run([]); // 재시도 성공
+    assert.deepStrictEqual(ctx.PFSTALE, [], '다시 받았는데도 낡은 종목 표시가 남았다');
+    assert.strictEqual(+ctx.PFCAT, +ctx.PFAT);
+    ok('포트폴리오 부분 실패는 계산 시각을 밀지 않고, 다시 받으면 표시가 사라진다');
+  }
+
   // ---------- 3h. 앱 브리지 허용 목록이 엔진이 쓰는 호스트를 다 담고 있다 ----------
   // 브리지는 허용 목록 밖으로 나가지 않는다 → 새 호스트를 엔진에 추가하고 목록에 안 넣으면
   // 로컬·서버에서는 되고 앱에서만 그 어댑터가 조용히 폴백으로 밀린다.
@@ -329,6 +360,17 @@ if (A) {
       const extra = [...allow].filter(h => !used.includes(h));
       assert.deepStrictEqual(extra, [], '엔진이 쓰지 않는 호스트가 열려 있다: ' + extra.join(', '));
       ok(`앱 브리지 허용 목록이 엔진이 쓰는 호스트 ${used.length}개와 정확히 일치한다`);
+
+      // 자동 리다이렉트를 켜면 첫 URL만 검사되고, 허용된 사이트가 30x로 가리키는 낯선 호스트로
+      // 그대로 나간다 = 허용 목록이 무력해진다. 자바 코드는 여기서 돌릴 수 없어 구조만 고정한다.
+      const nj = fs.readFileSync(netJava, 'utf8');
+      assert.ok(/setInstanceFollowRedirects\(false\)/.test(nj), '자동 리다이렉트가 켜져 있다 — 허용 목록을 우회한다');
+      assert.ok(!/setInstanceFollowRedirects\(true\)/.test(nj), 'setInstanceFollowRedirects(true)가 남아 있다');
+      // 이동할 때마다 검사하려면 allowed()가 루프 안에 있어야 한다(요청 생성보다 앞에)
+      const loop = /for \(int hop[\s\S]*?openConnection\(\)/.exec(nj);
+      assert.ok(loop && /allowed\(target\)/.test(loop[0]), 'allowed() 검사가 이동 루프 안에 없다');
+      assert.ok(/MAX_HOPS/.test(nj), '리다이렉트 횟수 제한이 없다');
+      ok('앱 브리지가 리다이렉트를 직접 따라가며 이동마다 다시 검사한다');
     }
   }
 
@@ -354,6 +396,23 @@ if (A) {
   assert.ok(new Date(ca.validTo) > new Date(Date.now() + 90 * 86400e3),
     '중간 인증서 만료 90일 전 — 잎 인증서 AIA의 crt.sectigo.com에서 새로 받아 교체할 것');
   ok('내장 Sectigo 중간 인증서의 지문·주체·발급자가 맞다');
+
+  // ---------- 5a. 공개 서버는 루프백만 듣는다 (auth.js가 있을 때만) ----------
+  // 전체 인터페이스에 붙으면 공인IP:8778로 평문 HTTP 접속이 열려 비밀번호와 세션 쿠키가 그대로 흐른다.
+  // nginx는 127.0.0.1로 프록시하므로 HTTPS 경로는 이것으로 충분하다.
+  if (A) {
+    const { execFileSync } = require('child_process');
+    const os = require('os');
+    const probe = 'const a=require("./auth.js");a.server.listen(0,process.env.AUTH_HOST||"127.0.0.1",()=>{'
+      + 'console.log(a.server.address().address);process.exit(0);});';
+    const addr = execFileSync(process.execPath, ['-e', probe],
+      { cwd: __dirname, env: { ...process.env, ETF_PASS: 'testpass' }, encoding: 'utf8' }).trim();
+    assert.strictEqual(addr, '127.0.0.1', `기본 바인딩이 ${addr} — 외부에서 평문으로 접속할 수 있다`);
+    const lan = Object.values(os.networkInterfaces()).flat()
+      .find(i => i && i.family === 'IPv4' && !i.internal);
+    assert.ok(!/0\.0\.0\.0/.test(addr), '전체 인터페이스에 붙었다');
+    ok('auth.js는 기본으로 루프백만 듣는다' + (lan ? ` (이 PC의 ${lan.address}로는 열리지 않는다)` : ''));
+  }
 
   // ---------- 6. 인증 전 요청으로 서버가 죽지 않는다 (실제 소켓, auth.js가 있을 때만) ----------
   if (A) {
