@@ -146,6 +146,22 @@ if (A) {
     ok('지수 등락 부호가 상승·하락 양쪽에서 맞는다');
   }
 
+  // ---------- 3c-2b. 지수 종가는 확정된 뒤에만 고정한다 ----------
+  // 네이버는 15:30 직후 이미 marketStatus=CLOSE를 주는데 그 값은 확정 종가가 아니다
+  // (실측 2026-08-11: 직후 코스피 6,358.35 → 확정 6,345.53, 12.8p 차이). 상태만 보고 굳히면
+  // 켜 둔 화면이 종일 그 값을 들고 있는다 — 앱을 새로 켠 사람과 값이 다르게 보였다.
+  {
+    const KST3 = (d, h, mi) => Date.UTC(2026, 7, d, h - 9, mi); // 2026-08-11(화) 기준
+    assert.strictEqual(S.idxSettled(KST3(11, 15, 31)), false, '마감 직후 값을 확정 종가로 굳힌다');
+    assert.strictEqual(S.idxSettled(KST3(11, 15, 45)), false, '종가가 확정되기 전에 굳힌다');
+    assert.strictEqual(S.idxSettled(KST3(11, 16, 0)), true, '확정 시각이 지났는데도 계속 다시 받는다');
+    assert.strictEqual(S.idxSettled(KST3(11, 23, 0)), true, '밤에도 지수를 다시 받는다');
+    assert.strictEqual(S.idxSettled(KST3(12, 8, 30)), true, '개장 전에는 전일 종가가 최종이다');
+    assert.strictEqual(S.idxSettled(KST3(11, 13, 0)), false, '장중에는 굳혀선 안 된다');
+    assert.strictEqual(S.idxSettled(KST3(15, 13, 0)), true, '주말은 다시 받을 이유가 없다'); // 8/15 토
+    ok('지수 종가는 확정 시각(16:00) 이후에만 고정하고, 마감 직후에는 다시 받는다');
+  }
+
   // ---------- 3c-3. PDF 갱신 경계 (하루 세 번만 새로 받는다) ----------
   {
     const KST = (h, mi) => Date.UTC(2026, 7, 10, h - 9, mi);

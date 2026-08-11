@@ -1390,15 +1390,23 @@ const nightUsable = q => !!q && Number.isFinite(q.chgPct)
 // 야간선물만 30초를 지킨다. 이 선들은 차단당하지 않는 한계로 확인된 값이라 더 줄이지 않는다.
 const IDX_TTL = LOCAL ? 8e3 : 17e3;
 const YF_TTL = 15e3;
+const IDX_SETTLE_TTL = 5 * 60e3; // 마감~종가 확정 사이의 조회 간격
+// 종가가 확정된 뒤인가 — 그 뒤에는 값이 변하지 않으므로 캐시를 그대로 쓴다.
+// 15:30 마감이지만 종가 단일가 체결분이 반영되기까지 몇 분이 더 걸린다(16:00을 여유 있는 선으로 잡았다).
+const idxSettled = (now = Date.now()) =>
+  krSession(now) === '휴장' || kstHm(now) >= 1600 || kstHm(now) < 900;
 // 지수는 정규장에만 움직인다 — 장외에는 새로 부르지 않고 마지막 값을 쓴다.
-// 단 장중에 받아 둔 값은 종가가 아니므로(marketStatus=OPEN) 마감 후 한 번은 다시 받아 종가로 바꾼다.
+// ⚠ marketStatus만 보고 고정하면 안 된다. 네이버는 15:30 직후 이미 CLOSE를 주는데 그 값은 아직
+// 확정 종가가 아니다(실측 2026-08-11: 15:30 직후 코스피 6,358.35 → 확정 6,345.53, 12.8p 차이).
+// 그래서 확정 시각까지는 몇 분 간격으로 다시 받아 종가로 바꾼다.
 const naverIndex = async (code, live) => {
   const key = `idx:${code}`;
   if (!live) {
     const c = cache.get(key);
-    if (c?.data && c.data.marketStatus !== 'OPEN') return c.data;
+    if (c?.data && c.data.marketStatus !== 'OPEN' && idxSettled()) return c.data;
   }
-  return cached(key, IDX_TTL, () => getJson(`https://m.stock.naver.com/api/index/${code}/basic`));
+  return cached(key, live ? IDX_TTL : IDX_SETTLE_TTL,
+    () => getJson(`https://m.stock.naver.com/api/index/${code}/basic`));
 };
 
 async function marketQuotes() {
@@ -3492,6 +3500,6 @@ if (require.main === module) {
     try { fs.writeFileSync(__dirname + '/server.pid', String(process.pid)); } catch (e) {}
   });
 }
-module.exports = { server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, krSession, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
+module.exports = { server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, krSession, idxSettled, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
 
 }
