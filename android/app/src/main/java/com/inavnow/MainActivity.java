@@ -29,6 +29,7 @@ public class MainActivity extends Activity {
                 && u.getPath() != null && u.getPath().startsWith("/android_asset/");
     }
 
+    private volatile boolean destroyed = false; // 파괴된 WebView를 만지지 않도록
     private WebView web;
     private Net net;
     private long lastBack;
@@ -89,8 +90,10 @@ public class MainActivity extends Activity {
 
     /** Net이 백그라운드 스레드에서 부른다 → JS는 메인 스레드에서만 만질 수 있다 */
     void resolveNet(String id, String json) {
+        if (destroyed) return;
         final String js = "window.__netDone(" + JSONObject.quote(id) + "," + JSONObject.quote(json) + ")";
-        runOnUiThread(() -> web.evaluateJavascript(js, null));
+        // UI 스레드에 올라간 뒤에 파괴될 수 있다 — 실행 직전에 한 번 더 본다
+        runOnUiThread(() -> { if (!destroyed) web.evaluateJavascript(js, null); });
     }
 
     /**
@@ -113,6 +116,8 @@ public class MainActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
+        destroyed = true; // 이 뒤로는 어떤 응답도 WebView로 보내지 않는다
+        net.close(); // 요청 풀·시한 감시 스레드를 정리한다(Activity 재생성마다 쌓이지 않게)
         web.destroy();
         super.onDestroy();
     }

@@ -363,14 +363,118 @@ if (A) {
 
       // 자동 리다이렉트를 켜면 첫 URL만 검사되고, 허용된 사이트가 30x로 가리키는 낯선 호스트로
       // 그대로 나간다 = 허용 목록이 무력해진다. 자바 코드는 여기서 돌릴 수 없어 구조만 고정한다.
-      const nj = fs.readFileSync(netJava, 'utf8');
+      // 검사는 전부 '주석을 걷어낸' 소스로 한다 — 주석에 함수 이름을 적어 두면 통과해 버린다
+      // (실측: 순서 검사가 주석 속 getOutputStream을 실제 호출로 봤다).
+      // 주석만 지우고 문자열은 남긴다 — 정규식으로 //를 지우면 코드 안의 "://"(originOf가 출처를
+      // 만들 때 쓴다)까지 주석으로 보고 그 줄의 뒷부분을 먹는다
+      const strip = t => {
+        let out = '', i = 0;
+        while (i < t.length) {
+          const c = t[i];
+          if (c === '"' || c === "'") {                       // 문자열 리터럴은 그대로
+            let j = i + 1;
+            while (j < t.length && t[j] !== c) j += t[j] === '\\' ? 2 : 1;
+            out += t.slice(i, j + 1); i = j + 1;
+          } else if (c === '/' && t[i + 1] === '/') {          // 한 줄 주석
+            while (i < t.length && t[i] !== '\n') i++;
+          } else if (c === '/' && t[i + 1] === '*') {          // 여러 줄 주석
+            const e = t.indexOf('*/', i + 2); i = e < 0 ? t.length : e + 2;
+          } else { out += c; i++; }
+        }
+        return out;
+      };
+      // strip 자체를 먼저 확인한다 — 이 아래 검사 전부가 여기에 얹혀 있다
+      assert.strictEqual(strip('a("://"); // b\nc /* d */ e'), 'a("://"); \nc  e', 'strip이 문자열이나 주석을 잘못 다룬다');
+      const nj = strip(fs.readFileSync(netJava, 'utf8'));
+      assert.ok(nj.includes('"://"'), 'strip이 코드 안의 "://"를 지웠다');
       assert.ok(/setInstanceFollowRedirects\(false\)/.test(nj), '자동 리다이렉트가 켜져 있다 — 허용 목록을 우회한다');
       assert.ok(!/setInstanceFollowRedirects\(true\)/.test(nj), 'setInstanceFollowRedirects(true)가 남아 있다');
       // 이동할 때마다 검사하려면 allowed()가 루프 안에 있어야 한다(요청 생성보다 앞에)
       const loop = /for \(int hop[\s\S]*?openConnection\(\)/.exec(nj);
       assert.ok(loop && /allowed\(target\)/.test(loop[0]), 'allowed() 검사가 이동 루프 안에 없다');
       assert.ok(/MAX_HOPS/.test(nj), '리다이렉트 횟수 제한이 없다');
-      ok('앱 브리지가 리다이렉트를 직접 따라가며 이동마다 다시 검사한다');
+      // 헤더(Cookie·Referer)를 매 홉에 다시 싣기 때문에, 출처가 바뀌면 A의 쿠키가 B로 건네진다.
+      // 호스트 이름만 비교하면 같은 이름의 다른 포트(8443 등)를 남의 출처로 보지 못한다
+      assert.ok(/originOf\(target\)\.equals\(origin\)/.test(nj),
+        '출처가 바뀌는 리다이렉트를 막지 않는다 — 쿠키가 다른 곳으로 넘어간다');
+      assert.ok(/getDefaultPort/.test(nj), '출처 비교가 포트를 보지 않는다');
+      assert.ok(/getPort\(\) != 443/.test(nj), '허용 목록이 포트를 보지 않는다 — 허용 호스트의 다른 포트로 나갈 수 있다');
+      // 홉마다 타임아웃을 새로 세면 3번 이동에 8초×4까지 늘어난다. connect·read·본문 읽기가
+      // 각각 남은 시간을 새로 쓰는 것도 막아야 실제 상한이 생긴다
+      assert.ok(/deadline/.test(nj) && !/setReadTimeout\(timeout\)/.test(nj),
+        '타임아웃이 요청 단위가 아니라 홉 단위다');
+      assert.ok(/clock\.schedule\([^)]*disconnect/.test(nj), '시한이 지나도 연결을 끊지 않는다');
+      assert.ok(/readAll\(in, deadline\)/.test(nj), '본문 읽기가 시한을 보지 않는다');
+      // 감시가 본문 전송보다 늦게 걸리면 POST가 그 자리에서 막힐 때 시한이 소용없다
+      const gi = nj.indexOf('clock.schedule'), oi = nj.indexOf('getOutputStream');
+      assert.ok(gi > 0 && oi > gi, '시한 감시가 본문 전송(getOutputStream)보다 늦게 걸린다');
+      // 중괄호 균형으로 블록을 떼어 낸다(정규식으로 끝을 짚으면 엉뚱한 줄을 문다).
+      // 못 찾으면 null — 표식을 놓쳤을 때 파일 첫 중괄호(=클래스 전체)를 집어 조용히 통과하면 안 된다.
+      // 리터럴 안의 중괄호는 세지 않는다(문자열은 strip이 남겨 두므로 여기서 걸러야 한다).
+      const blockAt = (t, from) => {
+        if (from < 0) return null;
+        const j = t.indexOf('{', from);
+        if (j < 0) return null;
+        let d = 0;
+        for (let k = j; k < t.length; k++) {
+          const ch = t[k];
+          if (ch === '"' || ch === "'") {
+            k++;
+            while (k < t.length && t[k] !== ch) k += t[k] === '\\' ? 2 : 1;
+            continue;
+          }
+          if (ch === '{') d++;
+          else if (ch === '}' && --d === 0) return t.slice(j, k + 1);
+        }
+        return null; // 균형이 맞지 않는다
+      };
+      assert.strictEqual(blockAt('x { a "}" b } y', 0), '{ a "}" b }', 'blockAt이 문자열 안의 중괄호를 센다');
+      assert.strictEqual(blockAt('아무것도', -1), null, 'blockAt이 표식을 놓쳤는데 무언가를 돌려준다');
+      assert.strictEqual(blockAt('x { 안 닫힘', 0), null, 'blockAt이 균형이 안 맞는데 돌려준다');
+      // 정상·예외·리다이렉트 어느 길로 나가도 감시 해제·목록 제거·연결 닫기 셋이 다 일어나야 한다.
+      // (셋 중 하나가 빠져도 통과하지 않도록 finally 블록 안에서 함께 본다 — active.remove는
+      //  예약 실패 처리에도 있어서 파일 전체 검색으로는 구분되지 않는다)
+      const fin = blockAt(nj, nj.indexOf('} finally {', nj.indexOf('int status')));
+      assert.ok(fin, '요청 처리의 finally 블록을 찾지 못했다 — 구조가 바뀌었으면 이 검사도 고칠 것');
+      assert.ok(/guard\.cancel\(false\)/.test(fin), 'finally가 시한 감시를 해제하지 않는다');
+      assert.ok(/active\.remove\(c\)/.test(fin), 'finally가 진행 중 목록에서 빼지 않는다 — close()가 이미 끝난 연결을 만진다');
+      assert.ok(/c\.disconnect\(\)/.test(fin), 'finally가 연결을 닫지 않는다');
+      assert.ok(/active\.add\(c\)/.test(nj), '진행 중인 연결을 등록하지 않는다');
+      // close(): 연결을 먼저 끊고 스레드를 내려야 한다. clock을 먼저 내리면 네트워크에서 막힌
+      // 요청을 나중에 끊어 줄 감시가 사라져, 화면이 사라진 뒤에도 그 요청이 남는다
+      const closeBody = blockAt(nj, nj.indexOf('void close()'));
+      assert.ok(closeBody, 'close()를 찾지 못했다');
+      const ci = closeBody.indexOf('disconnect'), si = closeBody.indexOf('shutdownNow');
+      assert.ok(ci >= 0 && si > ci, 'close()가 연결을 끊기 전에 스레드를 내린다 — 막힌 요청이 남는다');
+      assert.ok((closeBody.match(/shutdownNow/g) || []).length === 2, 'close()가 두 스레드를 다 내리지 않는다');
+      // 닫힌 뒤에는 콜백을 돌려보내지 않는다
+      assert.ok(/if \(!closed\) act\.resolveNet/.test(nj), '닫힌 뒤에도 응답을 화면으로 보낸다');
+      // 등록·감시 예약과 close()가 같은 자물쇠 안이어야 서로를 지나치지 않는다. 나뉘어 있으면
+      // close()가 목록을 훑은 뒤 끼어든 연결이 감시 없이 네트워크로 나간다
+      const locks = [];
+      for (let i = nj.indexOf('synchronized (lifecycle)'); i >= 0; i = nj.indexOf('synchronized (lifecycle)', i + 1)) {
+        const bl = blockAt(nj, i);
+        if (bl) locks.push(bl);
+      }
+      assert.ok(locks.some(bl => /active\.add\(c\)/.test(bl) && /clock\.schedule/.test(bl)),
+        '연결 등록과 시한 감시 예약이 같은 자물쇠 안에 없다');
+      assert.ok(locks.some(bl => /closed = true/.test(bl) && /shutdownNow/.test(bl)),
+        'close()가 자물쇠 밖에서 종료를 진행한다');
+      assert.ok(locks.some(bl => /if \(closed\) return;/.test(bl) && /pool\.execute/.test(bl)),
+        '종료 중에도 새 작업을 큐에 넣는다 — 거부 예외가 브리지 밖으로 나갈 수 있다');
+      // 위 셋이 서로 다른 블록이어야 한다(표식이 통째로 사라진 경우를 잡는 안전망)
+      assert.ok(locks.length >= 3, `자물쇠 블록이 ${locks.length}개다 — 요청 시작·연결 등록·종료 세 곳에 있어야 한다`);
+
+      const mj = strip(fs.readFileSync(path.join(__dirname, 'android/app/src/main/java/com/inavnow/MainActivity.java'), 'utf8'));
+      const onDestroy = /protected void onDestroy\(\)\s*\{([\s\S]*?)\n    \}/.exec(mj);
+      assert.ok(onDestroy, 'onDestroy를 찾지 못했다');
+      assert.ok(/net\.close\(\)/.test(onDestroy[1]),
+        'onDestroy가 Net을 정리하지 않는다 — 화면이 재생성될 때마다 스레드가 쌓인다');
+      assert.ok(/destroyed = true/.test(onDestroy[1]), 'onDestroy가 파괴 표시를 남기지 않는다');
+      // 파괴된 WebView를 만지면 죽는다 — UI 스레드에 올라간 뒤에도 한 번 더 봐야 한다
+      assert.ok(/if \(destroyed\) return/.test(mj) && /if \(!destroyed\) web\.evaluateJavascript/.test(mj),
+        '파괴 후 콜백이 WebView로 들어갈 수 있다');
+      ok('앱 브리지가 리다이렉트를 직접 따라가며 이동마다 다시 검사한다(교차 호스트 거부·공용 시한·정리)');
     }
   }
 
@@ -401,17 +505,46 @@ if (A) {
   // 전체 인터페이스에 붙으면 공인IP:8778로 평문 HTTP 접속이 열려 비밀번호와 세션 쿠키가 그대로 흐른다.
   // nginx는 127.0.0.1로 프록시하므로 HTTPS 경로는 이것으로 충분하다.
   if (A) {
-    const { execFileSync } = require('child_process');
+    // 검사가 스스로 listen하면 안 된다 — require일 때는 auth.js의 바인딩 코드(require.main 블록)가
+    // 실행되지 않아, 거기가 0.0.0.0으로 되돌아가도 통과해 버린다. 정말 프로세스로 띄워서 확인한다.
+    assert.strictEqual(A.HOST, '127.0.0.1', `listen에 쓰는 값이 ${A.HOST}다`);
     const os = require('os');
-    const probe = 'const a=require("./auth.js");a.server.listen(0,process.env.AUTH_HOST||"127.0.0.1",()=>{'
-      + 'console.log(a.server.address().address);process.exit(0);});';
-    const addr = execFileSync(process.execPath, ['-e', probe],
-      { cwd: __dirname, env: { ...process.env, ETF_PASS: 'testpass' }, encoding: 'utf8' }).trim();
-    assert.strictEqual(addr, '127.0.0.1', `기본 바인딩이 ${addr} — 외부에서 평문으로 접속할 수 있다`);
-    const lan = Object.values(os.networkInterfaces()).flat()
-      .find(i => i && i.family === 'IPv4' && !i.internal);
-    assert.ok(!/0\.0\.0\.0/.test(addr), '전체 인터페이스에 붙었다');
-    ok('auth.js는 기본으로 루프백만 듣는다' + (lan ? ` (이 PC의 ${lan.address}로는 열리지 않는다)` : ''));
+    // PORT=0으로 띄우고 실제 포트를 자식이 찍어 준 것에서 읽는다 — 포트를 고르면 다른 프로세스와
+    // 부딪히고, 하필 그 자리에 남의 HTTP 서버가 있으면 엉뚱한 응답을 보고 통과할 수 있다
+    const child = require('child_process').spawn(process.execPath, ['auth.js'],
+      { cwd: __dirname, env: { ...process.env, ETF_PASS: 'testpass', PORT: '0' } });
+    try {
+      const aport = await new Promise((res, rej) => {
+        const t = setTimeout(() => rej(new Error('auth.js가 10초 안에 포트를 알려주지 않았다')), 10000);
+        let buf = '';
+        child.stdout.on('data', d => {
+          buf += d;
+          const m = /localhost:(\d+)/.exec(buf);
+          if (m) { clearTimeout(t); res(+m[1]); }
+        });
+        child.on('exit', c => { clearTimeout(t); rej(new Error(`auth.js가 바로 끝났다(코드 ${c})`)); });
+      });
+      const hit = host => new Promise(res => {
+        const rq = http.get({ host, port: aport, path: '/', timeout: 1500 }, r => { r.resume(); res(true); });
+        rq.on('error', () => res(false));
+        rq.on('timeout', () => { rq.destroy(); res(false); });
+      });
+      assert.ok(await hit('127.0.0.1'), `auth.js가 127.0.0.1:${aport}에서 응답하지 않는다`);
+      const lan = Object.values(os.networkInterfaces()).flat()
+        .find(i => i && i.family === 'IPv4' && !i.internal);
+      if (lan) {
+        assert.strictEqual(await hit(lan.address), false,
+          `${lan.address}:${aport}으로 접속됐다 — 같은 망의 누구나 평문으로 로그인 화면에 닿는다`);
+      }
+      ok('node auth.js가 루프백만 듣는다' + (lan ? ` (${lan.address}로는 닿지 않는다)` : ' (LAN 주소 없음)'));
+    } finally {
+      // 이미 끝났으면 기다리지 않는다 — 종료된 뒤에 exit를 기다리면 영원히 걸린다
+      if (child.exitCode === null && child.signalCode === null) {
+        const done = new Promise(r => child.once('exit', r));
+        child.kill();
+        await done;
+      }
+    }
   }
 
   // ---------- 6. 인증 전 요청으로 서버가 죽지 않는다 (실제 소켓, auth.js가 있을 때만) ----------
