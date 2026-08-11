@@ -164,9 +164,9 @@ if (A) {
 
   // ---------- 3c-4. PDF 기준일이 낡으면 짧게 쥔다 (늦게 올리는 운용사 대응) ----------
   {
-    const KST = (h, mi) => Date.UTC(2026, 7, 10, h - 9, mi);
-    const today = S.todayYmd();
-    const yst = String(+today - 1); // 같은 달 안이면 이렇게도 충분하다(검사용)
+    const KST = (h, mi) => Date.UTC(2026, 7, 11, h - 9, mi); // 2026-08-11(화)
+    // 날짜·시각을 모두 고정한다 — pdfTtlFor 내부의 '오늘'도 now에서 뽑으므로 실행일과 무관하다
+    const yst = '20260810', today = '20260811';
     // 어댑터마다 다른 필드에서 기준일을 꺼낸다
     assert.strictEqual(S.pdfStdDt({ std_DT: '2026-08-11' }), '20260811', 'ACE 필드');
     assert.strictEqual(S.pdfStdDt({ pdf: { gijunYMD: '20260811' } }), '20260811', 'KODEX 필드');

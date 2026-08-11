@@ -189,8 +189,8 @@ function krIsin(code) { // 6자리 종목코드 → KR ISIN (표준 체크디지
   return base + ((10 - (sum % 10)) % 10);
 }
 
-function todayYmd(sep = '') {
-  const kst = new Date(Date.now() + 9 * 3600e3);
+function todayYmd(sep = '', now = Date.now()) { // now는 검사용 주입구 — 평소엔 시계
+  const kst = new Date(now + 9 * 3600e3);
   return [kst.getUTCFullYear(), String(kst.getUTCMonth() + 1).padStart(2, '0'), String(kst.getUTCDate()).padStart(2, '0')].join(sep);
 }
 
@@ -333,7 +333,7 @@ const hmToMin = hm => Math.floor(hm / 100) * 60 + (hm % 100);
 // (실측 재현: 19:05 수신·02:00 조회 → TTL 30분인데 나이 415분 → 새벽에 다시 받는다. Codex 지적).
 function pdfTtlFor(data, fetchedAt = Date.now(), now = Date.now()) {
   const d8 = pdfStdDt(data);
-  if (d8 && d8 < todayYmd() && pdfRetryTime(now)) return 30 * 60e3;
+  if (d8 && d8 < todayYmd('', now) && pdfRetryTime(now)) return 30 * 60e3; // 날짜 기준도 now에 맞춘다
   return pdfTtl(fetchedAt);
 }
 // 낡은 자료를 다시 확인해도 되는 때인가 — 거래일이고 첫 갱신 시각을 지났을 때만.
