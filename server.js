@@ -2158,6 +2158,11 @@ const HTML = `<!doctype html>
     align-items: center; justify-content: center; font-size: 14px; line-height: 1; color: var(--muted2); }
   #pfrf[disabled] { cursor: default; color: var(--gold); animation: pfspin .9s linear infinite; }
   @keyframes pfspin { to { transform: rotate(360deg); } }
+  /* '지금 다시 받기' 진행 게이지 — 종목을 하나씩 받을 때마다 왼쪽부터 찬다.
+     반투명이라 버튼 글자가 그대로 읽힌다 */
+  /* '지금 다시 받기' 진행 표시 — 버튼 배경을 왼쪽부터 채운다. 안에 막대를 넣는 방식은
+     button 내부에서 절대배치 자식의 폭이 0으로 잡혀(px로 줘도) 쓸 수 없었다(실측). */
+  #pdfrf { background-repeat: no-repeat; transition: background-position .2s linear; }
   #pfsum { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin: 14px 0 4px; text-align: center; }
   #pfsum .bx { background: var(--soft); border-radius: 10px; padding: 11px 8px; }
   #pfsum .bx > .muted { font-size: 12px; }
@@ -2524,16 +2529,41 @@ async function pdfInfo(){
       + (d.blocked.length ? ' · 오늘 차단: '+d.blocked.join(',') : '');
   } catch(e){ el.textContent = '상태를 읽지 못했습니다.'; }
 }
+// 눌렀을 때 '다음 조회 때 받는다'고 미루지 않고, 지금 화면에 필요한 종목을 실제로 다시 받는다.
+// 진행률은 종목 단위로 안다(홈이면 포트폴리오 종목, 종목 화면이면 그 종목 하나).
 async function pdfReload(){
   const btn = document.getElementById('pdfrf'), el = document.getElementById('pdfinfo');
-  btn.disabled = true; el.textContent = '지우는 중…';
+  if(btn.disabled) return;
+  const bar = function(p){
+    const pct = Math.round(p * 100) + '%';
+    btn.style.backgroundImage = p > 0
+      ? 'linear-gradient(to right, var(--goldbg) ' + pct + ', transparent ' + pct + ')' : '';
+  };
+  btn.disabled = true; bar(0);
   try {
     await fetch('/api/pdfinfo?clear=1');
-    el.textContent = '지웠습니다. 다음 조회 때 새로 받습니다.';
-    // 화면에 보이는 값도 새로 받게 한다(홈이면 포트폴리오, 종목 화면이면 그 종목)
-    if(HOME){ PFCAT = null; if(typeof pfCalc === 'function') pfCalc(); } else { refresh(); }
-  } catch(e){ el.textContent = '초기화에 실패했습니다.'; }
-  btn.disabled = false;
+    const codes = HOME ? PF.map(function(h){ return h.code; }) : [CODE];
+    if(!codes.length){ el.textContent = '지웠습니다. 종목을 열면 새로 받습니다.'; bar(1); }
+    else {
+      el.textContent = '다시 받는 중… (0/' + codes.length + ')';
+      for(let i = 0; i < codes.length; i++){
+        try {
+          const d = await (await fetch('/api/inav?code=' + encodeURIComponent(codes[i]))).json();
+          if(d && d.inav != null){
+            dSave(codes[i], d);
+            if(HOME) PFV[codes[i]] = { inav: d.inav, price: d.marketPrice };
+            else { D = d; render(); }
+          }
+        } catch(e){ /* 한 종목 실패가 나머지를 막지 않는다 */ }
+        bar((i + 1) / codes.length);
+        el.textContent = '다시 받는 중… (' + (i + 1) + '/' + codes.length + ')';
+      }
+      if(HOME){ PFAT = PFCAT = new Date(); pfSaveCalc(); pfRender(); }
+      await pdfInfo(); // 새 상태(수신 시각·기준일)로 문구를 바꿔 준다
+    }
+  } catch(e){ el.textContent = '다시 받지 못했습니다.'; }
+  await new Promise(function(r){ setTimeout(r, 400); }); // 다 찬 모습이 눈에 보이도록 잠깐 둔다
+  bar(0); btn.disabled = false;
 }
 document.getElementById('theme').onchange = function(){ CFG.theme = this.value; saveCfg(); };
 [...document.querySelectorAll('input[name=tm]')].forEach(r=>{
