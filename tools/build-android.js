@@ -94,7 +94,7 @@ const SHIM = BRIDGE + `<script src="engine.js"></script>
           count: live.length, total: items.length,
           oldest: live.length ? Math.min.apply(null, live) : null,
           newest: live.length ? Math.max.apply(null, live) : null,
-          dates: dates, stale: sets.filter(function(d){ return d < ENGINE.todayYmd(); }).length, // 종목별로 센다
+          dates: dates, retrying: ENGINE.pdfRetryTime(), stale: sets.filter(function(d){ return d < ENGINE.todayYmd(); }).length, // 종목별로 센다
           ttlMs: ENGINE.pdfTtl(), marks: ENGINE.PDF_MARKS, blocked: blocked,
         });
       }

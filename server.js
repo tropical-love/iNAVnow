@@ -328,12 +328,18 @@ const hmToMin = hm => Math.floor(hm / 100) * 60 + (hm % 100);
 //     30분마다 다시 받는다(하루 최대 48회. 로컬 PC판은 숨은 탭도 계산하므로 차단 위험이 실재한다).
 //  ② 첫 갱신 시각(08:00)을 지났을 때만. 그 전에는 전일자가 정상이다.
 // TIGER·RISE는 캐시에 HTML을 담아 기준일을 읽을 수 없다 — 그 둘은 항상 경계 TTL만 쓴다.
-function pdfTtlFor(data, at = Date.now()) {
+// fetchedAt(받은 시각)과 now(지금)를 반드시 나눠 받는다 — 하나로 쓰면 자정 이후 첫 계산에서
+// '받은 시각이 08:00 이후'로 읽혀 30분 TTL이 적용되고, 이미 몇 시간 지난 캐시가 만료된다
+// (실측 재현: 19:05 수신·02:00 조회 → TTL 30분인데 나이 415분 → 새벽에 다시 받는다. Codex 지적).
+function pdfTtlFor(data, fetchedAt = Date.now(), now = Date.now()) {
   const d8 = pdfStdDt(data);
-  const bizNow = krSession(at) !== '휴장' && kstHm(at) >= PDF_MARKS[0];
-  if (d8 && d8 < todayYmd() && bizNow) return 30 * 60e3;
-  return pdfTtl(at);
+  if (d8 && d8 < todayYmd() && pdfRetryTime(now)) return 30 * 60e3;
+  return pdfTtl(fetchedAt);
 }
+// 낡은 자료를 다시 확인해도 되는 때인가 — 거래일이고 첫 갱신 시각을 지났을 때만.
+// 평일 공휴일은 09:10 무렵 휴장이 확정되기 전까지 거래일로 보이므로 아침에 두세 번 헛조회가
+// 날 수 있다(주말 48회와 달리 감당 가능한 수준이라 그대로 둔다).
+const pdfRetryTime = (now = Date.now()) => krSession(now) !== '휴장' && kstHm(now) >= PDF_MARKS[0];
 function pdfTtl(now = Date.now()) {
   const cur = hmToMin(kstHm(now));
   const next = PDF_MARKS.find(m => hmToMin(m) > cur);
@@ -2514,7 +2520,7 @@ async function pdfInfo(){
     el.textContent = d.count+'건 보관'+((d.total||0) > d.count ? '(만료 '+(d.total-d.count)+')' : '')+' · 마지막 수신 '+ago
       + (d.dates.length ? ' · 기준일 '+d.dates.join(', ') : '')
       + ' · 다음 갱신 '+nx.toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'})
-      + (d.stale ? ' · 아직 지난 기준일 '+d.stale+'종목(30분 뒤 다시 확인)' : '')
+      + (d.stale ? ' · 아직 지난 기준일 '+d.stale+'종목'+(d.retrying ? '(30분 뒤 다시 확인)' : '(다음 갱신 때 확인)') : '')
       + (d.blocked.length ? ' · 오늘 차단: '+d.blocked.join(',') : '');
   } catch(e){ el.textContent = '상태를 읽지 못했습니다.'; }
 }
@@ -3294,7 +3300,7 @@ const handler = async (req, res) => {
       count: live.length, total: items.length,
       oldest: live.length ? Math.min(...live.map(x => x.at)) : null,
       newest: live.length ? Math.max(...live.map(x => x.at)) : null,
-      dates, stale, ttlMs: pdfTtl(), marks: PDF_MARKS, blocked,
+      dates, stale, retrying: pdfRetryTime(), ttlMs: pdfTtl(), marks: PDF_MARKS, blocked,
     }), JSON_T);
     return;
   }
@@ -3335,7 +3341,7 @@ const handler = async (req, res) => {
 // 안드로이드에서는 HTTP 서버가 없다 — 페이지가 이 함수들을 직접 부른다(에셋 index.html의 fetch shim).
 if (!NODE) {
   globalThis.ENGINE = { computeINav, etfList, marketQuotes, krQuotes, stats, cache, saveCache,
-    issuerBlocked, pdfTtl, pdfTtlFor, pdfStdDt, fxKeyD, PDF_MARKS, krSession, todayYmd, DEFAULT_CODE };
+    issuerBlocked, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, fxKeyD, PDF_MARKS, krSession, todayYmd, DEFAULT_CODE };
 } else {
 
 // async 핸들러가 던지면 unhandled rejection으로 프로세스가 죽는다 — 요청 하나로 서비스가 내려간다.
@@ -3356,6 +3362,6 @@ if (require.main === module) {
     try { fs.writeFileSync(__dirname + '/server.pid', String(process.pid)); } catch (e) {}
   });
 }
-module.exports = { server, handler, PORT, HTML, cached, cache, krSession, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
+module.exports = { server, handler, PORT, HTML, cached, cache, krSession, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
 
 }
