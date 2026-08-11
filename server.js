@@ -218,7 +218,8 @@ try {
   if (raw) for (const [k, v] of Object.entries(JSON.parse(raw))) {
     if (PERSIST_RE.test(k) || Date.now() - v.ts < v.ttl) cache.set(k, v);
   }
-} catch (e) { console.error('캐시 로드 실패:', e.message); } // 조용히 삼키면 위와 같은 버그를 못 본다
+// 조용히 삼키면 위와 같은 버그를 못 본다. 다만 처음 실행이라 파일이 없는 것은 오류가 아니다.
+} catch (e) { if (e.code !== 'ENOENT') console.error('캐시 로드 실패:', e.message); }
 // 숨김 작업(세션 0)으로 돌면 콘솔이 없어 오류를 확인할 방법이 아예 없다 — 파일에도 남긴다.
 // 출력은 시작 로그와 오류뿐이라 거의 안 자라지만, 시작할 때 1MB를 넘으면 비운다.
 // isTTY로 숨김 실행만 골라내려 했지만 세션 0에서도 참으로 나와 로그가 안 남았다 — 그냥 항상 남긴다.
