@@ -321,12 +321,17 @@ const pdfStdDt = d => {
   return '';
 };
 const hmToMin = hm => Math.floor(hm / 100) * 60 + (hm % 100);
-// 받아 온 자료의 기준일이 아직 지난 영업일이면 다음 경계까지 기다리지 않는다 — 늦게 올리는 운용사가
-// 있어서(실측 2026-08-10 18:15: 키움·ACE는 08-11자, PLUS는 아직 08-10자) 08:00에 낡은 것을 받으면
-// 하루 종일 그걸 쓰게 된다. 30분 뒤 다시 확인하고, 새 기준일을 받으면 경계 방식으로 돌아간다.
+// 아침 갱신에서 받은 자료가 아직 지난 기준일이면(늦게 올리는 운용사가 있다) 다음 경계까지 기다리지
+// 않고 30분 뒤 다시 확인한다. 새 기준일을 받으면 경계 방식으로 돌아간다.
+// ⚠ 판정 조건 두 개가 반드시 필요하다 —
+//  ① 오늘이 거래일일 때만. 주말·공휴일에는 직전 영업일자가 정상인데 그걸 낡았다고 보면
+//     30분마다 다시 받는다(하루 최대 48회. 로컬 PC판은 숨은 탭도 계산하므로 차단 위험이 실재한다).
+//  ② 첫 갱신 시각(08:00)을 지났을 때만. 그 전에는 전일자가 정상이다.
+// TIGER·RISE는 캐시에 HTML을 담아 기준일을 읽을 수 없다 — 그 둘은 항상 경계 TTL만 쓴다.
 function pdfTtlFor(data, at = Date.now()) {
   const d8 = pdfStdDt(data);
-  if (d8 && d8 < todayYmd()) return 30 * 60e3;
+  const bizNow = krSession(at) !== '휴장' && kstHm(at) >= PDF_MARKS[0];
+  if (d8 && d8 < todayYmd() && bizNow) return 30 * 60e3;
   return pdfTtl(at);
 }
 function pdfTtl(now = Date.now()) {
@@ -2506,7 +2511,7 @@ async function pdfInfo(){
     const mins = Math.round((Date.now() - d.newest) / 60000);
     const ago = mins < 1 ? '방금' : mins < 60 ? mins+'분 전' : Math.floor(mins/60)+'시간 '+(mins%60)+'분 전';
     const nx = new Date(Date.now() + (d.ttlMs || 0));
-    el.textContent = d.count+'건 보관 · 마지막 수신 '+ago
+    el.textContent = d.count+'건 보관'+((d.total||0) > d.count ? '(만료 '+(d.total-d.count)+')' : '')+' · 마지막 수신 '+ago
       + (d.dates.length ? ' · 기준일 '+d.dates.join(', ') : '')
       + ' · 다음 갱신 '+nx.toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'})
       + (d.stale ? ' · 아직 지난 기준일 '+d.stale+'종목(30분 뒤 다시 확인)' : '')
@@ -3280,10 +3285,10 @@ const handler = async (req, res) => {
       items.push({ at: v.ts, stdDt: pdfStdDt(v.data) || null, alive });
     }
     const live = items.filter(x => x.alive);
-    const dates = [...new Set([...cache.entries()]
-      .filter(([k]) => k.startsWith('pdfset:'))
-      .map(([, v]) => fxKeyD(v.data?.d)).filter(x => x.length === 8))].sort();
-    const stale = dates.filter(d => d < todayYmd()).length;
+    const sets = [...cache.entries()].filter(([k]) => k.startsWith('pdfset:'))
+      .map(([, v]) => fxKeyD(v.data?.d)).filter(x => x.length === 8);
+    const dates = [...new Set(sets)].sort();
+    const stale = sets.filter(d => d < todayYmd()).length; // 종목별로 센다(중복 제거는 표시용 dates에만)
     const blocked = [...cache.keys()].filter(k => k.startsWith('blk:') && issuerBlocked(k.slice(4))).map(k => k.slice(4));
     send(req, res, JSON.stringify({
       count: live.length, total: items.length,

@@ -177,7 +177,14 @@ if (A) {
     assert.strictEqual(S.pdfTtlFor({ stdDt: yst }, KST(8, 5)), 30 * 60e3, '낡은 자료를 하루 쥐고 있다');
     assert.strictEqual(S.pdfTtlFor({ stdDt: today }, KST(8, 5)), S.pdfTtl(KST(8, 5)), '오늘자인데 짧게 쥔다');
     assert.strictEqual(S.pdfTtlFor({}, KST(8, 5)), S.pdfTtl(KST(8, 5)), '기준일을 못 찾으면 경계 TTL');
-    ok('기준일이 낡은 PDF만 30분 뒤 다시 확인한다');
+    // 주말·공휴일에 직전 영업일자는 정상이다 — 낡았다고 보면 30분마다 다시 받는다(하루 48회)
+    const SAT = (h, mi) => Date.UTC(2026, 7, 15, h - 9, mi); // 2026-08-15 토
+    const SUN = (h, mi) => Date.UTC(2026, 7, 16, h - 9, mi);
+    assert.notStrictEqual(S.pdfTtlFor({ stdDt: yst }, SAT(9, 0)), 30 * 60e3, '토요일에 30분마다 다시 받는다');
+    assert.notStrictEqual(S.pdfTtlFor({ stdDt: yst }, SUN(9, 0)), 30 * 60e3, '일요일에 30분마다 다시 받는다');
+    // 첫 갱신 시각(08:00) 전에는 전일자가 정상
+    assert.notStrictEqual(S.pdfTtlFor({ stdDt: yst }, KST(7, 0)), 30 * 60e3, '08:00 전인데 벌써 낡았다고 본다');
+    ok('낡은 PDF 재확인은 거래일 08:00 이후에만 — 주말·공휴일·개장 전에는 하지 않는다');
   }
 
   // ---------- 3d. 리밸런싱 감지 (편입 종목의 기준 평가액이 기준 NAV와 어긋나는 날을 알린다) ----------

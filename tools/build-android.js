@@ -80,16 +80,21 @@ const SHIM = BRIDGE + `<script src="engine.js"></script>
           ENGINE.saveCache();
           return J({cleared: n});
         }
+        const items = [];
         const live = [];
-        for(const [k, v] of C) if(k.startsWith('pdf:') && Date.now() - v.ts < ENGINE.pdfTtlFor(v.data, v.ts)) live.push(v.ts);
-        const dates = [...new Set([...C.entries()].filter(function(e){ return e[0].startsWith('pdfset:'); })
-          .map(function(e){ return ENGINE.fxKeyD(e[1].data && e[1].data.d); }).filter(function(x){ return x.length === 8; }))].sort();
+        for(const [k, v] of C) if(k.startsWith('pdf:')){
+          items.push(v.ts);
+          if(Date.now() - v.ts < ENGINE.pdfTtlFor(v.data, v.ts)) live.push(v.ts);
+        }
+        const sets = [...C.entries()].filter(function(e){ return e[0].startsWith('pdfset:'); })
+          .map(function(e){ return ENGINE.fxKeyD(e[1].data && e[1].data.d); }).filter(function(x){ return x.length === 8; });
+        const dates = [...new Set(sets)].sort();
         const blocked = [...C.keys()].filter(function(k){ return k.startsWith('blk:') && ENGINE.issuerBlocked(k.slice(4)); }).map(function(k){ return k.slice(4); });
         return J({
-          count: live.length,
+          count: live.length, total: items.length,
           oldest: live.length ? Math.min.apply(null, live) : null,
           newest: live.length ? Math.max.apply(null, live) : null,
-          dates: dates, stale: dates.filter(function(d){ return d < ENGINE.todayYmd(); }).length,
+          dates: dates, stale: sets.filter(function(d){ return d < ENGINE.todayYmd(); }).length, // 종목별로 센다
           ttlMs: ENGINE.pdfTtl(), marks: ENGINE.PDF_MARKS, blocked: blocked,
         });
       }
