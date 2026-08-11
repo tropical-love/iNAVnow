@@ -1,7 +1,7 @@
 // 외부 의존성 없음 — 통신은 HttpURLConnection, JSON은 플랫폼 org.json. server.js의 '의존성 0'과 같은 방침.
 plugins { id 'com.android.application' }
 
-// 릴리스 서명 키 — android/keystore.properties(git에 없음)가 있으면 그 키로, 없으면 디버그 키로 서명한다.
+// 릴리스 서명 키 — android/keystore.properties(git에 없음)가 있어야 release를 만들 수 있다(없으면 빌드 중단).
 // 서명이 바뀌면 기존 설치본 위에 업데이트가 안 되므로 .jks와 비밀번호는 반드시 백업할 것.
 def ksFile = rootProject.file('keystore.properties')
 def ks = new Properties()
@@ -15,8 +15,8 @@ android {
         applicationId 'com.inavnow'
         minSdk 26          // WebView의 fetch·TextDecoder·Response가 안정적으로 있는 하한(Android 8.0)
         targetSdk 34
-        versionCode 15
-        versionName '1.3'
+        versionCode 16
+        versionName '1.3.1'
     }
 
     signingConfigs {
@@ -33,8 +33,10 @@ android {
     buildTypes {
         release {
             minifyEnabled false   // 에셋 JS는 난독화 대상이 아니고, 자바 코드가 200줄뿐이라 이득이 없다
-            // 키가 없으면 디버그 키로 서명한다 — 설치는 되게 하고, 서명 주체만 달라진다
-            signingConfig ksFile.exists() ? signingConfigs.release : signingConfigs.debug
+            // 키가 없으면 서명 설정을 두지 않고, 아래 taskGraph 검사가 release 빌드를 멈춘다.
+            // 디버그 키로 대신 서명하면 파일명이 같은 inavnow.apk라 그대로 배포될 수 있고,
+            // 받는 사람 폰에서는 서명이 달라 기존 앱 위에 업데이트되지 않는다.
+            if (ksFile.exists()) signingConfig signingConfigs.release
         }
     }
 
@@ -46,5 +48,13 @@ android {
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+// release를 실제로 만들려 할 때만 멈춘다 — 키가 없어도 assembleDebug는 그대로 되어야 한다.
+gradle.taskGraph.whenReady { graph ->
+    if (!ksFile.exists() && graph.allTasks.any { it.name.contains('Release') }) {
+        throw new GradleException('android/keystore.properties가 없어 release를 서명할 수 없습니다. ' +
+                '배포용 키를 두거나, 시험용이면 assembleDebug를 쓰세요.')
     }
 }

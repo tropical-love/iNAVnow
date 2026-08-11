@@ -4,7 +4,9 @@ import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.os.Bundle;
 import android.webkit.ConsoleMessage;
+import android.net.Uri;
 import android.webkit.WebChromeClient;
+import android.webkit.WebResourceRequest;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Toast;
@@ -21,6 +23,12 @@ public class MainActivity extends Activity {
     /** 메인 화면에서 두 번 눌러 종료할 때의 유효 시간 — 토스트(LENGTH_SHORT ≈ 2초)와 맞춘다 */
     private static final long EXIT_WINDOW_MS = 2000;
 
+    /** 에셋으로 실려 나간 페이지인지 — 앱이 열어도 되는 유일한 출처다 */
+    private static boolean isAsset(Uri u) {
+        return u != null && "file".equals(u.getScheme())
+                && u.getPath() != null && u.getPath().startsWith("/android_asset/");
+    }
+
     private WebView web;
     private Net net;
     private long lastBack;
@@ -36,7 +44,14 @@ public class MainActivity extends Activity {
         web.getSettings().setJavaScriptEnabled(true);
         web.getSettings().setDomStorageEnabled(true); // localStorage — 포트폴리오·캐시가 여기 있다
         web.getSettings().setDatabaseEnabled(true);
-        web.setWebViewClient(new WebViewClient());
+        // 에셋 밖으로는 나가지 않는다. 브리지(AndroidNet)가 이 WebView의 모든 페이지에 붙어 있어,
+        // 외부 페이지가 한 번이라도 열리면 그 페이지에서 임의 네트워크 요청을 할 수 있게 된다.
+        // 이 앱에는 외부로 나가는 링크가 없으므로 전부 막는다.
+        web.setWebViewClient(new WebViewClient() {
+            @Override public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
+                return !isAsset(r.getUrl());
+            }
+        });
         // JS 오류를 logcat으로 — 기기에서 엔진이 죽으면 이것 말고는 볼 방법이 없다
         web.setWebChromeClient(new WebChromeClient() {
             @Override public boolean onConsoleMessage(ConsoleMessage m) {

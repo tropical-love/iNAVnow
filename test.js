@@ -222,7 +222,16 @@ if (A) {
     const port = S.server.address().port;
     S.cache.set('pdf:test:zzz', { ts: Date.now(), ttl: 60e3, data: { stdDt: '20260811' } });
     S.cache.set('blk:testissuer', { ts: Date.now(), ttl: 24 * 3600e3, data: '429 ...' });
-    const res = await fetch('http://127.0.0.1:' + port + '/api/pdfinfo?clear=1');
+      // GET으로는 지워지지 않아야 한다 — 다른 사이트가 <img src>로 캐시를 비우는 길을 막는다
+    const bad = await fetch('http://127.0.0.1:' + port + '/api/pdfinfo?clear=1');
+    assert.strictEqual(bad.status, 405, 'GET으로도 캐시가 지워진다');
+    assert.strictEqual(S.cache.has('pdf:test:zzz'), true, 'GET 요청이 캐시를 지웠다');
+    // 다른 출처에서 온 POST도 거부한다
+    const xo = await fetch('http://127.0.0.1:' + port + '/api/pdfinfo?clear=1', {
+      method: 'POST', headers: { Origin: 'http://evil.example' } });
+    assert.strictEqual(xo.status, 403, '다른 출처의 POST를 받아들였다');
+    assert.strictEqual(S.cache.has('pdf:test:zzz'), true, '다른 출처의 요청이 캐시를 지웠다');
+  const res = await fetch('http://127.0.0.1:' + port + '/api/pdfinfo?clear=1', { method: 'POST' });
     const body = await res.json();
     assert.strictEqual(res.status, 200);
     assert.ok(body.cleared >= 1, 'PDF를 지우지 않았다');
@@ -242,7 +251,7 @@ if (A) {
     S.notePdfKey('555555', 'pdf:funetf:KR7555555001');
     S.cache.set('pdf:aaa:orig', { ts: Date.now(), ttl: 60e3, data: { stdDt: '20260811' } });
     S.cache.set('pdf:funetf:KR7555555001', { ts: Date.now(), ttl: 60e3, data: { stdDt: '20260811' } });
-    const r2 = await (await fetch('http://127.0.0.1:' + port + '/api/pdfinfo?clear=1&codes=111111,222222,555555')).json();
+    const r2 = await (await fetch('http://127.0.0.1:' + port + '/api/pdfinfo?clear=1&codes=111111,222222,555555', { method: 'POST' })).json();
     assert.strictEqual(r2.scope, 'codes');
     assert.strictEqual(r2.cleared, 3, '거쳐 온 출처를 모두 지워야 한다(111111 1건 + 555555 2건)');
     assert.strictEqual(r2.miss, 1, '한 번도 계산하지 않은 종목은 miss로 세어야 한다');
@@ -272,6 +281,55 @@ if (A) {
     assert.deepStrictEqual(S.pdfKeysOf('444444'), ['pdf:zzz:ok', 'pdf:funetf:zzz'], '기초 ETF 키 목록이 연결되지 않았다');
     ['pdfkey:333333', 'pdfkey:444444', 'pdf:zzz:ok', 'pdf:funetf:zzz'].forEach(k => S.cache.delete(k));
     ok('PDF 키는 성공한 뒤에만 남고, 합성 ETF에는 기초 ETF 키가 연결된다');
+  }
+
+  // ---------- 3g. PDF 상태는 지금 보고 있는 종목만 센다 ----------
+  // 과거에 조회한 종목까지 합치면 화면에 없는 종목 때문에 '지난 기준일 N종목'이 뜬다.
+  {
+    const srv = S.server.listen(0);
+    const port = srv.address().port;
+    const day = S.todayYmd(), old = '20200102';
+    S.cache.set('pdf:mine:a', { ts: Date.now(), ttl: 60e3, data: { stdDt: day } });
+    S.cache.set('pdf:other:b', { ts: Date.now(), ttl: 60e3, data: { stdDt: old } });
+    S.notePdfKey('777777', 'pdf:mine:a');
+    S.notePdfKey('888888', 'pdf:other:b');
+    S.cache.set('pdfset:777777', { ts: Date.now(), ttl: 60e3, data: { d: day, codes: ['x'] } });
+    S.cache.set('pdfset:888888', { ts: Date.now(), ttl: 60e3, data: { d: old, codes: ['y'] } }); // 화면에 없는 종목
+    const mine = await (await fetch('http://127.0.0.1:' + port + '/api/pdfinfo?codes=777777')).json();
+    assert.strictEqual(mine.scope, 'codes');
+    assert.strictEqual(mine.total, 1, '내 종목만 세지 않았다');
+    assert.strictEqual(mine.stale, 0, '화면에 없는 종목 때문에 지난 기준일로 셌다');
+    const all = await (await fetch('http://127.0.0.1:' + port + '/api/pdfinfo')).json();
+    assert.strictEqual(all.scope, 'all');
+    assert.ok(all.stale >= 1, 'codes 없이 조회하면 전체를 세야 한다');
+    ['pdf:mine:a', 'pdf:other:b', 'pdfkey:777777', 'pdfkey:888888', 'pdfset:777777', 'pdfset:888888']
+      .forEach(k => S.cache.delete(k));
+    S.server.close();
+    ok('PDF 상태 집계가 codes로 준 종목 범위만 센다');
+  }
+
+  // ---------- 3h. 앱 브리지 허용 목록이 엔진이 쓰는 호스트를 다 담고 있다 ----------
+  // 브리지는 허용 목록 밖으로 나가지 않는다 → 새 호스트를 엔진에 추가하고 목록에 안 넣으면
+  // 로컬·서버에서는 되고 앱에서만 그 어댑터가 조용히 폴백으로 밀린다.
+  {
+    const fs = require('fs'), path = require('path');
+    const netJava = path.join(__dirname, 'android/app/src/main/java/com/inavnow/Net.java');
+    if (fs.existsSync(netJava)) { // PC 배포판에는 android 폴더가 없다
+      const src = fs.readFileSync(__filename.replace(/test\.js$/, 'server.js'), 'utf8');
+      // 데이터를 받는 곳이 아닌 것들: 폰트·아이콘 CDN(빌드가 제거), SVG 네임스페이스, PEM 안에 적힌 발급자 URL
+      const skip = new Set(['cdn.jsdelivr.net', 'ssl.gstatic.com', 'www.w3.org', 'crt.sectigo.com']);
+      const used = [...new Set([...src.matchAll(/https:\/\/([a-z0-9.-]+\.[a-z]{2,})/g)].map(m => m[1]))]
+        .filter(h => !skip.has(h));
+      const block = /HOSTS\s*=\s*\{([\s\S]*?)\}/.exec(fs.readFileSync(netJava, 'utf8')); // HOSTS 배열만
+      assert.ok(block, 'Net.java에서 HOSTS 목록을 찾지 못했다');
+      const allow = new Set([...block[1].matchAll(/"([^"]+)"/g)].map(m => m[1]));
+      const missing = used.filter(h => !allow.has(h));
+      assert.deepStrictEqual(missing, [], '앱 허용 목록에 없는 호스트: ' + missing.join(', '));
+      // 반대로 쓰지 않는 호스트를 열어 두지도 않는다
+      const extra = [...allow].filter(h => !used.includes(h));
+      assert.deepStrictEqual(extra, [], '엔진이 쓰지 않는 호스트가 열려 있다: ' + extra.join(', '));
+      ok(`앱 브리지 허용 목록이 엔진이 쓰는 호스트 ${used.length}개와 정확히 일치한다`);
+    }
   }
 
   // ---------- 4. 거래일 달력: close=null인 실거래일을 휴장으로 오판하지 않는다 ----------

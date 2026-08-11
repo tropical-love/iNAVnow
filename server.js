@@ -102,7 +102,12 @@ async function kiwoomPostJson(url, body) {
     }, res => {
       let t = '';
       res.on('data', c => t += c);
-      res.on('end', () => { try { resolve(JSON.parse(t)); } catch (e) { reject(new Error(`JSON 파싱 실패: ${url}`)); } });
+      res.on('end', () => {
+        // 상태를 먼저 본다 — 429·500 응답도 본문이 JSON이면 성공으로 흘러간다. 종목 목록은 하루 캐시라
+        // 오류 JSON이 한 번 들어가면 그날 내내 키움 종목이 전부 실패한다(안드로이드 경로는 원래 확인한다)
+        if (res.statusCode < 200 || res.statusCode >= 300) return reject(new Error(`${res.statusCode} POST ${url}`));
+        try { resolve(JSON.parse(t)); } catch (e) { reject(new Error(`JSON 파싱 실패: ${url}`)); }
+      });
     });
     req.setTimeout(FETCH_TIMEOUT_MS, () => req.destroy(new Error(`타임아웃 ${url}`)));
     req.on('error', reject);
@@ -1791,7 +1796,7 @@ async function computeINav(stockCode, depth = 0) {
       // 마감 iNAV 값으로 churn → 굴린 결과가 토스 기준가와 +4.4% 어긋남).
       // 대신 KRX 실시간 iNAV에서 국내 레그의 당일 변동분을 걷어내면 당일 기준가가 나온다
       // (KRX iNAV = 당일기준가 × (1 + 국내 당일변동 기여) — 해외 레그·환율은 하루 고정이므로).
-      // 급변장에선 5분 캐시된 iNAV와 지금 시세의 시점이 어긋나므로 iNAV를 새로 받아 짝을 맞춘다.
+      // 급변장에선 캐시된 iNAV와 지금 시세의 시점이 어긋나므로 iNAV를 새로 받아 짝을 맞춘다.
       const igF = await getJson(`https://m.stock.naver.com/api/stock/${stockCode}/integration`).catch(() => null);
       const igNavF = parseFloat((igF?.totalInfos?.find(t => t.code === 'nav')?.value || '0').replace(/,/g, '')) || igNav;
       const domLive = movedHs.filter(h => h.t.cur === 'KRW').reduce((s, h) => {
@@ -2417,7 +2422,7 @@ let ETFS = [], selIdx = -1;
 fetch('/api/etfs').then(r=>r.json()).then(d=>{ if(Array.isArray(d)) ETFS = d; });
 const $q = document.getElementById('q'), $sugg = document.getElementById('sugg');
 const favs = () => JSON.parse(localStorage.getItem('favs')||'[]');
-const esc = s => String(s).replace(/[&<>"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; });
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; });
 
 // 최근 조회 (localStorage, 현재 종목 제외하고 5개 표시 → 6개까지 보관)
 let recentSaved = false;
@@ -2445,7 +2450,7 @@ function showSugg(items, title){
   selIdx = -1;
   if(!items.length){ $sugg.style.display='none'; return; }
   $sugg.innerHTML = (title?'<div class="muted">'+title+'</div>':'') +
-    items.map(x=>'<div data-code="'+x.code+'">'+x.name+' <span class="muted">('+x.code+')</span></div>').join('');
+    items.map(x=>'<div data-code="'+esc(x.code)+'">'+esc(x.name)+' <span class="muted">('+esc(x.code)+')</span></div>').join('');
   // 드롭다운은 검색창 오른쪽 끝에 맞춰 왼쪽으로 펼쳐진다. CSS의 100vw로는 검색창이 화면 어디에
   // 있는지 알 수 없어 왼쪽으로 넘칠 수 있다(실측 320px 화면에서 −19px) → 좌표를 재서 폭을 묶는다.
   $sugg.style.maxWidth = Math.max(160, Math.round($q.getBoundingClientRect().right) - 10) + 'px';
@@ -2534,11 +2539,15 @@ function syncCfgUI(){
 }
 function openCfg(){ syncCfgUI(); document.getElementById('cfgdlg').showModal(); pdfInfo(); }
 // 하루 한 번만 받는 자료(구성종목 PDF)의 상태. 리밸런싱이 늦게 올라온 날 손으로 새로 받을 수 있게 한다.
+// 설정 창은 지금 보고 있는 것만 이야기한다 — 홈이면 포트폴리오 종목, 종목 화면이면 그 종목.
+// 이 범위가 '지금 다시 받기'가 실제로 다시 받는 범위와 같아야 숫자와 동작이 어긋나지 않는다.
+function pdfScope(){ return HOME ? PF.map(function(h){ return h.code; }) : [CODE]; }
 async function pdfInfo(){
   const el = document.getElementById('pdfinfo');
   el.textContent = '확인 중…';
   try {
-    const d = await (await fetch('/api/pdfinfo')).json();
+    const sc = pdfScope();
+    const d = await (await fetch('/api/pdfinfo' + (sc.length ? '?codes=' + encodeURIComponent(sc.join(',')) : ''))).json();
     if(!d.count){ el.textContent = '아직 받은 자료가 없습니다.'; return; }
     const mins = Math.round((Date.now() - d.newest) / 60000);
     const ago = mins < 1 ? '방금' : mins < 60 ? mins+'분 전' : Math.floor(mins/60)+'시간 '+(mins%60)+'분 전';
@@ -2562,27 +2571,28 @@ async function pdfReload(){
   };
   btn.disabled = true; bar(0);
   try {
-    const codes = HOME ? PF.map(function(h){ return h.code; }) : [CODE];
+    const codes = pdfScope();
     if(!codes.length){
       // 지울 대상도, 다시 받을 대상도 없다 — codes 없이 부르면 서버가 전체를 비우므로 요청하지 않는다
       el.textContent = '다시 받을 종목이 없습니다. 종목을 열면 그때 새로 받습니다.'; bar(1);
     } else {
       // 화면에 필요한 종목만 비운다 — 다른 종목 자료를 함께 날리면 그쪽이 다음에 느려진다
-      const cl = await fetch('/api/pdfinfo?clear=1&codes=' + encodeURIComponent(codes.join(',')));
+      const cl = await fetch('/api/pdfinfo?clear=1&codes=' + encodeURIComponent(codes.join(',')), { method: 'POST' });
       if(!cl.ok) throw new Error('clear ' + cl.status); // 비우지 못했는데 진행하면 다시 받은 척하게 된다
       const cj = await cl.json().catch(function(){ return null; });
       // 지울 위치를 못 찾은 종목이 있으면(한 번도 계산하지 않았거나 옛 버전에서 받아 둔 자료) 전부 비운다 —
       // 그대로 두면 남은 캐시를 재사용해 '새로 받은 척'하게 된다. '지정 종목만 비운다'는 원칙의 예외로,
       // 무관한 종목 자료도 함께 지워진다(대개 옛 캐시를 한 번 정리하고 끝난다)
       if(cj && cj.miss){
-        const all = await fetch('/api/pdfinfo?clear=1');
+        const all = await fetch('/api/pdfinfo?clear=1', { method: 'POST' });
         if(!all.ok) throw new Error('full clear ' + all.status); // 여기서도 못 지웠으면 진행하면 안 된다
       }
       el.textContent = '다시 받는 중… (0/' + codes.length + ')';
       // officialOnly로 떨어진 응답은 PDF를 못 받은 것이다(공식 iNAV만 표시. coveragePct 0)
       const gotPdf = function(d){ return d && d.inav != null && !(d.isOfficial && d.coveragePct === 0); };
-      let failed = 0;
+      const stale = [];
       for(let i = 0; i < codes.length; i++){
+        const nm = HOME ? (PF[i] && PF[i].name) || codes[i] : codes[i];
         try {
           const r = await fetch('/api/inav?code=' + encodeURIComponent(codes[i]));
           const d = r.ok ? await r.json() : null; // 500이면 {error}가 와서 조용히 성공처럼 보인다
@@ -2590,20 +2600,15 @@ async function pdfReload(){
             dSave(codes[i], d);
             if(HOME) PFV[codes[i]] = { inav: d.inav, price: d.marketPrice };
             else { D = d; render(); }
-          } else failed++;
-        } catch(e){ failed++; } // 한 종목 실패가 나머지를 막지는 않지만, 숨기지도 않는다
+          } else stale.push(nm);
+        } catch(e){ stale.push(nm); } // 한 종목 실패가 나머지를 막지는 않지만, 숨기지도 않는다
         bar((i + 1) / codes.length);
         el.textContent = '다시 받는 중… (' + (i + 1) + '/' + codes.length + ')';
       }
-      if(HOME){
-        PFAT = new Date();
-        // 하나라도 못 받았으면 계산 시각(PFCAT)은 그대로 둔다 — 갱신해 버리면 실패 종목의 낡은 값이
-        // '방금 계산한 값'으로 저장돼 다음 주기(1분)까지 새 값처럼 쓰인다
-        if(!failed) PFCAT = PFAT;
-        pfSaveCalc(); pfRender();
-      }
+      // 못 받은 종목이 있으면 계산 시각을 밀지 않는다(자동 계산과 같은 규칙)
+      if(HOME){ pfMarkCalc(stale); pfRender(); }
       await pdfInfo(); // 새 상태(수신 시각·기준일)로 문구를 바꿔 준다
-      if(failed) el.textContent = failed + '종목은 자료를 못 받아 이전 값입니다(곧 다시 시도) · ' + el.textContent;
+      if(stale.length) el.textContent = stale.length + '종목은 자료를 못 받아 이전 값입니다(곧 다시 시도) · ' + el.textContent;
     }
   } catch(e){ el.textContent = '다시 받지 못했습니다 — ' + (e && e.message ? e.message : '알 수 없는 오류'); }
   await new Promise(function(r){ setTimeout(r, 400); }); // 다 찬 모습이 눈에 보이도록 잠깐 둔다
@@ -2716,8 +2721,8 @@ function treemap(rows){
              : (r.cur && r.cur !== 'KRW' && r.sym) ? r.sym.split('.')[0]
              : r.name.split(' ')[0];
     // 이름이 안 들어가는 칸은 아예 비운다 — 숫자만 있으면 어느 종목인지 알 수 없어 읽을 수 없다(툴팁으로 대체)
-    if (c.w>=68 && c.h>=46) d.innerHTML = '<b>'+nm+'</b>'+chg+'<br>'+fmt(r.wg,1)+'%';
-    else if (c.w>=40 && c.h>=30) { d.className = 'cell sm'; d.innerHTML = '<b>'+nm+'</b>'+chg; }
+    if (c.w>=68 && c.h>=46) d.innerHTML = '<b>'+esc(nm)+'</b>'+chg+'<br>'+fmt(r.wg,1)+'%';
+    else if (c.w>=40 && c.h>=30) { d.className = 'cell sm'; d.innerHTML = '<b>'+esc(nm)+'</b>'+chg; }
     // \\n — 이 스크립트는 서버 쪽 템플릿 리터럴 안이라 \\n을 써야 클라이언트에 개행 이스케이프로 전달된다
     d.title = r.more
       ? r.name+' 합계 '+fmt(r.wg,1)+'% (가중평균 '+chg+')\\n'
@@ -2751,7 +2756,7 @@ function render(){
     + (d.marketChangePct==null ? '<span class="chg" style="color:var(--muted)">—</span>'
        : '<span class="chg '+cls(d.marketChangePct)+'">'
          + (d.marketChange!=null ? amt(d.marketChange,dp(d.marketPrice))+' ' : '')+sign(d.marketChangePct)+'%</span>')
-    + (d.marketOver ? ' <span class="badge b시간외">'+(d.krSession==='NXT프리'?'프리':d.krSession==='NXT애프터'?'애프터':'시간외')+'</span>' : '');
+    + (d.marketOver ? ' <span class="badge b시간외">'+esc(d.krSession==='NXT프리'?'프리':d.krSession==='NXT애프터'?'애프터':'시간외')+'</span>' : '');
   document.getElementById('idx').textContent = d.baseIndex||'';
   // 첫 칸은 등락의 기준이 된 종가 — 등락액은 바로 위 가격줄에 이미 있고, iNAV는 아래 카드에 있어 중복이었다.
   // 시간외 시세일 땐 등락 기준이 당일 정규장 종가라 라벨을 구분한다.
@@ -2761,11 +2766,11 @@ function render(){
     '<div>'+(d.marketOver?'당일 종가':'전일 종가')+' <b>'+(refClose!=null?fmt(refClose,dp(d.marketPrice))+'원':'—')+'</b></div>'+
     // 공식 iNAV를 쓰는 상품은 기준 NAV가 전영업일 값이라 괴리율 기준이 '마감 공식 iNAV'다 — 라벨도 그렇게
     '<div>괴리율'+(d.premiumBasis==='regular'?'(정규장 기준)':d.premiumBasis==='close'?(d.isOfficial?'(종가↔공식iNAV)':'(종가↔기준NAV)'):'(시장가)')+' <b class="'+cls(d.premiumPct)+'">'+sign(d.premiumPct)+'%</b></div>'+
-    '<div>기준 NAV('+(d.navRefDate||'')+') <b>'+fmt(d.navRef)+'</b></div>'+
-    '<div>순자산 <b>'+(d.aum||'—')+'</b></div>'+
-    '<div>거래량 <b>'+(d.volume||'—')+'</b></div>'+
-    '<div>운용보수 <b>'+(d.fee!=null?d.fee+'%':'—')+'</b></div>';
-  document.getElementById('rets').innerHTML = (d.returns||[]).map(r=>'<span class="chip">'+r.periodTypeCode+' '+sign(r.value,1)+'%</span>').join('');
+    '<div>기준 NAV('+esc(d.navRefDate||'')+') <b>'+fmt(d.navRef)+'</b></div>'+
+    '<div>순자산 <b>'+esc(d.aum||'—')+'</b></div>'+
+    '<div>거래량 <b>'+esc(d.volume||'—')+'</b></div>'+
+    '<div>운용보수 <b>'+(d.fee!=null?esc(d.fee)+'%':'—')+'</b></div>';
+  document.getElementById('rets').innerHTML = (d.returns||[]).map(r=>'<span class="chip">'+esc(r.periodTypeCode)+' '+sign(r.value,1)+'%</span>').join('');
   document.getElementById('clock').textContent = new Date(d.asOf).toLocaleTimeString('ko-KR')+' KST · 한국장 '+sessLabel(d.krSession);
   // 종가 대비: 최근 확정 종가에서 iNAV가 얼마나 움직였나 — "내일 시초가가 얼마나 뜰지"의 가늠자
   document.getElementById('inav').innerHTML = fmt(d.inav,dp(d.inav))+'원 <span class="chg '+cls(d.inavChangePct)+'">'
@@ -2806,9 +2811,9 @@ function render(){
   document.getElementById('coverpct').textContent = fmt(d.coveragePct,1)+'%';
   const rows = [...d.rows].sort((a,b)=>{const va=a[sortKey]??-1e9, vb=b[sortKey]??-1e9; return sortAsc?va-vb:vb-va;});
   document.getElementById('rows').innerHTML = rows.map(r=>{
-    const curFmt = r.cur==='KRW'?'원':(' '+(r.cur||''));
-    return '<tr><td title="'+r.name+'">'+r.name+(r.sym?' <span class="muted">'+r.sym+'</span>':'')+'</td>'+
-    '<td>'+(r.tracked?'<span class="badge b'+r.session+'">'+r.session+'</span>':'<span class="badge">미추적</span>')+'</td>'+
+    const curFmt = r.cur==='KRW'?'원':(' '+esc(r.cur||''));
+    return '<tr><td title="'+esc(r.name)+'">'+esc(r.name)+(r.sym?' <span class="muted">'+esc(r.sym)+'</span>':'')+'</td>'+
+    '<td>'+(r.tracked?'<span class="badge b'+esc(r.session)+'">'+esc(r.session)+'</span>':'<span class="badge">미추적</span>')+'</td>'+
     '<td>'+(r.tracked?fmt(r.price, r.cur==='JPY'||r.cur==='KRW'?0:2)+curFmt:'—')+'</td>'+
     '<td class="'+cls(r.changePct)+'">'+(r.tracked?(r.changePct==null?'<span class="muted" title="오늘 정규장이 아직 시작 전입니다">—</span>':sign(r.changePct)+'%'):'—')
       + (r.sessPct!=null ? '<div class="sub '+cls(r.sessPct)+'" title="현재 진행 중인 세션 변동(정규장 종가 대비)">'+sign(r.sessPct)+'%</div>' : '')+'</td>'+
@@ -3020,25 +3025,36 @@ let PF_DOWN = '';    // 서버 모드에서 목록을 못 불러온 상태 — �
 let PFV = {};        // code → 최근 계산한 {inav, price}
 let PFAT = null;     // 화면에 보이는 기준 시각(현재가만 갱신해도 움직인다)
 let PFCAT = null;    // iNAV 전체 계산 시각 — 재계산 판단은 이걸로 한다
-                     // (현재가 갱신이 PFAT를 밀면 5분 조건이 매번 리셋돼 iNAV가 영영 안 바뀐다)
+                     // (현재가 갱신이 PFAT를 밀면 PF_TTL 조건이 매번 리셋돼 iNAV가 영영 안 바뀐다)
 let PFERR = '';      // 저장 실패 안내
+let PFSTALE = [];    // 이번 계산에서 못 받아 이전 값을 그대로 쓰는 종목명들
 let PFBUSY = false, pfEditIdx = -1, pfPick = null;
 const PF_TTL = 60e3; // iNAV 전체 재계산 간격. 더 줄여도 외부 호출은 시세 캐시(30초)에 묶여 늘지 않지만,
                      // 장외에는 3종목 계산에 4.7초가 들어 30초로 하면 거의 쉬지 않고 돈다
+const PF_RETRY = 20e3; // 일부 종목을 못 받았을 때 다음 재계산까지. PFCAT을 아예 안 밀면 즉시 재계산이
+                       // 끝없이 돌고, 그냥 밀면 실패한 값이 다음 주기까지 최신인 척한다
+// 계산 한 판의 끝을 한 곳에서 확정한다 — 화면 시각·재계산 시각·낡은 종목 안내가 어긋나지 않게.
+// 자동 계산과 수동 '지금 다시 받기'가 같은 규칙을 쓴다.
+function pfMarkCalc(staleNames){
+  PFSTALE = staleNames || [];
+  PFAT = new Date();
+  PFCAT = PFSTALE.length ? new Date(Date.now() - PF_TTL + PF_RETRY) : PFAT;
+  pfSaveCalc();
+}
 // 종목 상세 ↔ 홈 이동은 매번 '새 문서'라 PFV·PFAT가 메모리에서 사라진다(앱은 file:// 이동이라 특히).
-// 남겨 두지 않으면 5분이 안 지났는데도 홈에 올 때마다 전 종목을 다시 조회한다.
+// 남겨 두지 않으면 재계산 간격(PF_TTL)이 안 지났는데도 홈에 올 때마다 전 종목을 다시 조회한다.
 const PFCSTORE = 'pfCalc';
 (function pfLoadCalc(){
   try {
     const d = JSON.parse(localStorage.getItem(PFCSTORE) || 'null');
-    if(d && d.at && d.v){ PFV = d.v; PFAT = new Date(d.at); PFCAT = new Date(d.cat || d.at); }
+    if(d && d.at && d.v){ PFV = d.v; PFAT = new Date(d.at); PFCAT = new Date(d.cat || d.at); PFSTALE = d.stale || []; }
   } catch(e){}
 })();
 function pfSaveCalc(){
   try {
     const v = {}; // 지운 종목의 값은 남기지 않는다
     PF.forEach(function(h){ if(PFV[h.code]) v[h.code] = PFV[h.code]; });
-    localStorage.setItem(PFCSTORE, JSON.stringify({at: PFAT ? +PFAT : Date.now(), cat: PFCAT ? +PFCAT : null, v: v}));
+    localStorage.setItem(PFCSTORE, JSON.stringify({at: PFAT ? +PFAT : Date.now(), cat: PFCAT ? +PFCAT : null, v: v, stale: PFSTALE}));
   } catch(e){}
 }
 // 평가 기준: 정규장 중엔 '현재가'(실제로 팔릴 값), 그 밖에는 'iNAV'(체결가가 멈춰 있어 유일한 단서)가 기본.
@@ -3097,7 +3113,9 @@ function pfRender(){
   const sum = document.getElementById('pfsum'), box = document.getElementById('pfbody');
   const ck = document.getElementById('pfclock'), bad = PF_DOWN || PFERR;
   ck.textContent = bad ? bad
-    : PFAT ? PFAT.toLocaleTimeString('ko-KR')+' KST 기준' : PF.length ? '계산 중…' : '';
+    : PFAT ? PFAT.toLocaleTimeString('ko-KR')+' KST 기준'
+        + (PFSTALE.length ? ' · '+PFSTALE.length+'종목 이전 값' : '') : PF.length ? '계산 중…' : '';
+  ck.title = PFSTALE.length ? PFSTALE.join(', ')+' — 자료를 못 받아 이전 값입니다(곧 다시 시도)' : '';
   ck.className = bad ? 'up' : 'muted';
   // 불러오기에 실패했으면 추가·수정을 막는다 — 빈 목록 상태로 저장하면 서버의 원본이 날아간다
   document.getElementById('pfaddbtn').disabled = !!PF_DOWN;
@@ -3173,7 +3191,7 @@ async function pfPxTick(){
       const v = d && d[h.code];
       if(v && v.price > 0){ PFV[h.code] = Object.assign({}, PFV[h.code], { price: v.price }); any = true; }
     });
-    if(any){ PFAT = new Date(); pfSaveCalc(); pfRender(); }
+    if(any){ PFAT = new Date(); pfSaveCalc(); pfRender(); } // PFCAT은 그대로 — 현재가 갱신은 재계산이 아니다
   } catch(e){ /* 실패하면 다음 주기에 다시 */ }
 }
 
@@ -3187,6 +3205,7 @@ async function pfCalc(){
   // 순차로 둔다. 병렬로 바꿔 봤지만 종목마다 구성종목 시세를 각자 100건씩 동시에 던져
   // 커넥션 풀에서 밀려 오히려 3배 느렸다(실측 3종목: 순차 4.7초·100회 → 병렬 13.4초·263회).
   // in-flight 병합은 같은 키만 합치므로 서로 다른 종목의 조회는 합쳐지지 않는다.
+  const stale = [];
   for(const h of PF){
     await (async function(h){
     try {
@@ -3199,12 +3218,12 @@ async function pfCalc(){
       if(!fresh && d && d.inav != null) dSave(h.code, d);
       if(!pfBPinned && d && d.krSession) PFB = pfDefBasis(d.krSession); // 공휴일 교정
       if(d && d.etfName && d.etfName !== h.name){ h.name = d.etfName; pfSet(PF); } // 운용사 개명 반영
-    } catch(e){ /* 한 종목 실패가 나머지 계산을 막지 않는다 */ }
+      if(!(d && d.inav != null)) stale.push(h.name); // 응답이 왔지만 계산이 안 된 경우도 낡은 값이다
+    } catch(e){ stale.push(h.name); /* 한 종목 실패가 나머지 계산을 막지 않는다 */ }
     pfRender(); // 끝난 종목부터 화면에 채운다
     })(h);
   }
-  PFAT = PFCAT = new Date();
-  pfSaveCalc(); // 다음 페이지 로드가 5분 안이면 이 값을 그대로 쓴다
+  pfMarkCalc(stale); // 못 받은 종목이 있으면 계산 시각을 밀지 않는다 — 낡은 값이 최신인 척하지 않게
   PFBUSY = false; btn.disabled = false;
   pfRender();
 }
@@ -3290,8 +3309,8 @@ if(HOME){
   showHome();
   document.getElementById('pfcard').style.display = '';
   pfRender();
-  // 남겨 둔 계산이 5분보다 오래됐을 때만 다시 조회한다. 3분 전에 계산했다면 그 값을 그대로 보여주고
-  // 2분 뒤에 갱신한다 — 홈에 올 때마다 전 종목을 다시 훑던 문제(앱에서 특히 두드러짐).
+  // 남겨 둔 계산이 PF_TTL(60초)보다 오래됐을 때만 다시 조회한다. 40초 전에 계산했다면 그 값을 그대로
+  // 보여주고 20초 뒤에 갱신한다 — 홈에 올 때마다 전 종목을 다시 훑던 문제(앱에서 특히 두드러짐).
   // 별도 타이머를 관리하지 않고 30초마다 나이만 재는 방식이라 이중 발화가 없다.
   function pfTick(){
     if(!(BG_OK || !document.hidden)) return; // 안 보이는 탭에서는 건너뛴다
@@ -3300,7 +3319,7 @@ if(HOME){
   pfLoad().then(function(){ pfRender(); pfTick(); pfPxTick(); }); // 서버 저장이면 목록을 받아온 뒤 판단
   setInterval(pfTick, 30e3);
   // 현재가는 ETF 자체 시세만 있으면 되므로(구성종목을 훑지 않는다) 종목 화면과 같은 주기로 돌린다.
-  // iNAV 전체 재계산은 위 pfTick이 5분마다 맡는다.
+  // iNAV 전체 재계산은 위 pfTick이 PF_TTL 주기로 맡는다.
   setInterval(function(){ if(BG_OK || !document.hidden) pfPxTick(); }, MKT_MS);
 }
 else {
@@ -3349,6 +3368,19 @@ const handler = async (req, res) => {
   if (u.pathname === '/api/pdfinfo') {
     // 하루 한 번만 받아도 되는 자료(구성종목 PDF·차단 기록)의 상태와 수동 초기화
     if (u.searchParams.get('clear') === '1') {
+      // 지우는 요청은 POST만 받고 출처를 확인한다 — GET이면 다른 사이트가 <img src>로도 캐시를 비울 수
+      // 있고(브라우저가 쿠키를 실어 보낸다), 공개 서버에서는 로그인한 세션이 그대로 쓰인다
+      if (req.method !== 'POST') {
+        res.writeHead(405, { 'Content-Type': 'application/json; charset=utf-8', Allow: 'POST' });
+        res.end(JSON.stringify({ error: 'POST로 요청해 주세요' }));
+        return;
+      }
+      const org = req.headers.origin;
+      if (org && org !== 'null' && new URL(org).host !== req.headers.host) {
+        res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: '다른 출처의 요청입니다' }));
+        return;
+      }
       // 차단 기록(blk:)은 남긴다 — 수동 갱신마다 지우면 429로 막힌 운용사를 매번 다시 두드려
       // 차단이 길어진다(차단 상태에서도 폴백으로 새 자료를 받으므로 갱신은 된다).
       // codes를 주면 그 종목이 쓴 키만 지운다(pdfkey:<code>에 남겨 둔다) — 화면과 무관한 종목의
@@ -3372,14 +3404,20 @@ const handler = async (req, res) => {
     // 건수는 아직 유효한 자료만 센다(만료분·폴백 중복은 '자료 건수'일 뿐 종목 수가 아니다).
     // 기준일은 원본 응답이 아니라 정규화해 둔 pdfset에서 읽는다 — 어댑터마다 필드 이름이 달라
     // 원본을 그대로 읽으면 일부 운용사가 빠진다(Codex 지적).
+    // codes를 주면 그 종목이 쓰는 자료만 센다 — 안 주면 과거에 조회한 종목까지 합쳐져
+    // 화면에 없는 종목 때문에 '지난 기준일 N종목'이 뜬다
+    const only = (u.searchParams.get('codes') || '').split(',').filter(c => /^[0-9A-Z]{6}$/.test(c));
+    const wanted = only.length ? new Set(only.flatMap(c => pdfKeysOf(c))) : null;
     const items = [];
     for (const [k, v] of cache) {
       if (!k.startsWith('pdf:')) continue;
+      if (wanted && !wanted.has(k)) continue;
       const alive = Date.now() - v.ts < pdfTtlFor(v.data, v.ts);
       items.push({ at: v.ts, stdDt: pdfStdDt(v.data) || null, alive });
     }
     const live = items.filter(x => x.alive);
-    const sets = [...cache.entries()].filter(([k]) => k.startsWith('pdfset:'))
+    const sets = [...cache.entries()]
+      .filter(([k]) => k.startsWith('pdfset:') && (!only.length || only.includes(k.slice(7))))
       .map(([, v]) => fxKeyD(v.data?.d)).filter(x => x.length === 8);
     const dates = [...new Set(sets)].sort();
     const stale = sets.filter(d => d < todayYmd()).length; // 종목별로 센다(중복 제거는 표시용 dates에만)
@@ -3389,6 +3427,7 @@ const handler = async (req, res) => {
       oldest: live.length ? Math.min(...live.map(x => x.at)) : null,
       newest: live.length ? Math.max(...live.map(x => x.at)) : null,
       dates, stale, retrying: pdfRetryTime(), ttlMs: pdfTtl(), marks: PDF_MARKS, blocked,
+      scope: only.length ? 'codes' : 'all',
     }), JSON_T);
     return;
   }

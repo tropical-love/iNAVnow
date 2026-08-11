@@ -61,6 +61,39 @@ public class Net {
         });
     }
 
+    /**
+     * 엔진이 실제로 쓰는 호스트만 허용한다(알파벳순).
+     *
+     * 이 브리지는 CORS 밖에서 임의 요청을 보낼 수 있어, 페이지에 스크립트가 한 번이라도 주입되면
+     * 일반 웹페이지보다 할 수 있는 일이 많다. 목록을 좁혀 두면 그때도 낯선 서버로는 못 나간다.
+     * 호스트를 늘릴 때는 engine.js에서 실제로 부르는 것만 넣는다.
+     */
+    private static final String[] HOSTS = {
+            "finance.naver.com",
+            "investments.miraeasset.com",
+            "m.stock.naver.com",
+            "moneyrecipe.blog",
+            "papi.aceetf.co.kr",
+            "query1.finance.yahoo.com",
+            "wts-info-api.tossinvest.com",
+            "www.1qetf.com",
+            "www.aceetf.co.kr",
+            "www.funetf.co.kr",
+            "www.kiwoometf.com",
+            "www.plusetf.co.kr",
+            "www.riseetf.co.kr",
+            "www.samsungfund.com",
+            "www.soletf.com",
+            "yasun.gg",
+    };
+
+    private static boolean allowed(URL u) {
+        if (!"https".equals(u.getProtocol())) return false; // 평문 http로는 나가지 않는다
+        String h = u.getHost().toLowerCase();
+        for (String ok : HOSTS) if (h.equals(ok)) return true;
+        return false;
+    }
+
     private JSONObject doRequest(JSONObject s) throws Exception {
         String url = s.getString("url");
         String method = s.optString("method", "GET");
@@ -68,7 +101,10 @@ public class Net {
         String extraCa = s.isNull("extraCa") ? null : s.optString("extraCa", null);
         int timeout = s.optInt("timeout", 8000);
 
-        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        URL parsed = new URL(url);
+        if (!allowed(parsed)) throw new SecurityException("허용하지 않는 주소: " + parsed.getProtocol() + "://" + parsed.getHost());
+
+        HttpURLConnection c = (HttpURLConnection) parsed.openConnection();
         // kiwoometf.com은 중간 인증서를 빼먹고 보낸다 — 그 인증서를 보태 정상 검증을 켠다.
         // 검증을 끄는 게 아니라 신뢰 앵커를 보태는 것이라 MITM 방어가 유지된다.
         if ("sectigo-ov".equals(extraCa) && c instanceof HttpsURLConnection) {
