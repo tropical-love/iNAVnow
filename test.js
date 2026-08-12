@@ -293,7 +293,7 @@ if (A) {
     // 편입·편출을 못 잡는다. 하필 이 버튼은 리밸런싱이 늦을 때 누르라고 안내한다
     assert.strictEqual(S.cache.has('pdfset:111111'), true, '리밸런싱 비교 이력을 지웠다 — 편입·편출을 놓친다');
     ['pdf:bbb:other', 'pdfkey:111111', 'pdfkey:555555', 'pdfset:111111', 'blk:testissuer'].forEach(k => S.cache.delete(k));
-    S.server.close();
+    await new Promise(r => S.server.close(r)); // 다 닫힌 뒤에 다음 블록이 다시 연다
     ok('수동 갱신은 지정 종목 자료만 비우고, 차단 기록·리밸런싱 이력·무관한 종목은 남긴다');
   }
 
@@ -334,7 +334,7 @@ if (A) {
     assert.ok(all.stale >= 1, 'codes 없이 조회하면 전체를 세야 한다');
     ['pdf:mine:a', 'pdf:other:b', 'pdfkey:777777', 'pdfkey:888888', 'pdfset:777777', 'pdfset:888888']
       .forEach(k => S.cache.delete(k));
-    S.server.close();
+    await new Promise(r => S.server.close(r));
     ok('PDF 상태 집계가 codes로 준 종목 범위만 센다');
   }
 

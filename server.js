@@ -2240,6 +2240,12 @@ const HTML = `<!doctype html>
   .pfrow .dt { display: flex; justify-content: space-between; align-items: baseline; gap: 8px;
     font-size: 13px; font-variant-numeric: tabular-nums; }
   .pfrow .dt .muted { font-size: 12.5px; }
+  /* 어제 대비는 가격보다 한 단계, 등락률은 거기서 또 한 단계 작게 — 가격이 주 정보다 */
+  .pfrow .dt .day { font-size: 11.5px; font-variant-numeric: tabular-nums; }
+  .pfrow .dt .day .pct { font-size: 10.5px; margin-left: 3px; opacity: .9; }
+  #pfsum .day { display: block; font-size: 11px; font-weight: 500; margin-top: 3px; }
+  /* 간격 규칙이 .v 안쪽에만 있어 어제 대비 줄에서는 금액과 %가 붙어 나왔다 */
+  #pfsum .day .pct { margin-left: 4px; }
   #pfempty { font-size: 13px; color: var(--muted); line-height: 1.7; margin: 12px 0 2px; }
   @media (max-width: 640px) {
     #pfsum { grid-template-columns: 1fr; gap: 6px; text-align: left; }
@@ -2385,6 +2391,10 @@ const HTML = `<!doctype html>
   <div class="sec" id="secInav">
     <label><input type="checkbox" id="showinav"> 타이틀에 현재 iNAV 표시</label>
     <div class="hint">갱신될 때마다 제목 뒤에 <b>_숫자</b>로 붙습니다(종목명 미표시 모드 제외).</div>
+  </div>
+  <div class="sec">
+    <label><input type="checkbox" id="showday"> 포트폴리오에 어제 대비 표시</label>
+    <div class="hint">직전 거래일 <b>종가</b>를 기준으로 오늘 얼마나 움직였는지 함께 보여줍니다(종목별·합계).</div>
   </div>
   <div class="sec">
     <div class="muted">구성종목 자료(PDF)</div>
@@ -2557,6 +2567,7 @@ function syncCfgUI(){
   const si = document.getElementById('showinav');
   si.checked = CFG.showInav && CFG.titleMode!=='noname';
   si.disabled = CFG.titleMode === 'noname';
+  document.getElementById('showday').checked = localStorage.getItem('pfDay') !== '0';
 }
 function openCfg(){ syncCfgUI(); document.getElementById('cfgdlg').showModal(); pdfInfo(); }
 // 하루 한 번만 받는 자료(구성종목 PDF)의 상태. 리밸런싱이 늦게 올라온 날 손으로 새로 받을 수 있게 한다.
@@ -2646,6 +2657,11 @@ document.getElementById('otitle').oninput = function(){
   localStorage.setItem('cfg', JSON.stringify(CFG)); applyTitle(); // syncCfgUI는 생략(입력 중 커서 유지)
 };
 document.getElementById('showinav').onchange = function(){ CFG.showInav = this.checked; saveCfg(); };
+// 어제 대비 표시 — 포트폴리오 화면에만 쓰는 값이라 CFG(타이틀 설정)와 따로 둔다
+document.getElementById('showday').onchange = function(){
+  localStorage.setItem('pfDay', this.checked ? '1' : '0');
+  if(typeof pfRender === 'function' && HOME) pfRender();
+};
 function clearFavs(){
   if(!confirm('관심 목록을 모두 지울까요?')) return;
   localStorage.removeItem('favs');
@@ -3168,17 +3184,35 @@ function pfRender(){
     const u = q ? (PFB === 'price' ? q.price : q.inav) : null; // 선택한 기준의 단가
     cost += c;
     if(u == null) allKnown = false; else val += u * h.qty;
-    return { h: h, cost: c, unit: u, val: u != null ? u * h.qty : null };
+    // 종목별 어제 대비는 1주 기준(가격 옆에 붙으므로) — 합계와 달리 아는 종목만 표시한다
+    const pv = q && q.prev > 0 ? q.prev : null;
+    const dd = (u != null && pv) ? u - pv : null;
+    return { h: h, cost: c, unit: u, val: u != null ? u * h.qty : null,
+      dayD: dd, dayP: dd != null ? dd / pv * 100 : null };
   });
   const total = allKnown ? val : null;
   const diff = total != null ? total - cost : null;
   const pct = (diff != null && cost > 0) ? diff / cost * 100 : null;
+  // 어제 대비 — 기준은 직전 거래일 종가다. 어제 그 수량을 종가로 들고 있었다면 얼마였는지와 견준다.
+  // 하나라도 전일 종가를 모르면 합계를 내지 않는다(일부만 더하면 틀린 금액이 된다).
+  let dayBase = 0, dayKnown = total != null;
+  PF.forEach(function(h){
+    const q = PFV[h.code];
+    if(q && q.prev > 0) dayBase += q.prev * h.qty; else dayKnown = false;
+  });
+  const dayDiff = dayKnown ? total - dayBase : null;
+  const dayPct = (dayDiff != null && dayBase > 0) ? dayDiff / dayBase * 100 : null;
+  const dayOn = localStorage.getItem('pfDay') !== '0';
+  const dayHtml = function(inner){ return dayOn && dayDiff != null
+    ? '<span class="day '+cls(dayDiff)+'">'+inner+'</span>' : ''; };
   sum.innerHTML =
     '<div class="bx"><div class="muted">원금</div><div class="v">'+fmt(cost,0)+'원</div></div>'+
     '<div class="bx"><div class="muted">현재가치 <span style="font-size:10.5px">'+bLbl+' 기준</span></div>'+
-      '<div class="v">'+(total!=null ? fmt(total,0)+'원' : '—')+'</div></div>'+
+      '<div class="v">'+(total!=null ? fmt(total,0)+'원' : '—')+'</div>'+
+      dayHtml('어제보다 '+amtHtml(dayDiff))+'</div>'+
     '<div class="bx"><div class="muted">변동</div><div class="v '+(diff!=null?cls(diff):'')+'">'+
-      (diff!=null ? amtHtml(diff)+'<span class="pct">'+sign(pct)+'%</span>' : '—')+'</div></div>';
+      (diff!=null ? amtHtml(diff)+'<span class="pct">'+sign(pct)+'%</span>' : '—')+'</div>'+
+      dayHtml('어제보다 '+amtHtml(dayDiff)+'<span class="pct">'+sign(dayPct)+'%</span>')+'</div>';
   // 비중은 선택한 기준의 평가금액 — 값이 움직이면 막대도 따라 움직인다. 아직 못 구했으면 원금 기준.
   const base = (total != null && total > 0) ? total : cost;
   box.innerHTML = rows.map(function(r, i){
@@ -3196,7 +3230,9 @@ function pfRender(){
         '<i style="width:'+w.toFixed(1)+'%"></i><span>'+fmt(w,1)+'%'+
         (mine!=null ? '<b>('+fmt(mine,0)+')</b>' : '')+'</span></div>'+
       '<div class="dt"><span class="muted">'+fmt(r.h.qty,0)+'주 · 평균 '+fmt(r.h.avg,dp(r.h.avg))+'원'+
-        (r.unit!=null ? ' → '+bLbl+' '+fmt(r.unit,dp(r.unit))+'원' : '')+'</span>'+
+        (r.unit!=null ? ' → '+bLbl+' '+fmt(r.unit,dp(r.unit))+'원' : '')+
+        (dayOn && r.dayD != null ? ' <span class="day '+cls(r.dayD)+'">'+amtHtml(r.dayD)
+          + '<span class="pct">'+sign(r.dayP)+'%</span></span>' : '')+'</span>'+
         '<span class="'+(d!=null?cls(d):'muted')+'">'+
           (d!=null ? amtHtml(d)+' <span style="font-size:12px">'+sign(p)+'%</span>' : '계산 중…')+'</span>'+
       '</div></div>';
@@ -3212,7 +3248,8 @@ async function pfPxTick(){
     let any = false;
     PF.forEach(function(h){
       const v = d && d[h.code];
-      if(v && v.price > 0){ PFV[h.code] = Object.assign({}, PFV[h.code], { price: v.price }); any = true; }
+      // prev(직전 거래일 종가)는 여기서만 온다 — 상세 응답의 등락 기준은 시간외에 당일 종가로 바뀌어 섞으면 안 된다
+      if(v && v.price > 0){ PFV[h.code] = Object.assign({}, PFV[h.code], { price: v.price, prev: v.prev }); any = true; }
     });
     if(any){ PFAT = new Date(); pfSaveCalc(); pfRender(); } // PFCAT은 그대로 — 현재가 갱신은 재계산이 아니다
   } catch(e){ /* 실패하면 다음 주기에 다시 */ }
@@ -3236,7 +3273,7 @@ async function pfCalc(){
       const cached = dLoad(h.code);
       const fresh = cached && cached.d && Date.now() - cached.at < REUSE_MS;
       const d = fresh ? cached.d : await (await fetch('/api/inav?code='+encodeURIComponent(h.code))).json();
-      if(d && d.inav != null) PFV[h.code] = { inav: d.inav, price: d.marketPrice };
+      if(d && d.inav != null) PFV[h.code] = Object.assign({}, PFV[h.code], { inav: d.inav, price: d.marketPrice }); // prev는 유지
       // 반대로 여기서 받은 응답도 남긴다 — 이 종목을 눌러 들어가면 다시 받지 않는다
       if(!fresh && d && d.inav != null) dSave(h.code, d);
       if(!pfBPinned && d && d.krSession) PFB = pfDefBasis(d.krSession); // 공휴일 교정
