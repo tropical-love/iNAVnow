@@ -116,8 +116,11 @@ const SHIM = BRIDGE + `<script src="engine.js"></script>
       if(s.startsWith('/api/px')){ // ETF 자체 시세만 (포트폴리오 현재가 빠른 갱신)
         const cs = (q.get('codes')||'').split(',').filter(function(c){ return /^[0-9A-Z]{6}$/.test(c); }).slice(0,30);
         const m = cs.length ? await ENGINE.krQuotes(cs) : {};
+        const ref = ENGINE.dayRef(); // 어제 대비의 기준 종가·라벨(서버 라우트와 같은 규칙)
         return J(Object.fromEntries(cs.map(function(c){
-          return [c, m[c] ? {price:m[c].last, prev:m[c].prevClose, session:m[c].session} : null];
+          return [c, m[c] ? {price:m[c].last, prev:m[c].prevClose,
+            base: ref.useReg ? m[c].regClose : m[c].prevClose, dayLabel: ref.label, dayReg: ref.useReg,
+            session:m[c].session} : null];
         })));
       }
       if(s.startsWith('/api/stats')) return J(ENGINE.stats);

@@ -967,6 +967,30 @@ function krSession(now = Date.now()) { // now는 검사용 주입구 — 평소�
 }
 // 개장 전 구간(08:00~09:00) — 오늘 첫 체결 전이라 등락의 기준이 아직 없다
 const KR_PREOPEN = ['NXT프리', '장전'];
+
+// ---------- '어제 대비'의 기준 ----------
+// 기준은 언제나 '가장 최근 확정 종가'다. 오늘 장이 끝났으면 오늘 종가, 그 밖에는 직전 거래일 종가.
+// 라벨은 그 종가가 언제 것인지로 정한다 — 같은 값에 '어제보다'라고 붙이면 시점마다 말이 어긋난다.
+//   · 오늘 마감 후 자정까지 → 오늘 종가보다 (그 뒤 장외 변동)
+//   · 자정 넘어 다음 마감 전 → 어제보다 / 금요일보다(토·일·월) / 직전 거래일보다(연휴 뒤)
+// 16:00을 경계로 두는 이유는 지수와 같다 — 15:30 직후에는 종가가 아직 확정 전이다.
+const DAY_REF_HM = 1600;
+const kstD = (now = Date.now()) => new Date(now + 9 * 3600e3); // UTC 필드를 KST로 읽는다
+const ymd8 = d => [d.getUTCFullYear(), String(d.getUTCMonth() + 1).padStart(2, '0'),
+  String(d.getUTCDate()).padStart(2, '0')].join('');
+function dayRef(now = Date.now()) {
+  // 오늘 종가가 확정됐나 — 거래일이고 16:00을 지났을 때만(주말·공휴일은 krSession이 휴장을 준다)
+  if (krSession(now) !== '휴장' && kstHm(now) >= DAY_REF_HM) return { useReg: true, label: '오늘 종가보다' };
+  const t = kstD(now), d = kstD(now);
+  let hops = 0;
+  do { d.setUTCDate(d.getUTCDate() - 1); hops++; }
+  while (hops < 14 && (d.getUTCDay() === 0 || d.getUTCDay() === 6 || !isKrBiz(ymd8(d))));
+  const gap = Math.round((Date.UTC(t.getUTCFullYear(), t.getUTCMonth(), t.getUTCDate())
+    - Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())) / 86400e3);
+  if (d.getUTCDay() === 5) return { useReg: false, label: '금요일보다' }; // 토·일·월은 모두 금요일이 기준
+  if (gap === 1) return { useReg: false, label: '어제보다' };
+  return { useReg: false, label: '직전 거래일보다' };
+}
 // 장외 굴림에서 현물 바스켓을 야간선물보다 먼저 볼 때 — 프리마켓에는 현물이 다시 거래되고
 // 야간선물은 06:00에 멈춰 있다. 그 밖(저녁~새벽)에는 선물이 최신이라 순서가 반대다.
 const spotFirst = (s = krSession()) => KR_PREOPEN.includes(s);
@@ -3185,7 +3209,7 @@ function pfRender(){
     cost += c;
     if(u == null) allKnown = false; else val += u * h.qty;
     // 종목별 어제 대비는 1주 기준(가격 옆에 붙으므로) — 합계와 달리 아는 종목만 표시한다
-    const pv = q && q.prev > 0 ? q.prev : null;
+    const pv = q && q.base > 0 ? q.base : null;
     const dd = (u != null && pv) ? u - pv : null;
     return { h: h, cost: c, unit: u, val: u != null ? u * h.qty : null,
       dayD: dd, dayP: dd != null ? dd / pv * 100 : null };
@@ -3195,24 +3219,29 @@ function pfRender(){
   const pct = (diff != null && cost > 0) ? diff / cost * 100 : null;
   // 어제 대비 — 기준은 직전 거래일 종가다. 어제 그 수량을 종가로 들고 있었다면 얼마였는지와 견준다.
   // 하나라도 전일 종가를 모르면 합계를 내지 않는다(일부만 더하면 틀린 금액이 된다).
-  let dayBase = 0, dayKnown = total != null;
+  let dayBase = 0, dayKnown = total != null, dayLbl = '어제보다', dayReg = false;
   PF.forEach(function(h){
     const q = PFV[h.code];
-    if(q && q.prev > 0) dayBase += q.prev * h.qty; else dayKnown = false;
+    if(q && q.dayLabel){ dayLbl = q.dayLabel; dayReg = !!q.dayReg; } // 종목마다 같다(서버가 달력으로 정한다)
+    if(q && q.base > 0) dayBase += q.base * h.qty; else dayKnown = false;
   });
   const dayDiff = dayKnown ? total - dayBase : null;
   const dayPct = (dayDiff != null && dayBase > 0) ? dayDiff / dayBase * 100 : null;
   const dayOn = localStorage.getItem('pfDay') !== '0';
-  const dayHtml = function(inner){ return dayOn && dayDiff != null
+  // 기준이 '오늘 종가'인데 차이가 0이면 아무것도 보여주지 않는다 — 장이 끝나면 현재가는 시간외
+  // 체결이 없는 한 종가 그대로여서 '오늘 종가보다 0원 +0.00%'가 종일 붙어 있다(사용자 지적).
+  // iNAV는 장외에도 계속 움직이므로 그대로 나온다. 시간외 체결이 있으면 현재가도 값이 생긴다.
+  const dayShow = dayOn && dayDiff != null && !(dayReg && Math.round(dayDiff) === 0);
+  const dayHtml = function(inner){ return dayShow
     ? '<span class="day '+cls(dayDiff)+'">'+inner+'</span>' : ''; };
   sum.innerHTML =
     '<div class="bx"><div class="muted">원금</div><div class="v">'+fmt(cost,0)+'원</div></div>'+
     '<div class="bx"><div class="muted">현재가치 <span style="font-size:10.5px">'+bLbl+' 기준</span></div>'+
       '<div class="v">'+(total!=null ? fmt(total,0)+'원' : '—')+'</div>'+
-      dayHtml('어제보다 '+amtHtml(dayDiff))+'</div>'+
+      dayHtml(dayLbl+' '+amtHtml(dayDiff))+'</div>'+
     '<div class="bx"><div class="muted">변동</div><div class="v '+(diff!=null?cls(diff):'')+'">'+
       (diff!=null ? amtHtml(diff)+'<span class="pct">'+sign(pct)+'%</span>' : '—')+'</div>'+
-      dayHtml('어제보다 '+amtHtml(dayDiff)+'<span class="pct">'+sign(dayPct)+'%</span>')+'</div>';
+      dayHtml(dayLbl+' '+amtHtml(dayDiff)+'<span class="pct">'+sign(dayPct)+'%</span>')+'</div>';
   // 비중은 선택한 기준의 평가금액 — 값이 움직이면 막대도 따라 움직인다. 아직 못 구했으면 원금 기준.
   const base = (total != null && total > 0) ? total : cost;
   box.innerHTML = rows.map(function(r, i){
@@ -3231,7 +3260,8 @@ function pfRender(){
         (mine!=null ? '<b>('+fmt(mine,0)+')</b>' : '')+'</span></div>'+
       '<div class="dt"><span class="muted">'+fmt(r.h.qty,0)+'주 · 평균 '+fmt(r.h.avg,dp(r.h.avg))+'원'+
         (r.unit!=null ? ' → '+bLbl+' '+fmt(r.unit,dp(r.unit))+'원' : '')+
-        (dayOn && r.dayD != null ? ' <span class="day '+cls(r.dayD)+'">'+amtHtml(r.dayD)
+        (dayOn && r.dayD != null && !(dayReg && Math.round(r.dayD) === 0)
+          ? ' <span class="day '+cls(r.dayD)+'" title="'+esc(dayLbl)+'">'+amtHtml(r.dayD)
           + '<span class="pct">'+sign(r.dayP)+'%</span></span>' : '')+'</span>'+
         '<span class="'+(d!=null?cls(d):'muted')+'">'+
           (d!=null ? amtHtml(d)+' <span style="font-size:12px">'+sign(p)+'%</span>' : '계산 중…')+'</span>'+
@@ -3249,7 +3279,8 @@ async function pfPxTick(){
     PF.forEach(function(h){
       const v = d && d[h.code];
       // prev(직전 거래일 종가)는 여기서만 온다 — 상세 응답의 등락 기준은 시간외에 당일 종가로 바뀌어 섞으면 안 된다
-      if(v && v.price > 0){ PFV[h.code] = Object.assign({}, PFV[h.code], { price: v.price, prev: v.prev }); any = true; }
+      if(v && v.price > 0){ PFV[h.code] = Object.assign({}, PFV[h.code],
+        { price: v.price, prev: v.prev, base: v.base, dayLabel: v.dayLabel, dayReg: v.dayReg }); any = true; }
     });
     if(any){ PFAT = new Date(); pfSaveCalc(); pfRender(); } // PFCAT은 그대로 — 현재가 갱신은 재계산이 아니다
   } catch(e){ /* 실패하면 다음 주기에 다시 */ }
@@ -3497,8 +3528,12 @@ const handler = async (req, res) => {
       const codes = (u.searchParams.get('codes') || '').split(',')
         .filter(c => /^[0-9A-Z]{6}$/.test(c)).slice(0, 30);
       const q = codes.length ? await krQuotes(codes) : {};
+      const ref = dayRef();
       send(req, res, JSON.stringify(Object.fromEntries(codes.map(c =>
-        [c, q[c] ? { price: q[c].last, prev: q[c].prevClose, session: q[c].session } : null]))), JSON_T);
+        [c, q[c] ? { price: q[c].last, prev: q[c].prevClose,
+          // 어제 대비의 기준 종가와 그 라벨(오늘 종가보다 / 어제보다 / 금요일보다 / 직전 거래일보다)
+          base: ref.useReg ? q[c].regClose : q[c].prevClose, dayLabel: ref.label, dayReg: ref.useReg,
+          session: q[c].session } : null]))), JSON_T);
     } catch (e) {
       console.error('/api/px 실패:', e.message);
       res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -3527,7 +3562,7 @@ const handler = async (req, res) => {
 
 // 안드로이드에서는 HTTP 서버가 없다 — 페이지가 이 함수들을 직접 부른다(에셋 index.html의 fetch shim).
 if (!NODE) {
-  globalThis.ENGINE = { computeINav, etfList, marketQuotes, krQuotes, stats, cache, saveCache,
+  globalThis.ENGINE = { computeINav, etfList, marketQuotes, krQuotes, stats, cache, saveCache, dayRef,
     issuerBlocked, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, pdfKeysOf, fxKeyD, PDF_MARKS, krSession, todayYmd, DEFAULT_CODE };
 } else {
 
@@ -3549,6 +3584,6 @@ if (require.main === module) {
     try { fs.writeFileSync(__dirname + '/server.pid', String(process.pid)); } catch (e) {}
   });
 }
-module.exports = { server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, krSession, idxSettled, spotFirst, KR_PREOPEN, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
+module.exports = { server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, krSession, idxSettled, spotFirst, KR_PREOPEN, dayRef, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
 
 }

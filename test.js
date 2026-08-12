@@ -176,6 +176,35 @@ if (A) {
     ok('레버리지 장외 굴림이 프리마켓에는 현물 바스켓을 먼저 본다');
   }
 
+  // ---------- 3c-2d. '어제 대비'의 기준과 라벨 ----------
+  // 기준은 언제나 가장 최근 확정 종가다. 같은 값에 '어제보다'를 붙이면 시점마다 말이 어긋난다 —
+  // 오늘 마감 뒤에는 그 값이 '오늘 종가 대비 장외 변동'이고, 토·일·월에는 금요일이 기준이다.
+  {
+    // 직전 거래일 탐색은 달력(isKrBiz)을 쓴다 — 앞의 3b가 가짜 달력을 남겨 두므로 여기서 다시 세운다.
+    // 2026-08: 11(화)·12(수)·13(목)·14(금)·17(월)을 거래일로, 15~16(주말)은 비운다.
+    const days = [];
+    for (let i = 0; i < 45; i++) days.push(String(20200101 + i)); // isKrBiz 활성화 요건(>40개)
+    days.push('20260811', '20260812', '20260813', '20260814', '20260817', S.todayYmd());
+    S.cache.set('krbiz', { ts: Date.now(), ttl: 6 * 3600e3, data: days });
+    await S.loadKrDays();
+    const K = (d, h, mi) => Date.UTC(2026, 7, d, h - 9, mi); // 2026-08-12는 수요일
+    const at = (d, h, mi) => S.dayRef(K(d, h, mi));
+    assert.strictEqual(at(12, 13, 0).label, '어제보다', '장중 기준은 직전 거래일 종가다');
+    assert.strictEqual(at(12, 13, 0).useReg, false);
+    assert.strictEqual(at(12, 15, 45).label, '어제보다', '15:45에는 종가가 아직 확정 전이다');
+    assert.strictEqual(at(12, 16, 30).label, '오늘 종가보다', '마감 뒤인데 어제를 기준으로 본다');
+    assert.strictEqual(at(12, 16, 30).useReg, true, '마감 뒤에는 오늘 종가를 기준으로 써야 한다');
+    assert.strictEqual(at(12, 23, 59).label, '오늘 종가보다', '자정 전까지는 오늘 종가가 기준이다');
+    assert.strictEqual(at(13, 1, 0).label, '어제보다', '자정을 넘기면 어제가 된다');
+    assert.strictEqual(at(13, 1, 0).useReg, false);
+    assert.strictEqual(at(15, 12, 0).label, '금요일보다', '토요일 기준은 금요일이다');   // 8/15 토
+    assert.strictEqual(at(16, 12, 0).label, '금요일보다', '일요일도 금요일이 기준이다'); // 8/16 일
+    assert.strictEqual(at(17, 10, 0).label, '금요일보다', '월요일 장중도 금요일이 기준이다');
+    assert.strictEqual(at(17, 17, 0).label, '오늘 종가보다', '월요일 마감 뒤에는 그날 종가가 기준이다');
+    S.cache.delete('krbiz'); // 뒤 검사가 쓰는 상태로 되돌린다
+    ok("'어제 대비'가 오늘 종가·어제·금요일을 시점에 맞게 가른다");
+  }
+
   // ---------- 3c-3. PDF 갱신 경계 (하루 세 번만 새로 받는다) ----------
   {
     const KST = (h, mi) => Date.UTC(2026, 7, 10, h - 9, mi);
