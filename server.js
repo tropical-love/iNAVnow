@@ -967,6 +967,9 @@ function krSession(now = Date.now()) { // now는 검사용 주입구 — 평소�
 }
 // 개장 전 구간(08:00~09:00) — 오늘 첫 체결 전이라 등락의 기준이 아직 없다
 const KR_PREOPEN = ['NXT프리', '장전'];
+// 장외 굴림에서 현물 바스켓을 야간선물보다 먼저 볼 때 — 프리마켓에는 현물이 다시 거래되고
+// 야간선물은 06:00에 멈춰 있다. 그 밖(저녁~새벽)에는 선물이 최신이라 순서가 반대다.
+const spotFirst = (s = krSession()) => KR_PREOPEN.includes(s);
 
 // 미국주식 주간거래(Blue Ocean): 야후에 없음 → 토스 시세로 보완
 function usDaySession() { // KST 09:00~17:00 평일 = 미국 주간거래 시간대
@@ -1194,7 +1197,11 @@ async function officialOnly(stockCode, analysis, basic, reason) {
     krSession: krSession(), fx: {},
     returns: analysis.returnPerformanceList, aum: analysis.totalNav, fee: analysis.totalFee,
     volume: igVal(ig, 'accumulatedTradingVolume'),
-    note: `구성종목을 실시간 추적할 수 없어(${reason}) KRX 공식 iNAV를 그대로 표시합니다. 채권형·해외형은 종목코드가 공개되지 않아 자체 추정이 불가합니다.`,
+    // reason은 '첫 시도가 왜 실패했는지'다. 여기까지 왔다는 건 대체 경로(다른 제공처·같은 상품의
+    // 타 운용사 ETF·상위10)도 모두 실패했다는 뜻이라 그렇게 적는다 — '폴백 사용'으로 끝내면
+    // 대체 자료로 계산한 것처럼 읽힌다(실제로는 계산을 포기하고 공식값만 보여주는 상태).
+    note: `구성종목을 실시간 추적할 수 없어 KRX 공식 iNAV를 그대로 표시합니다 — ${reason}.`
+      + ' 일시적인 경우가 많아 다음 갱신 때 자동으로 다시 시도합니다. 구성종목에 종목코드가 없는 채권형·합성형은 계속 공식값만 표시됩니다.',
     rows: [], moreCount: 0, pdfDate: '-',
     asOf: new Date().toISOString(),
   };
@@ -1260,24 +1267,27 @@ async function computeDomesticLev(stockCode, analysis, basic) {
   // 선물 베이시스의 장외 변화는 잡지 못하지만, 굴리지 않는 것보다 오차가 훨씬 작다.
   let inav = official, sessContrib = 0, rolled = null;
   if (krSession() !== '본장') {
-    // ① 야간선물이 돌고 있으면 그것을 쓴다 — 이 상품 자체가 선물 기반이라 베이시스가 상쇄된다.
+    // ① 야간선물 — 이 상품 자체가 선물 기반이라 베이시스가 상쇄된다.
     //    섹터 지수에는 해당 야간선물이 없으므로 지수가 대표 지수와 같을 때만.
     const nq = nightSym && domIndexSame(idxNm, idxLabel) ? (await nightFutures())[nightSym] : null;
-    if (nightUsable(nq) && Math.abs(nq.chgPct) >= 0.01) {
-      sessContrib = lev * nq.chgPct;
-      inav = official * (1 + sessContrib / 100);
-      rolled = { name: idxLabel + ' 야간선물', pct: nq.chgPct, night: true };
-    } else {
-      // ② 없으면 같은 지수 1배수 ETF의 현물 바스켓으로 (선물 베이시스의 장외 변화는 못 잡는다)
+    const byNight = () => (nightUsable(nq) && Math.abs(nq.chgPct) >= 0.01)
+      ? { name: idxLabel + ' 야간선물', pct: nq.chgPct, night: true } : null;
+    // ② 같은 지수 1배수 ETF의 현물 바스켓 (선물 베이시스의 장외 변화는 못 잡는다)
+    const bySpot = async () => {
       const bc = await domBaseCode(nm, stockCode, idxNm, idxLabel, base1x);
       const base = bc ? await computeINav(bc, 1).catch(() => null) : null;
       const bs = base?.sessContrib;
       // 기초가 공식값뿐이거나 추적이 얕으면 굴리지 않는다 — 오차가 배수만큼 증폭된다
-      if (base && !base.isOfficial && Number.isFinite(bs) && Math.abs(bs) >= 0.01 && base.coveragePct >= 50) {
-        sessContrib = lev * bs;
-        inav = official * (1 + sessContrib / 100);
-        rolled = { code: bc, name: base.etfName, pct: bs };
-      }
+      return (base && !base.isOfficial && Number.isFinite(bs) && Math.abs(bs) >= 0.01 && base.coveragePct >= 50)
+        ? { code: bc, name: base.etfName, pct: bs } : null;
+    };
+    // 순서는 세션이 정한다. 야간선물은 06:00에 끝나 그 값에 멈추는데, 프리마켓에는 현물이 다시
+    // 거래되므로 그때는 현물 바스켓이 더 최신이다(실측 2026-08-12 08:24: 코스닥150레버리지가
+    // 06:00 선물값에 멈춰 프리장 변동이 하나도 반영되지 않았다). 프리장에 체결이 없으면 선물로 돌아간다.
+    rolled = spotFirst() ? (await bySpot()) || byNight() : byNight() || (await bySpot());
+    if (rolled) {
+      sessContrib = lev * rolled.pct;
+      inav = official * (1 + sessContrib / 100);
     }
   }
   const etfClose = etfCloseOf(basic);
@@ -1556,7 +1566,7 @@ async function computeINav(stockCode, depth = 0) {
   let pdf, skipped = false;
   try {
     if (!adapter) throw new Error(`지원하지 않는 운용사: ${analysis.issuerName || '알 수 없음'}`);
-    if (issuerBlocked(issuerKey)) { skipped = true; throw new Error(`${issuerKey} 오늘 차단됨 — 폴백 사용`); }
+    if (issuerBlocked(issuerKey)) { skipped = true; throw new Error(`${issuerKey} 자료를 오늘 받을 수 없음(차단)`); }
     pdf = await adapter.pdf(stockCode);
   } catch (e) {
     // 건너뛰어서 던진 것까지 다시 기록하면 차단 기한이 매번 새로 쓰여(24시간 → 10분) 계속 재시도한다
@@ -1571,8 +1581,10 @@ async function computeINav(stockCode, depth = 0) {
       if (sib) return computeSynthetic(stockCode, sib, analysis, basic, 1);
       // ③ 네이버 상위10
       try { pdf = await naverTop10Pdf(stockCode, analysis); }
-      // ④ 그래도 안 되면 추정을 포기하고 KRX 공식 iNAV만 보여준다
-      catch (e2) { return officialOnly(stockCode, analysis, basic, e.message); }
+      // ④ 그래도 안 되면 추정을 포기하고 KRX 공식 iNAV만 보여준다.
+      //    대체 경로가 왜 실패했는지도 함께 남긴다 — 첫 실패만 적어 두면 나중에 원인을 못 찾는다
+      //    (실측 2026-08-12 08:24 PLUS 글로벌HBM반도체가 이 상태였는데 이유가 화면에 없었다).
+      catch (e2) { return officialOnly(stockCode, analysis, basic, `${e.message} · 대체 자료도 실패(${e1.message})`); }
     }
   }
   const rebal = notePdfSet(stockCode, pdf); // 리밸런싱 감지(설명은 notePdfSet 주석에)
@@ -3500,6 +3512,6 @@ if (require.main === module) {
     try { fs.writeFileSync(__dirname + '/server.pid', String(process.pid)); } catch (e) {}
   });
 }
-module.exports = { server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, krSession, idxSettled, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
+module.exports = { server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, krSession, idxSettled, spotFirst, KR_PREOPEN, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
 
 }

@@ -162,6 +162,20 @@ if (A) {
     ok('지수 종가는 확정 시각(16:00) 이후에만 고정하고, 마감 직후에는 다시 받는다');
   }
 
+  // ---------- 3c-2c. 레버리지 장외 굴림은 프리마켓에 현물을 먼저 본다 ----------
+  // 야간선물은 06:00에 끝나 그 값에 멈춘다. 프리마켓(08:00~)에는 현물이 다시 거래되는데
+  // 선물을 먼저 보면 그 값이 이겨서 프리장 변동이 하나도 반영되지 않는다
+  // (실측 2026-08-12 08:24: 코스닥150레버리지가 06:00 선물값에 멈춰 있었다).
+  {
+    assert.strictEqual(S.spotFirst('NXT프리'), true, '프리마켓인데 멈춘 선물을 먼저 본다');
+    assert.strictEqual(S.spotFirst('장전'), true, '프리장 종료~개장 사이에도 현물이 최신이다');
+    assert.strictEqual(S.spotFirst('NXT애프터'), false, '애프터에는 선물이 돌고 있어 선물이 먼저다');
+    assert.strictEqual(S.spotFirst('장마감'), false, '저녁·새벽에는 선물이 먼저다');
+    assert.strictEqual(S.spotFirst('휴장'), false);
+    assert.deepStrictEqual(S.KR_PREOPEN, ['NXT프리', '장전'], '프리마켓 세션 목록이 바뀌었다');
+    ok('레버리지 장외 굴림이 프리마켓에는 현물 바스켓을 먼저 본다');
+  }
+
   // ---------- 3c-3. PDF 갱신 경계 (하루 세 번만 새로 받는다) ----------
   {
     const KST = (h, mi) => Date.UTC(2026, 7, 10, h - 9, mi);
