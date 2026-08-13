@@ -189,18 +189,30 @@ if (A) {
     await S.loadKrDays();
     const K = (d, h, mi) => Date.UTC(2026, 7, d, h - 9, mi); // 2026-08-12는 수요일
     const at = (d, h, mi) => S.dayRef(K(d, h, mi));
+    // 라벨
     assert.strictEqual(at(12, 13, 0).label, '어제보다', '장중 기준은 직전 거래일 종가다');
-    assert.strictEqual(at(12, 13, 0).useReg, false);
     assert.strictEqual(at(12, 15, 45).label, '어제보다', '15:45에는 종가가 아직 확정 전이다');
     assert.strictEqual(at(12, 16, 30).label, '오늘 종가보다', '마감 뒤인데 어제를 기준으로 본다');
-    assert.strictEqual(at(12, 16, 30).useReg, true, '마감 뒤에는 오늘 종가를 기준으로 써야 한다');
     assert.strictEqual(at(12, 23, 59).label, '오늘 종가보다', '자정 전까지는 오늘 종가가 기준이다');
-    assert.strictEqual(at(13, 1, 0).label, '어제보다', '자정을 넘기면 어제가 된다');
-    assert.strictEqual(at(13, 1, 0).useReg, false);
+    assert.strictEqual(at(13, 0, 4).label, '어제보다', '자정을 넘기면 어제가 된다');
+    assert.strictEqual(at(13, 8, 31).label, '어제보다', '프리장에도 기준은 직전 거래일이다');
     assert.strictEqual(at(15, 12, 0).label, '금요일보다', '토요일 기준은 금요일이다');   // 8/15 토
     assert.strictEqual(at(16, 12, 0).label, '금요일보다', '일요일도 금요일이 기준이다'); // 8/16 일
+    assert.strictEqual(at(17, 3, 0).label, '금요일보다', '월요일 새벽도 금요일이 기준이다');
     assert.strictEqual(at(17, 10, 0).label, '금요일보다', '월요일 장중도 금요일이 기준이다');
     assert.strictEqual(at(17, 17, 0).label, '오늘 종가보다', '월요일 마감 뒤에는 그날 종가가 기준이다');
+
+    // 어느 값을 기준으로 쓰는가 — 여기가 자정에 하루 어긋나던 자리다.
+    // 네이버의 '전일 종가'는 자정이 지나도 한동안 그 전날을 가리킨다(실측 2026-08-13 00:04:
+    // ACE…레버리지 전일 종가가 46,880원(8/11)으로 나왔고 08:31에는 45,335원(8/12)이었다).
+    // 장이 닫혀 있는 동안에는 정규장 종가(reg)가 곧 가장 최근 확정 종가라, 그걸 쓰면 어긋나지 않는다.
+    assert.strictEqual(at(13, 0, 4).useReg, true, '자정 직후에 전일 종가를 쓰면 기준이 하루 밀린다');
+    assert.strictEqual(at(13, 8, 31).useReg, true, '프리장에도 정규장 종가가 직전 거래일 종가다');
+    assert.strictEqual(at(13, 10, 0).useReg, false, '장중에는 진행 중인 오늘 값을 기준으로 쓰면 안 된다');
+    assert.strictEqual(at(13, 15, 45).useReg, false, '종가 확정 전에는 전일 종가가 기준이다');
+    assert.strictEqual(at(13, 16, 30).useReg, true, '마감 뒤에는 오늘 종가를 기준으로 써야 한다');
+    assert.strictEqual(at(15, 12, 0).useReg, true, '주말에는 정규장 종가가 곧 금요일 종가다');
+    assert.strictEqual(at(17, 3, 0).useReg, true, '월요일 새벽도 마찬가지다');
     S.cache.delete('krbiz'); // 뒤 검사가 쓰는 상태로 되돌린다
     ok("'어제 대비'가 오늘 종가·어제·금요일을 시점에 맞게 가른다");
   }
@@ -340,6 +352,26 @@ if (A) {
     assert.deepStrictEqual(S.pdfKeysOf('444444'), ['pdf:zzz:ok', 'pdf:funetf:zzz'], '기초 ETF 키 목록이 연결되지 않았다');
     ['pdfkey:333333', 'pdfkey:444444', 'pdf:zzz:ok', 'pdf:funetf:zzz'].forEach(k => S.cache.delete(k));
     ok('PDF 키는 성공한 뒤에만 남고, 합성 ETF에는 기초 ETF 키가 연결된다');
+  }
+
+  // ---------- 3f-2. 계산이 안 되는 자료는 버려서 다음 조회가 새로 받게 한다 ----------
+  // 아침에 아직 다 올라오지 않은 PDF를 한 번 받으면 그게 캐시에 남아 다음 정기 갱신(15:40)까지
+  // 종일 같은 실패를 반복한다(실측 2026-08-13: 비중 합 88%짜리 PDF로 iNAV가 null이었고,
+  // 캐시가 빈 새 프로세스에서는 100%로 정상 계산됐다).
+  {
+    ['pdfkey:999999', 'pdfdrop:999999', 'pdf:zzz:bad'].forEach(k => S.cache.delete(k));
+    S.cache.set('pdf:zzz:bad', { ts: Date.now(), ttl: 60e3, data: { stdDt: '20260813' } });
+    S.notePdfKey('999999', 'pdf:zzz:bad');
+    assert.strictEqual(S.dropBadPdf('999999'), true, '쓸 수 없는 자료를 버리지 않았다');
+    assert.strictEqual(S.cache.has('pdf:zzz:bad'), false, '자료가 그대로 남아 있다');
+    // 곧바로 또 버리지는 않는다 — 실패할 때마다 운용사를 두드리면 차단당한다
+    S.cache.set('pdf:zzz:bad', { ts: Date.now(), ttl: 60e3, data: { stdDt: '20260813' } });
+    assert.strictEqual(S.dropBadPdf('999999'), false, '쿨다운 없이 계속 다시 받는다');
+    assert.strictEqual(S.cache.has('pdf:zzz:bad'), true, '쿨다운 중인데 또 버렸다');
+    // 한 번도 받은 적 없는 종목은 버릴 것도 없다
+    assert.strictEqual(S.dropBadPdf('888888'), false);
+    ['pdfkey:999999', 'pdfdrop:999999', 'pdf:zzz:bad'].forEach(k => S.cache.delete(k));
+    ok('계산이 안 되는 구성종목 자료는 버리고, 30분 안에 되풀이하지는 않는다');
   }
 
   // ---------- 3g. PDF 상태는 지금 보고 있는 종목만 센다 ----------

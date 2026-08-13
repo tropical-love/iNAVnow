@@ -330,6 +330,25 @@ const notePdfKey = (stockCode, key) => {
   saveCache();
 };
 // 어댑터 공통 래퍼 — 받아 온 뒤에만 키를 기억한다(실패한 키를 남기면 '지울 게 있다'고 오해한다)
+// 계산이 안 되면(iNAV 없음) 받아 둔 자료를 버린다 — 아침에 아직 다 올라오지 않은 PDF를 한 번 받으면
+// 그게 캐시에 남아 다음 정기 갱신(15:40)까지 종일 같은 실패를 반복한다.
+// (실측 2026-08-13 09:14 KIWOOM 코스닥150커버드콜·1Q 코스닥150채권혼합50: 비중 합 88%짜리 PDF가
+//  캐시에 남아 iNAV가 null이었고, 캐시가 빈 새 프로세스에서는 100%로 정상 계산됐다.)
+// 운용사를 계속 두드리지 않도록 종목당 30분에 한 번만 버린다.
+const PDF_REDROP_MS = 30 * 60e3;
+function dropBadPdf(stockCode) {
+  const k = `pdfdrop:${stockCode}`;
+  const r = cache.get(k);
+  if (r && Date.now() - r.ts < PDF_REDROP_MS) return false; // 방금 버렸으면 그대로 둔다
+  const keys = pdfKeysOf(stockCode);
+  if (!keys.length) return false;
+  cache.set(k, { ts: Date.now(), ttl: PDF_REDROP_MS, data: 1 });
+  for (const key of keys) cache.delete(key);
+  saveCache();
+  console.error('구성종목 자료가 불완전해 버림:', stockCode, keys.join(','));
+  return true;
+}
+
 const pdfCached = async (stockCode, key, fn) => {
   const data = await cached(key, pdfTtlFor, fn);
   notePdfKey(stockCode, key);
@@ -974,22 +993,38 @@ const KR_PREOPEN = ['NXT프리', '장전'];
 //   · 오늘 마감 후 자정까지 → 오늘 종가보다 (그 뒤 장외 변동)
 //   · 자정 넘어 다음 마감 전 → 어제보다 / 금요일보다(토·일·월) / 직전 거래일보다(연휴 뒤)
 // 16:00을 경계로 두는 이유는 지수와 같다 — 15:30 직후에는 종가가 아직 확정 전이다.
-const DAY_REF_HM = 1600;
+const DAY_OPEN_HM = 900, DAY_REF_HM = 1600;
 const kstD = (now = Date.now()) => new Date(now + 9 * 3600e3); // UTC 필드를 KST로 읽는다
 const ymd8 = d => [d.getUTCFullYear(), String(d.getUTCMonth() + 1).padStart(2, '0'),
   String(d.getUTCDate()).padStart(2, '0')].join('');
+// 어느 필드가 '가장 최근 확정 종가'인지는 시각이 아니라 '장이 열려 있는가'로 갈린다.
+// 네이버의 '전일 종가'(prev)는 자정이 지나도 한동안 그 전날을 가리킨다 — 프리장 무렵에야 넘어간다
+// (실측 2026-08-13 00:04 ACE…레버리지: 전일 종가가 46,880원(8/11)으로 나와 기준이 하루 어긋났고,
+//  08:31에는 45,335원(8/12)으로 정상이었다). 장이 닫혀 있는 동안에는 정규장 종가(reg) 자체가
+//  곧 '가장 최근 확정 종가'라, 그것을 쓰면 네이버가 날짜를 넘기는 시점과 무관해진다.
 function dayRef(now = Date.now()) {
-  // 오늘 종가가 확정됐나 — 거래일이고 16:00을 지났을 때만(주말·공휴일은 krSession이 휴장을 준다)
-  if (krSession(now) !== '휴장' && kstHm(now) >= DAY_REF_HM) return { useReg: true, label: '오늘 종가보다' };
+  const biz = krSession(now) !== '휴장'; // 주말·공휴일은 krSession이 휴장을 준다
+  const hm = kstHm(now);
+  const trading = biz && hm >= DAY_OPEN_HM && hm < DAY_REF_HM; // 장이 열려 있고 종가는 아직 확정 전
+  // 장중에만 prev(직전 거래일 종가)를 쓴다 — 그때는 reg가 '진행 중인 오늘 값'이다
+  if (!trading) {
+    if (biz && hm >= DAY_REF_HM) return { useReg: true, label: '오늘 종가보다' };
+  } else {
+    return { useReg: false, label: dayPrevLabel(now) };
+  }
+  return { useReg: true, label: dayPrevLabel(now) };
+}
+// 직전 거래일이 언제인지로 이름을 정한다(어제 / 금요일 / 그 밖)
+function dayPrevLabel(now) {
   const t = kstD(now), d = kstD(now);
   let hops = 0;
   do { d.setUTCDate(d.getUTCDate() - 1); hops++; }
   while (hops < 14 && (d.getUTCDay() === 0 || d.getUTCDay() === 6 || !isKrBiz(ymd8(d))));
   const gap = Math.round((Date.UTC(t.getUTCFullYear(), t.getUTCMonth(), t.getUTCDate())
     - Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())) / 86400e3);
-  if (d.getUTCDay() === 5) return { useReg: false, label: '금요일보다' }; // 토·일·월은 모두 금요일이 기준
-  if (gap === 1) return { useReg: false, label: '어제보다' };
-  return { useReg: false, label: '직전 거래일보다' };
+  if (d.getUTCDay() === 5) return '금요일보다'; // 토·일·월은 모두 금요일이 기준
+  if (gap === 1) return '어제보다';
+  return '직전 거래일보다';
 }
 // 장외 굴림에서 현물 바스켓을 야간선물보다 먼저 볼 때 — 프리마켓에는 현물이 다시 거래되고
 // 야간선물은 06:00에 멈춰 있다. 그 밖(저녁~새벽)에는 선물이 최신이라 순서가 반대다.
@@ -3544,7 +3579,10 @@ const handler = async (req, res) => {
   if (u.pathname === '/api/inav') {
     try {
       const before = stats.calls;
-      const data = await computeINav(u.searchParams.get('code') || DEFAULT_CODE);
+      const code = u.searchParams.get('code') || DEFAULT_CODE;
+      let data = await computeINav(code);
+      // 공식값만 쓰는 상품(레버리지·채권형)은 원래 inav가 있다 — 여기서 null이면 계산이 깨진 것이다
+      if (data && data.inav == null && dropBadPdf(code)) data = await computeINav(code);
       const body = JSON.stringify(data);
       stats.reqs++; stats.bytesOut += body.length;
       stats.lastReqCalls = stats.calls - before; // 이번 요청이 유발한 외부 호출 수
@@ -3584,6 +3622,6 @@ if (require.main === module) {
     try { fs.writeFileSync(__dirname + '/server.pid', String(process.pid)); } catch (e) {}
   });
 }
-module.exports = { server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, krSession, idxSettled, spotFirst, KR_PREOPEN, dayRef, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
+module.exports = { server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, dropBadPdf, krSession, idxSettled, spotFirst, KR_PREOPEN, dayRef, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
 
 }
