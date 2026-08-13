@@ -3261,7 +3261,11 @@ function pfRender(){
     if(q && q.base > 0) dayBase += q.base * h.qty; else dayKnown = false;
   });
   const dayDiff = dayKnown ? total - dayBase : null;
-  const dayPct = (dayDiff != null && dayBase > 0) ? dayDiff / dayBase * 100 : null;
+  const dayPct = (dayDiff != null && dayBase > 0) ? dayDiff / dayBase * 100 : null; // 평가액이 얼마나 늘었나
+  // 변동 카드는 '원금 대비 손익률' 카드다 — 그 아래 어제 대비도 같은 지표의 변화여야 한다.
+  // 평가액 증가율을 여기 적으면 카드 숫자에서 빼도 어제 손익률이 나오지 않는다
+  // (실측: 손익률 23.41%, 어제 22.01% → 차이 1.40%p인데 평가액 증가율은 1.14%).
+  const dayPp = (dayDiff != null && cost > 0) ? dayDiff / cost * 100 : null;
   const dayOn = localStorage.getItem('pfDay') !== '0';
   // 기준이 '오늘 종가'인데 차이가 0이면 아무것도 보여주지 않는다 — 장이 끝나면 현재가는 시간외
   // 체결이 없는 한 종가 그대로여서 '오늘 종가보다 0원 +0.00%'가 종일 붙어 있다(사용자 지적).
@@ -3276,7 +3280,7 @@ function pfRender(){
       dayHtml(dayLbl+' '+amtHtml(dayDiff))+'</div>'+
     '<div class="bx"><div class="muted">변동</div><div class="v '+(diff!=null?cls(diff):'')+'">'+
       (diff!=null ? amtHtml(diff)+'<span class="pct">'+sign(pct)+'%</span>' : '—')+'</div>'+
-      dayHtml(dayLbl+' '+sign(dayPct)+'%')+'</div>';
+      dayHtml(dayLbl+' '+sign(dayPp)+'%p')+'</div>';
   // 비중은 선택한 기준의 평가금액 — 값이 움직이면 막대도 따라 움직인다. 아직 못 구했으면 원금 기준.
   const base = (total != null && total > 0) ? total : cost;
   box.innerHTML = rows.map(function(r, i){

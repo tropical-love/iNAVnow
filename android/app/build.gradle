@@ -15,7 +15,7 @@ android {
         applicationId 'com.inavnow'
         minSdk 26          // WebView의 fetch·TextDecoder·Response가 안정적으로 있는 하한(Android 8.0)
         targetSdk 34
-        versionCode 25
+        versionCode 26
         versionName '1.4'
     }
 
