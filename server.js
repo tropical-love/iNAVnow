@@ -3276,7 +3276,7 @@ function pfRender(){
       dayHtml(dayLbl+' '+amtHtml(dayDiff))+'</div>'+
     '<div class="bx"><div class="muted">변동</div><div class="v '+(diff!=null?cls(diff):'')+'">'+
       (diff!=null ? amtHtml(diff)+'<span class="pct">'+sign(pct)+'%</span>' : '—')+'</div>'+
-      dayHtml(dayLbl+' '+amtHtml(dayDiff)+'<span class="pct">'+sign(dayPct)+'%</span>')+'</div>';
+      dayHtml(dayLbl+' '+sign(dayPct)+'%')+'</div>';
   // 비중은 선택한 기준의 평가금액 — 값이 움직이면 막대도 따라 움직인다. 아직 못 구했으면 원금 기준.
   const base = (total != null && total > 0) ? total : cost;
   box.innerHTML = rows.map(function(r, i){
