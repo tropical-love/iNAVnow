@@ -1459,6 +1459,20 @@ const nightUsable = q => !!q && Number.isFinite(q.chgPct)
 // 야간선물만 30초를 지킨다. 이 선들은 차단당하지 않는 한계로 확인된 값이라 더 줄이지 않는다.
 const IDX_TTL = LOCAL ? 8e3 : 17e3;
 const YF_TTL = 15e3;
+// 원/달러는 주말만 빼면 거의 24시간 돌아간다(대략 토 07:00 ~ 월 06:00 KST 휴장, 서머타임에 ±1시간).
+// 야후 갱신이 몇십 분 밀리는 일이 흔해서 '30분 이상 안 움직였으면 마감'으로 보면 평일 아침에도
+// 마감이 붙는다(실측 2026-08-19 09:13: 마지막 갱신 08:24 = 49분 전인데 서울 외환시장은 09:00에 열렸다).
+// 그래서 시계로 판정하고, 값이 아주 오래됐을 때만(6시간) 마감으로 본다.
+const fxMarketOpen = (now = Date.now()) => {
+  const d = new Date(now + 9 * 3600e3);
+  const day = d.getUTCDay(), hm = d.getUTCHours() * 100 + d.getUTCMinutes();
+  if (day === 6) return hm < 700;   // 토요일 이른 아침까지는 아직 열려 있다
+  if (day === 0) return false;      // 일요일은 닫혔다
+  if (day === 1) return hm >= 600;  // 월요일 06:00부터 열린다
+  return true;
+};
+const FX_DEAD_MS = 6 * 3600e3; // 열려 있어야 할 시간인데 이만큼 안 움직이면 값을 믿지 않는다
+
 const IDX_SETTLE_TTL = 5 * 60e3; // 마감~종가 확정 사이의 조회 간격
 // 종가가 확정된 뒤인가 — 그 뒤에는 값이 변하지 않으므로 캐시를 그대로 쓴다.
 // 15:30 마감이지만 종가 단일가 체결분이 반영되기까지 몇 분이 더 걸린다(16:00을 여유 있는 선으로 잡았다).
@@ -1493,17 +1507,19 @@ async function marketQuotes() {
     return { name, value: num(d.closePrice), chg: navIdxChg(d),
       chgPct: Number.isFinite(pct) ? pct : null, closed: !inMkt };
   };
-  const yf = async (sym, name) => {
+  const yf = async (sym, name, fx) => {
     const m = (await cached(`yfq:${sym}`, YF_TTL, () =>
       getJson(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?range=1d&interval=5m`)))
       .chart.result[0].meta;
     const v = m.regularMarketPrice, prev = m.chartPreviousClose;
-    // 야후 선물은 최대 10분 지연될 수 있어 임계를 30분으로 둔다(평일 1시간 휴장도 '마감'으로 잡힌다 — 사실이다)
-    const stale = !m.regularMarketTime || Date.now() / 1000 - m.regularMarketTime > 1800;
-    return { name, value: v, chg: prev ? v - prev : null, chgPct: prev ? (v / prev - 1) * 100 : null, closed: stale };
+    // 선물은 최대 10분 지연될 수 있어 임계를 30분으로 둔다(평일 1시간 휴장도 '마감'으로 잡힌다 — 사실이다).
+    // 환율은 그 방식이 맞지 않아 시계로 본다(위 fxMarketOpen 설명).
+    const age = m.regularMarketTime ? Date.now() - m.regularMarketTime * 1000 : Infinity;
+    const closed = fx ? (!fxMarketOpen() || age > FX_DEAD_MS) : age > 30 * 60e3;
+    return { name, value: v, chg: prev ? v - prev : null, chgPct: prev ? (v / prev - 1) * 100 : null, closed };
   };
   const jobs = [kr('KOSPI', '코스피', nf['^KS200'], '코스피200 야간선물'), kr('KOSDAQ', '코스닥', nf['^KQ150'], '코스닥150 야간선물')]
-    .concat([['NQ=F', '나스닥 선물'], ['KRW=X', '달러/원']].map(([s, n]) => yf(s, n)));
+    .concat([['NQ=F', '나스닥 선물', false], ['KRW=X', '달러/원', true]].map(([s, n, fx]) => yf(s, n, fx)));
   const names = ['코스피', '코스닥', '나스닥 선물', '달러/원'];
   const rs = await Promise.allSettled(jobs);
   // 한 곳이 막혀도 나머지 카드는 살린다 — 실패분은 값 없이 자리만 지킨다
@@ -3626,6 +3642,6 @@ if (require.main === module) {
     try { fs.writeFileSync(__dirname + '/server.pid', String(process.pid)); } catch (e) {}
   });
 }
-module.exports = { server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, dropBadPdf, krSession, idxSettled, spotFirst, KR_PREOPEN, dayRef, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
+module.exports = { server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, dropBadPdf, krSession, idxSettled, fxMarketOpen, spotFirst, KR_PREOPEN, dayRef, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
 
 }

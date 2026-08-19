@@ -217,6 +217,22 @@ if (A) {
     ok("'어제 대비'가 오늘 종가·어제·금요일을 시점에 맞게 가른다");
   }
 
+  // ---------- 3c-2e. 환율 '마감' 딱지는 시계로 판정한다 ----------
+  // 원/달러는 주말만 빼면 거의 24시간 돌아간다. 야후 갱신은 몇십 분 밀리는 일이 흔해서
+  // '30분 이상 안 움직였으면 마감'으로 보면 평일 아침에도 마감이 붙는다
+  // (실측 2026-08-19 09:13: 마지막 갱신 08:24 = 49분 전인데 서울 외환시장은 09:00에 열렸다).
+  {
+    const K = (d, h, mi) => Date.UTC(2026, 7, d, h - 9, mi); // 2026-08-19는 수요일
+    assert.strictEqual(S.fxMarketOpen(K(19, 9, 13)), true, '평일 아침에 환율이 마감으로 나온다');
+    assert.strictEqual(S.fxMarketOpen(K(19, 3, 0)), true, '평일 새벽에도 외환시장은 돌아간다');
+    assert.strictEqual(S.fxMarketOpen(K(22, 5, 0)), true, '토요일 이른 아침까지는 열려 있다');   // 8/22 토
+    assert.strictEqual(S.fxMarketOpen(K(22, 7, 30)), false, '주말인데 열려 있다고 본다');
+    assert.strictEqual(S.fxMarketOpen(K(23, 12, 0)), false, '일요일은 닫혀 있다');              // 8/23 일
+    assert.strictEqual(S.fxMarketOpen(K(24, 5, 0)), false, '월요일 개장 전인데 열렸다고 본다');   // 8/24 월
+    assert.strictEqual(S.fxMarketOpen(K(24, 6, 30)), true, '월요일 06:00 이후에는 열린다');
+    ok("환율 '마감'은 주말에만 붙고, 평일 갱신 지연으로는 붙지 않는다");
+  }
+
   // ---------- 3c-3. PDF 갱신 경계 (하루 세 번만 새로 받는다) ----------
   {
     const KST = (h, mi) => Date.UTC(2026, 7, 10, h - 9, mi);
