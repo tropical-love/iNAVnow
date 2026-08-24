@@ -1598,9 +1598,13 @@ async function computeSynthetic(stockCode, baseCode, analysis, basic, levOverrid
     inavRegular, sessContrib,
     etfClose: etfCloseOf(basic), vsClosePct: etfCloseOf(basic) ? (inav / etfCloseOf(basic) - 1) * 100 : null,
     inavChangePct: (inav / navRef - 1) * 100,
-    // 형제 ETF 대체(1배)는 기초의 국내/해외 분해를 그대로 승계, 배수형은 배수 적용
-    domContrib: levOverride === 1 ? base.domContrib : 0,
-    frnContrib: levOverride === 1 ? base.frnContrib : lev * (localRatio - 1) * 100,
+    // 형제 ETF 대체(1배)는 기초의 국내/해외 분해를 그대로 승계, 배수형은 배수 적용.
+    // localRatio는 '현지 통화 기준' 수익률이라 국내·해외가 섞여 있다 — 통째로 frnContrib에 넣으면
+    // 기초가 전부 국내인 상품에서 국내 변동이 '해외 변동' 칸에 찍힌다
+    // (실측 2026-08-24 KODEX 2차전지산업레버리지: 구성종목 25개가 모두 국내인데 해외 -1.20%p).
+    // 기초의 국내:해외 비율대로 쪼갠다. 두 몫의 합은 종전과 같다(= lev × (localRatio-1) × 100).
+    domContrib: levOverride === 1 ? base.domContrib : lev * (base.domContrib / bw) * 100,
+    frnContrib: levOverride === 1 ? base.frnContrib : lev * (base.frnContrib / bw) * 100,
     fxContrib: levOverride === 1 ? base.fxContrib : lev * (combined - localRatio) * 100,
     returns: analysis.returnPerformanceList,
     aum: analysis.totalNav, fee: analysis.totalFee,
