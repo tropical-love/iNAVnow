@@ -1871,12 +1871,21 @@ async function computeINav(stockCode, depth = 0) {
     const movedHs = trackedHs.filter(h => newRef.has(h));
     const oldSum = movedHs.reduce((s, h) => s + oldRefOf(h), 0);
     const newSum = movedHs.reduce((s, h) => s + newRef.get(h), 0);
+    // ⚠ 추적분(주식) 변동률을 NAV 전체에 곱하면 안 된다 — 시세 소스가 없는 채권·현금은 그 사이
+    // 변동을 알 수 없어 0으로 둬야 한다. 곱해 버리면 채권까지 주식처럼 움직인 셈이 된다
+    // (실측 2026-09-07 RISE 삼성전자SK하이닉스채권혼합50: 주식 +6.97%가 그대로 곱해져 기준 NAV가
+    //  13,226.55 → 14,148, 공식값 13,675.89 대비 +3.5%. 순자산 대비 주식 비중(50.08%)만큼만
+    //  굴리면 13,688로 공식값과 0.09% 차이다).
+    // 시세를 매길 수 있는 자산(t 있음)은 조회 실패분까지 함께 굴린다 — 그쪽은 외삽이 맞다.
+    // ⚠ 선언이 아래 사용처보다 뒤로 가면 TDZ로 조용히 깨진다(이 파일에서 이미 한 번 당했다).
+    const priceableWg = holdings.filter(h => h.t).reduce((s2, h) => s2 + h.wg, 0) / 100;
+    const rollRatio = priceableWg > 0 ? 1 + priceableWg * (newSum / oldSum - 1) : newSum / oldSum;
     // PDF 총액을 새 시점으로 환산해 CU 좌수 역산 (평가금액 없는 PDF는 추적분 합으로 대신)
-    const totalNew = (pdf.list.reduce((s, r) => s + (r.valAm || 0), 0) || oldSum) * (newSum / oldSum);
+    const totalNew = (pdf.list.reduce((s, r) => s + (r.valAm || 0), 0) || oldSum) * rollRatio;
     // PDF가 순자산의 일부만 담는 상품(채권혼합)에서 (1−현금)을 쓰면 아래 두 검증이 모두 어긋난다
     // (실측 0186S0: cuEst 29,447 vs 실제 CU 50,000 → 검증 실패 후 재구성값이 공식 대비 +2.8%)
     const share = pdfShare(pdf.list, analysis);
-    const basketChg = newSum / oldSum - 1;
+    const basketChg = rollRatio - 1;
     let adoptNav = null, cuOk = false, cuEst = null, prov = !inKrMarket;
     if (igNav && Math.abs(igNav / navInfo.navRef - 1) <= 0.001) {
       // 이미 사실상 같은 값 — 검증할 게 없으니 공식값을 그대로 쓴다.
@@ -1910,7 +1919,7 @@ async function computeINav(stockCode, depth = 0) {
       // 전일 NAV가 CU 검증됐을 때만 — 안 됐으면 어긋난 값을 증폭시킬 뿐이다.
       if (pdfHasValAm && !navInfo.cuShares) break reanchor;
       if (!pdfHasValAm && inKrMarket) break reanchor; // 위에서 못 구했으면 굴리지 않는다
-      adoptNav = { navRef: navInfo.navRef * (newSum / oldSum) };
+      adoptNav = { navRef: navInfo.navRef * rollRatio };
       prov = false;
     }
     for (const h of movedHs) h.valRef = newRef.get(h);
