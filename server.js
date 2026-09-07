@@ -1917,9 +1917,24 @@ async function computeINav(stockCode, depth = 0) {
     if (!adoptNav) {
       // 검증된 전일 NAV를 바스켓 변동으로 굴린 재구성(혼합형 본장 중 등). 평가금액 있는 PDF는
       // 전일 NAV가 CU 검증됐을 때만 — 안 됐으면 어긋난 값을 증폭시킬 뿐이다.
-      if (pdfHasValAm && !navInfo.cuShares) break reanchor;
-      if (!pdfHasValAm && inKrMarket) break reanchor; // 위에서 못 구했으면 굴리지 않는다
-      adoptNav = { navRef: navInfo.navRef * rollRatio };
+      // CU 검증이 안 됐으면 굴리지 않는다 — 어긋난 값을 증폭시킬 뿐이다. 다만 장외에 프레임을
+      // 낡은 채로 두는 것도 나쁘다(하루 어긋난 기준과 오늘 종가를 비교하게 된다) → 그때는 공식
+      // 잠정 NAV로 프레임만 맞춘다(실측 2026-09-07 KODEX 골드선물(H): 선물·달러선물이 sumWg
+      // 118%라 CU 역산이 안 돼 9/4 NAV 25,185.65가 남아 괴리 -2.15%. 오늘 공식 24,837.14로
+      // 맞추면 -0.77%다).
+      const canRoll = pdfHasValAm ? !!navInfo.cuShares : !inKrMarket;
+      if (!canRoll) {
+        if (!inKrMarket && igNav) { navInfo = { navRef: igNav, adjusted: true, staleNav: navInfo.navRef, prov: false }; navRefDateOut = fmtYmd(targetDt); }
+        break reanchor;
+      }
+      const rolled = navInfo.navRef * rollRatio;
+      // 굴림은 어디까지나 추정이다. 장외에는 공식 잠정 NAV(igNav)가 있으니, 굴림값이 그것과 크게
+      // 벌어지면 공식을 쓴다 — 평가금액 없는 PDF(PLUS)는 CU 검증이 불가해 위 검사가 늘 실패하고,
+      // 그때 굴림값을 그대로 쓰면 앞 단계의 NAV 교체와 이중으로 적용된다
+      // (실측 2026-09-07 15:47 PLUS 글로벌HBM반도체: 공식 9/4 96,481 → igNav 채택 99,467 →
+      //  재앵커 ×1.0605 = 105,486. 공식 오늘값 102,075 대비 +3.34%, 괴리율이 -2.84%로 벌어졌다).
+      adoptNav = (!inKrMarket && igNav && Math.abs(rolled / igNav - 1) > 0.01)
+        ? { navRef: igNav } : { navRef: rolled };
       prov = false;
     }
     for (const h of movedHs) h.valRef = newRef.get(h);
