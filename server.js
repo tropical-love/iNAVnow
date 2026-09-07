@@ -1972,11 +1972,14 @@ async function computeINav(stockCode, depth = 0) {
   }
   if (refit) ({ fxRef, fxRefDate } = await resolveFxRef(holdings, quoteOf)); // 보정된 기준액으로 재역산
 
-  let sumContrib = 0, sumWg = 0, coveredWg = 0, up = 0, down = 0;
+  let sumContrib = 0, sumWg = 0, coveredWg = 0, trackableWg = 0, up = 0, down = 0;
   let domContrib = 0, frnContrib = 0, fxContrib = 0, sessContrib = 0;
   let wDom = 0, wFrn = 0, fxPure = 0; // 부분별 변동률 계산용(가중치·순수 환율 변동)
   const rows = holdings.map(h => {
     sumWg += h.wg;
+    // 시세 소스가 잡힌 자산만 외삽 대상이다 — 채권·현금은 애초에 t(소스 매핑)가 없다.
+    // 주식인데 시세를 못 받은 것은 t가 있으므로 외삽으로 메꿔진다(종전과 같다).
+    if (h.t) trackableWg += h.wg;
     const q = quoteOf(h);
     if (!q || !q.last) return { ...base(h), tracked: false };
     const fxNow = h.t.cur === 'KRW' ? 1 : fx[h.t.cur]?.last;
@@ -2044,8 +2047,13 @@ async function computeINav(stockCode, depth = 0) {
   // 상위10 폴백(partial)은 목록 자체가 바스켓의 일부다. sumWg가 50%대인데 sumWg/coveredWg를 쓰면
   // 상위10을 전부 추적한 순간 scale=1이 되어 외삽이 아예 안 되고 변동폭이 절반으로 축소됐다
   // (커버리지도 100%로 표시돼 축소된 걸 알 방법이 없었다). 이 경우엔 순자산 100% 기준으로 되돌린다.
-  const wgBase = pdf.partial ? 100 : sumWg;
-  const scale = coveredWg > 0 ? wgBase / coveredWg : 0;
+  // ⚠ 외삽은 '같은 유형' 안에서만 한다. 채권혼합형은 채권이 시세 소스가 없어 미추적으로 남는데,
+  // 그걸 주식 평균으로 외삽하면 변동이 통째로 부풀려진다(실측 2026-09-07 RISE 삼성전자SK하이닉스
+  // 채권혼합50: 주식 50%가 +5.3%인데 채권 46.7%까지 같이 움직인 셈이 되어 iNAV +5.15% —
+  // 실제로는 +2.65%이고 괴리율도 -2.55%가 아니라 -0.20%였다). 채권은 변동 0으로 둔다.
+  const wgBase = pdf.partial ? 100 : sumWg;                 // 반영률 표시는 전체 자산 기준 그대로
+  const extrapWg = pdf.partial ? 100 : (trackableWg || sumWg); // 외삽 분모는 추적 가능한 자산만
+  const scale = coveredWg > 0 ? extrapWg / coveredWg : 0;
   sumContrib *= scale; domContrib *= scale; frnContrib *= scale; fxContrib *= scale; sessContrib *= scale;
   const inav = navRef * (1 + sumContrib / 100);
   // ETF는 시간외 시세가 없다(개별 주식만 있음). 시장가가 정규장 종가면 iNAV도 정규장 시점으로 맞춰 괴리율 계산.
