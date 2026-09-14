@@ -1103,6 +1103,24 @@ function etfCloseOf(basic) {
 
 // 한국주식 시세. 정규장 중엔 토스 배치 1회, 정규장 외엔 네이버 개별 조회로 시간외(NXT/단일가) 가격까지.
 // 토스·야후는 국내 정규장 종가만 주므로 시간외 반영에는 네이버 overMarketPriceInfo가 필요하다.
+// 네이버 basic 응답에서 지금이 어느 세션인지 가린다.
+// ⚠ KRX 애프터마켓(2026-09-14 도입)은 marketStatus를 OPEN으로 둔 채 돌아간다. 그것만 보고
+// '본장'이라 하면 16시에도 정규장 종가 대비 변동(sessPct)이 계산되지 않아 마감 후 움직임을 볼 수
+// 없다(사용자 지적). 다행히 closePrice는 정규장 종가로 고정되고 애프터 체결가는
+// overMarketPriceInfo로 따로 오며, 어느 세션인지는 marketSessionType이 알려준다
+// (실측 2026-09-14 16:37 삼성전자: marketStatus=OPEN, marketSessionType='afterMarket',
+//  closePrice=249,000, overPrice=248,500).
+// marketSessionType이 없던 시절(NXT 시간외)에는 marketStatus가 CLOSE였으므로 종전대로 동작한다.
+function quoteSession(d, live) {
+  const offRegular = d.marketStatus !== 'OPEN'
+    || (d.marketSessionType && d.marketSessionType !== 'regularMarket');
+  if (live && offRegular) {
+    // '시간외'라고만 쓰면 KRX 시간외단일가와 헷갈린다 — 정규장 전=프리, 후=애프터로 구분
+    return d.overMarketPriceInfo?.tradingSessionType === 'PRE_MARKET' ? '프리' : '애프터';
+  }
+  return d.marketStatus === 'OPEN' ? '본장' : '장마감';
+}
+
 async function krQuotes(codes) {
   return cached(`kr:${codes.join(',')}`, QUOTE_TTL, () => krQuotesRaw(codes));
 }
@@ -1127,15 +1145,15 @@ async function krQuotesRaw(codes) {
       const prev = reg - num(d.compareToPreviousClosePrice);
       const om = d.overMarketPriceInfo;
       const live = om && om.overMarketStatus === 'OPEN' && num(om.overPrice) > 0;
+      const sess = quoteSession(d, live);
       // 시간외 세션이 끝난 뒤에도 그 마감가가 최신 체결가 — 정규장 종가로 되돌리면
       // 애프터장 마감 후 다음 장까지 모든 변동이 0%로 굳는다(사용자 지적).
-      const overLast = d.marketStatus !== 'OPEN' && om && num(om.overPrice) > 0 ? num(om.overPrice) : null;
+      // 정규장 중에 남아 있는 전일 시간외 값을 잘못 집지 않도록 '장마감'일 때만 쓴다.
+      const overLast = sess === '장마감' && om && num(om.overPrice) > 0 ? num(om.overPrice) : null;
       out[c] = {
         last: live ? num(om.overPrice) : (overLast ?? reg),
         prevClose: prev, regClose: reg,
-        // '시간외'라고만 쓰면 KRX 시간외단일가와 헷갈린다 — 정규장 전=프리, 후=애프터로 구분
-        session: d.marketStatus === 'OPEN' ? '본장'
-          : live ? (om.tradingSessionType === 'PRE_MARKET' ? '프리' : '애프터') : '장마감',
+        session: sess,
       };
     } catch (e) { /* 개별 실패는 아래 토스로 보충 */ }
   }));
@@ -2030,7 +2048,11 @@ async function computeINav(stockCode, depth = 0) {
     // 그 차이는 여전히 '정규장 이후 변동'이다. 세션 종료를 이유로 버리면 18:00을 넘기는 순간
     // 세션분이 0으로 접혀 괴리율 시점 보정과 레버리지 굴림이 함께 죽는다(실측 2026-08-05 19:20).
     // 시간외 체결이 없던 종목은 last === reg이므로 자동으로 0이 된다.
-    const sessPct = (!inReg && reg && q.last !== reg) ? (q.last / reg - 1) * 100 : null;
+    // 시간외 세션이 열려 있으면 변동이 0이어도 보여준다 — '아직 안 움직였다'와 '애프터마켓에서
+    // 거래되지 않는 종목이다'는 다른 정보다(사용자 지적). 세션이 닫힌 뒤(장마감)에는 종전대로
+    // 정규장 종가와 다를 때만 표시한다.
+    const inOver = q.session === '애프터' || q.session === '프리';
+    const sessPct = (!inReg && reg && (inOver || q.last !== reg)) ? (q.last / reg - 1) * 100 : null;
     // 괴리율 시점 보정은 국내 시간외만. 미국 주간거래·프리는 한국 정규장 시간대와 겹쳐
     // ETF 종가에 이미 반영돼 있어 제거하면 오히려 어긋난다(실측 확인).
     if (sessPct != null && h.t.cur === 'KRW') sessContrib += h.wg * sessPct / 100;
@@ -2966,7 +2988,9 @@ function render(){
     '<td>'+(r.tracked?'<span class="badge b'+esc(r.session)+'">'+esc(r.session)+'</span>':'<span class="badge">미추적</span>')+'</td>'+
     '<td>'+(r.tracked?fmt(r.price, r.cur==='JPY'||r.cur==='KRW'?0:2)+curFmt:'—')+'</td>'+
     '<td class="'+cls(r.changePct)+'">'+(r.tracked?(r.changePct==null?'<span class="muted" title="오늘 정규장이 아직 시작 전입니다">—</span>':sign(r.changePct)+'%'):'—')
-      + (r.sessPct!=null ? '<div class="sub '+cls(r.sessPct)+'" title="현재 진행 중인 세션 변동(정규장 종가 대비)">'+sign(r.sessPct)+'%</div>' : '')+'</td>'+
+      + (r.sessPct!=null ? '<div class="sub '+(r.sessPct===0?'muted':cls(r.sessPct))
+        +'" title="'+(r.sessPct===0?'진행 중인 세션에서 아직 정규장 종가와 같습니다':'현재 진행 중인 세션 변동(정규장 종가 대비)')
+        +'">'+sign(r.sessPct)+'%</div>' : '')+'</td>'+
     '<td class="'+cls(r.trackPct)+'">'+(r.tracked?sign(r.trackPct)+'%':'—')+'</td>'+
     '<td>'+fmt(r.wg,2)+'%</td></tr>';
   }).join('') + (d.moreCount ? '<tr><td colspan="6" class="muted" style="text-align:center">…외 '+d.moreCount+'종목 (비중 하위, 미추적분은 추적 바스켓 평균으로 외삽)</td></tr>' : '');
@@ -3678,6 +3702,6 @@ if (require.main === module) {
     try { fs.writeFileSync(__dirname + '/server.pid', String(process.pid)); } catch (e) {}
   });
 }
-module.exports = { server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, dropBadPdf, krSession, idxSettled, fxMarketOpen, spotFirst, KR_PREOPEN, dayRef, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
+module.exports = { server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, dropBadPdf, krSession, quoteSession, idxSettled, fxMarketOpen, spotFirst, KR_PREOPEN, dayRef, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
 
 }

@@ -146,6 +146,32 @@ if (A) {
     ok('지수 등락 부호가 상승·하락 양쪽에서 맞는다');
   }
 
+  // ---------- 3c-1b. KRX 애프터마켓에서도 정규장 종가 대비 변동을 본다 ----------
+  // 2026-09-14 도입된 KRX 애프터마켓은 marketStatus를 OPEN으로 둔 채 돌아간다. 그것만 보고
+  // '본장'이라 하면 sessPct(정규장 종가 대비)가 계산되지 않아 마감 후 움직임을 볼 수 없다.
+  // 실측 2026-09-14 16:37 삼성전자: marketStatus=OPEN · marketSessionType='afterMarket'
+  //   · closePrice=249,000(정규장 종가 고정) · overPrice=248,500
+  {
+    const after = { marketStatus: 'OPEN', marketSessionType: 'afterMarket',
+      overMarketPriceInfo: { overMarketStatus: 'OPEN', tradingSessionType: 'AFTER_MARKET' } };
+    assert.strictEqual(S.quoteSession(after, true), '애프터', 'KRX 애프터마켓을 본장으로 본다');
+    // 옛 NXT 시간외는 marketSessionType이 없고 marketStatus가 CLOSE였다 — 종전대로 동작해야 한다
+    const nxtAfter = { marketStatus: 'CLOSE',
+      overMarketPriceInfo: { overMarketStatus: 'OPEN', tradingSessionType: 'AFTER_MARKET' } };
+    const nxtPre = { marketStatus: 'CLOSE',
+      overMarketPriceInfo: { overMarketStatus: 'OPEN', tradingSessionType: 'PRE_MARKET' } };
+    assert.strictEqual(S.quoteSession(nxtAfter, true), '애프터');
+    assert.strictEqual(S.quoteSession(nxtPre, true), '프리');
+    // 정규장은 그대로 본장 — 시간외 값이 남아 있어도 정규장이면 정규장이다(잘못 집으면 시세가 틀어진다)
+    const reg = { marketStatus: 'OPEN', marketSessionType: 'regularMarket' };
+    assert.strictEqual(S.quoteSession(reg, false), '본장');
+    assert.strictEqual(S.quoteSession(reg, true), '본장', '정규장 중에 전일 시간외 값을 집었다');
+    // ETF는 애프터마켓 대상이 아니다(실측 0104G0: marketStatus=CLOSE · regularMarket)
+    assert.strictEqual(S.quoteSession({ marketStatus: 'CLOSE', marketSessionType: 'regularMarket' }, false), '장마감');
+    assert.strictEqual(S.quoteSession({ marketStatus: 'CLOSE' }, false), '장마감');
+    ok('KRX 애프터마켓을 시간외 세션으로 가른다(정규장·옛 NXT 동작은 그대로)');
+  }
+
   // ---------- 3c-2b. 지수 종가는 확정된 뒤에만 고정한다 ----------
   // 네이버는 15:30 직후 이미 marketStatus=CLOSE를 주는데 그 값은 확정 종가가 아니다
   // (실측 2026-08-11: 직후 코스피 6,358.35 → 확정 6,345.53, 12.8p 차이). 상태만 보고 굳히면
