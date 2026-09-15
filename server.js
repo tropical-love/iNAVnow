@@ -846,6 +846,17 @@ async function fxFixOf(cur, dateStr) {
     .filter(x => dig(x.d) <= dig(dateStr)).pop();
   return usd && perUsd ? usd / perUsd.c : null;
 }
+// 역산 환율이 실제 환율과 가장 가까운 날을 고른다. 1% 넘게 벌어지면 기준일을 못 정한 것으로 본다
+// — 엉뚱한 날을 붙잡으면 환율 변동이 통째로 틀어지므로, 어중간한 값보다 '모름'이 낫다.
+function nearestFxDate(cands) {
+  let best = null;
+  for (const { date, implied, mkt } of cands) {
+    if (!implied || !mkt) continue;
+    const err = Math.abs(implied / mkt - 1);
+    if (!best || err < best.err) best = { date, err };
+  }
+  return best && best.err < 0.01 ? best : null;
+}
 async function resolveFxRef(holdings, quoteOf) {
   const byCur = {};
   for (const h of holdings) {
@@ -876,9 +887,18 @@ async function resolveFxRef(holdings, quoteOf) {
   // PDF는 한 시점에 만들어지므로 기준 세션은 통화 공통이다(실측: USD·HKD·CNY·JPY 모두 같은 날짜).
   // 종목이 가장 많은 통화에서 정하고, 종목 1개뿐인 통화는 그 날짜를 물려받는다.
   const shared = Object.values(info).sort((a, b) => b.length - a.length).map(pick).find(Boolean);
+  // 해외 종목이 하나뿐인 ETF(채권혼합형이 대부분)는 산포로 기준일을 가를 수 없다 — 어느 날짜를
+  // 잡아도 종목이 하나라 산포가 0이다. 그때는 역산 환율을 그날 실제 환율과 대조해 가른다.
+  // 이 판정을 건너뛰고 prevClose로 물러나면 기준환율이 통째로 어긋난다(실측 2026-09-15
+  // PLUS SK하이닉스샌디스크채권혼합50: 1,290.89가 잡혀 '환율 변동 +5.5%'로 나왔다. 실제는 −0.0%).
+  const pickSolo = async (cur, rows) => nearestFxDate(await Promise.all(
+    [...new Set(rows.flatMap(r => r.days.map(x => x.d)))].sort().slice(-5).map(async date => {
+      const vals = fxAt(rows, date);
+      return { date, implied: vals.length ? medOf(vals) : null, mkt: await fxFixOf(cur, date).catch(() => null) };
+    })));
   const fxRef = {}, fxRefDate = {};
   for (const [cur, rows] of Object.entries(info)) {
-    const chosen = pick(rows) || shared;
+    const chosen = pick(rows) || shared || await pickSolo(cur, rows);
     const vals = chosen ? fxAt(rows, chosen.date) : [];
     if (vals.length) {
       fxRef[cur] = medOf(vals); fxRefDate[cur] = chosen.date;
@@ -3756,6 +3776,6 @@ if (require.main === module) {
     try { fs.writeFileSync(__dirname + '/server.pid', String(process.pid)); } catch (e) {}
   });
 }
-module.exports = { server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, dropBadPdf, krSession, quoteSession, resolveTicker, idxSettled, fxMarketOpen, spotFirst, KR_PREOPEN, dayRef, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, parseMinClose, needRegFix, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
+module.exports = { server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, dropBadPdf, krSession, quoteSession, resolveTicker, idxSettled, fxMarketOpen, spotFirst, KR_PREOPEN, dayRef, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, nearestFxDate, parseMinClose, needRegFix, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
 
 }
