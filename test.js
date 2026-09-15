@@ -209,6 +209,34 @@ if (A) {
     ok('장 마감 뒤(15:30~)에는 거래소가 OPEN이라 해도 시간외 세션으로 가른다');
   }
 
+{
+  // basic의 closePrice는 애프터 체결을 따라가므로 정규장 종가로 쓸 수 없다. 분봉의 15:30 봉이
+  // 종가단일가 체결분이라 그게 정규장 종가다 — 그걸 못 집으면 '마감 후 변동'이 0%로 굳는다.
+  const body = `[['날짜','시가','고가','저가','종가','거래량','외국인소진율'],
+["202609151525", 248400, 248600, 248400, 248600, 31221, null],
+["202609151530", null, null, null, 248500, 11081515, null],
+["202609151541", 248000, 248000, 248000, 248000, 2, null]
+]`;
+  assert.strictEqual(S.parseMinClose(body), 248500, '15:30 종가단일가 봉을 못 집었다');
+  // 15:30 뒤 봉은 NXT 애프터다 — 그걸 종가로 쓰면 마감 후 변동이 0으로 사라진다
+  assert.strictEqual(S.parseMinClose(`[['날짜'],
+["202609151541", 1, 1, 1, 248000, 2, null]
+]`), null);
+  assert.strictEqual(S.parseMinClose(`[['날짜']
+]`), null, '봉이 없으면 종전 값으로 물러나야 한다');
+
+  // 분봉을 더 받는 건 당일 정규장이 끝난 뒤뿐 — 장중·개장 전·주말에 부르면 헛품이다
+  const t = (ymd, hm) => Date.parse(`${ymd}T${hm}:00+09:00`);
+  assert.strictEqual(S.needRegFix(t('2026-09-15', '14:00')), false, '장중에 분봉을 더 받는다');
+  assert.strictEqual(S.needRegFix(t('2026-09-15', '15:29')), false);
+  assert.strictEqual(S.needRegFix(t('2026-09-15', '15:30')), true);
+  assert.strictEqual(S.needRegFix(t('2026-09-15', '23:59')), true);
+  assert.strictEqual(S.needRegFix(t('2026-09-16', '02:00')), false, '자정을 넘기면 그날 봉이 아직 없다');
+  assert.strictEqual(S.needRegFix(t('2026-09-18', '18:00')), true);
+  assert.strictEqual(S.needRegFix(t('2026-09-19', '18:00')), false, '주말에도 분봉을 받는다');
+  ok('정규장 종가를 15:30 종가단일가 봉에서 집고, 마감 뒤에만 더 받는다');
+}
+
   // ---------- 3c-2b. 지수 종가는 확정된 뒤에만 고정한다 ----------
   // 네이버는 15:30 직후 이미 marketStatus=CLOSE를 주는데 그 값은 확정 종가가 아니다
   // (실측 2026-08-11: 직후 코스피 6,358.35 → 확정 6,345.53, 12.8p 차이). 상태만 보고 굳히면

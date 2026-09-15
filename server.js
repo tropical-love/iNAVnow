@@ -210,7 +210,7 @@ const cache = new Map(); // key -> {ts, ttl, data}
 // ⚠ 선언이 아래 로드 코드보다 뒤에 있으면 TDZ ReferenceError가 catch에 삼켜져 캐시가 통째로
 // 로드되지 않는다(실측 2026-08-10: 디스크에 39개가 있는데 메모리는 0개 — 앱이 켤 때마다 PDF를
 // 다시 받던 원인). 반드시 로드보다 위에 둔다.
-const PERSIST_RE = /(:list$|^acefunds$|^etflist$|^krbiz$|^pdf:|^pdfkey:|^blk:|^isin:|^tosscode:|^rise:id:|^plus:id:|^fxfix:|^navfix:|^provnav:|^fxclose:|^pdfset:)/;
+const PERSIST_RE = /(:list$|^acefunds$|^etflist$|^krbiz$|^pdf:|^pdfkey:|^blk:|^isin:|^tosscode:|^rise:id:|^plus:id:|^fxfix:|^navfix:|^provnav:|^fxclose:|^pdfset:|^regfix:)/;
 const PERSIST = k => PERSIST_RE.test(k);
 try {
   const raw = NODE ? fs.readFileSync(CACHE_FILE, 'utf8') : localStorage.getItem(CACHE_LS);
@@ -1122,6 +1122,32 @@ function etfCloseOf(basic) {
 // (실측 2026-09-14 16:37 삼성전자: marketStatus=OPEN, marketSessionType='afterMarket',
 //  closePrice=249,000, overPrice=248,500).
 // marketSessionType이 없던 시절(NXT 시간외)에는 marketStatus가 CLOSE였으므로 종전대로 동작한다.
+// ⚠ 네이버 basic의 closePrice는 '정규장 종가'가 아니라 현재가다 — 애프터 체결이 나오면 그 값을
+// 따라간다(실측 2026-09-15 18:25~18:26 한화에어로스페이스: 1,057,000 → 1,058,000으로 1분 만에
+// 갱신). 그대로 쓰면 정규장 종가와 현재가가 같아져 '마감 후 변동'이 0%로 굳는다(사용자 지적).
+// 오늘 정규장 종가를 주는 공개 API는 없지만(integration·토스 모두 전일 종가만 준다) 분봉에는
+// 남아 있다 — 15:30 봉이 종가단일가 체결분이다(삼성전자 15:30봉 248,500 · 거래량 959,459).
+// 그 한 봉만 범위 지정해 받으므로 종목당 200바이트면 되고, 하루 고정값이라 길게 캐시한다.
+// 분봉 응답은 JSON이 아니라 JS 배열 리터럴이다: ["202609151530", 시가, 고가, 저가, 종가, 거래량, 외인]
+// (거래가 없던 분은 시·고·저가 null로 온다). 15:30을 넘는 봉은 NXT 애프터라 정규장 종가가 아니다.
+function parseMinClose(txt) {
+  const bars = [...txt.matchAll(/\["(\d{12})"\s*,\s*[^,]+,\s*[^,]+,\s*[^,]+,\s*(\d+)/g)]
+    .map(m => ({ t: +m[1].slice(8, 12), px: +m[2] }))
+    .filter(x => x.t <= 1530 && x.px > 0);
+  return bars.length ? bars[bars.length - 1].px : null;
+}
+const regCloseOf = (code, ymd) => cached(`regfix:${code}:${ymd}`, 20 * 3600e3, async () => {
+  const res = await fetchOrThrow('https://api.finance.naver.com/siseJson.naver'
+    + `?symbol=${code}&requestType=1&startTime=${ymd}1525&endTime=${ymd}1535&timeframe=minute`,
+    { headers: { 'User-Agent': 'Mozilla/5.0' } });
+  if (!res.ok) throw new Error(`${res.status} 분봉`);
+  const px = parseMinClose(await res.text());
+  if (!px) throw new Error('15:30 봉 없음');
+  return px;
+});
+// 분봉 보충이 필요한 때 — 당일 정규장이 끝난 뒤 자정 전까지. 자정을 넘기면 그날 봉이 없다.
+const needRegFix = (now = Date.now()) => krSession(now) !== '휴장' && kstHm(now) >= 1530;
+
 // ⚠ 거래소 응답만 믿으면 안 된다. 한국 정규장은 15:30에 끝나는데, 15:40~16:00은 NXT만 체결되는
 // 구간이라(NXT 애프터 15:30~20:00 · 체결 15:40~, KRX 애프터마켓 16:00~20:00) 네이버가 아직
 // marketStatus=OPEN·regularMarket을 준다. 그대로 믿으면 그 20분 동안 '장중'으로 굳어
@@ -1150,7 +1176,11 @@ async function krQuotesRaw(codes) {
     const d = await getJson(`https://wts-info-api.tossinvest.com/api/v2/stock-prices?codes=${codes.map(c => 'A' + c).join(',')}`);
     for (const p of d.result.prices) {
       const c = p.code.slice(1);
-      if (!out[c]) out[c] = { last: p.close, prevClose: p.base, regClose: p.close, session: krSession() === '본장' ? '본장' : '장마감' };
+      if (out[c]) continue;
+      // 토스의 close도 현재가라 마감 뒤에는 정규장 종가가 아니다 — 네이버와 같이 분봉으로 보충한다
+      const sess = krSession() === '본장' ? '본장' : '장마감';
+      const regFix = sess !== '본장' && needRegFix() ? await regCloseOf(c, todayYmd()).catch(() => null) : null;
+      out[c] = { last: p.close, prevClose: p.base, regClose: regFix || p.close, session: sess };
     }
   };
 
@@ -1166,13 +1196,17 @@ async function krQuotesRaw(codes) {
       const om = d.overMarketPriceInfo;
       const live = om && om.overMarketStatus === 'OPEN' && num(om.overPrice) > 0;
       const sess = quoteSession(d, live);
+      // 장 마감 뒤에는 closePrice가 애프터를 따라가므로 분봉에서 정규장 종가를 가져온다.
+      // 실패하면 종전 값을 쓴다(그 경우 마감 후 변동이 0으로 보일 뿐, 나빠지지는 않는다).
+      const regFix = sess !== '본장' && needRegFix()
+        ? await regCloseOf(c, todayYmd()).catch(() => null) : null;
       // 시간외 세션이 끝난 뒤에도 그 마감가가 최신 체결가 — 정규장 종가로 되돌리면
       // 애프터장 마감 후 다음 장까지 모든 변동이 0%로 굳는다(사용자 지적).
       // 정규장 중에 남아 있는 전일 시간외 값을 잘못 집지 않도록 '장마감'일 때만 쓴다.
       const overLast = sess === '장마감' && om && num(om.overPrice) > 0 ? num(om.overPrice) : null;
       out[c] = {
         last: live ? num(om.overPrice) : (overLast ?? reg),
-        prevClose: prev, regClose: reg,
+        prevClose: prev, regClose: regFix || reg,
         session: sess,
       };
     } catch (e) { /* 개별 실패는 아래 토스로 보충 */ }
@@ -3722,6 +3756,6 @@ if (require.main === module) {
     try { fs.writeFileSync(__dirname + '/server.pid', String(process.pid)); } catch (e) {}
   });
 }
-module.exports = { server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, dropBadPdf, krSession, quoteSession, resolveTicker, idxSettled, fxMarketOpen, spotFirst, KR_PREOPEN, dayRef, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
+module.exports = { server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, dropBadPdf, krSession, quoteSession, resolveTicker, idxSettled, fxMarketOpen, spotFirst, KR_PREOPEN, dayRef, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, parseMinClose, needRegFix, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
 
 }

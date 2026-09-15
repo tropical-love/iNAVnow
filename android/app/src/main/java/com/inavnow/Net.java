@@ -85,6 +85,7 @@ public class Net {
      * 호스트를 늘릴 때는 engine.js에서 실제로 부르는 것만 넣는다.
      */
     private static final String[] HOSTS = {
+            "api.finance.naver.com",
             "finance.naver.com",
             "investments.miraeasset.com",
             "m.stock.naver.com",
