@@ -1111,14 +1111,23 @@ function etfCloseOf(basic) {
 // (실측 2026-09-14 16:37 삼성전자: marketStatus=OPEN, marketSessionType='afterMarket',
 //  closePrice=249,000, overPrice=248,500).
 // marketSessionType이 없던 시절(NXT 시간외)에는 marketStatus가 CLOSE였으므로 종전대로 동작한다.
-function quoteSession(d, live) {
-  const offRegular = d.marketStatus !== 'OPEN'
+// ⚠ 거래소 응답만 믿으면 안 된다. 한국 정규장은 15:30에 끝나는데, 15:40~16:00은 NXT만 체결되는
+// 구간이라(NXT 애프터 15:30~20:00 · 체결 15:40~, KRX 애프터마켓 16:00~20:00) 네이버가 아직
+// marketStatus=OPEN·regularMarket을 준다. 그대로 믿으면 그 20분 동안 '장중'으로 굳어
+// 정규장 마감가와 그 뒤 변동이 분리되지 않는다(사용자 지적 2026-09-15).
+// 그래서 우리 시계(krSession)로 정규장 여부를 먼저 가르고, 세부 세션만 거래소 응답에서 읽는다.
+function quoteSession(d, live, nowSess = krSession()) {
+  const regularNow = nowSess === '본장';
+  const offRegular = !regularNow || d.marketStatus !== 'OPEN'
     || (d.marketSessionType && d.marketSessionType !== 'regularMarket');
   if (live && offRegular) {
     // '시간외'라고만 쓰면 KRX 시간외단일가와 헷갈린다 — 정규장 전=프리, 후=애프터로 구분
     return d.overMarketPriceInfo?.tradingSessionType === 'PRE_MARKET' ? '프리' : '애프터';
   }
-  return d.marketStatus === 'OPEN' ? '본장' : '장마감';
+  if (regularNow && d.marketStatus === 'OPEN') return '본장';
+  // 체결 정보가 아직 없어도 세션 자체는 열려 있다 — 그래야 '아직 안 움직였다'를 0.00%로 보여준다
+  if (nowSess === 'NXT애프터') return '애프터';
+  return '장마감';
 }
 
 async function krQuotes(codes) {
