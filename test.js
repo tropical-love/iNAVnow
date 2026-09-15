@@ -133,6 +133,31 @@ if (A) {
     ok('개장 전 등락은 비우고, 프리장 체결이 있으면 그 값을 쓴다');
   }
 
+  // ---------- 3c-1c. 종목코드 → 시세 소스 매핑 ----------
+  // 미국 주식이 통째로 미추적이 되던 자리(실측 2026-09-15 PLUS SK하이닉스샌디스크채권혼합50:
+  // 자료 제공처가 'SNDK US'가 아니라 'SNDK'로 줘서 비중 24%인 샌디스크가 빠지고 반영률이 59%였다).
+  {
+    const t = async (jm, name) => S.resolveTicker(jm, name || jm).catch(() => 'ERR');
+    const eq = async (jm, exp, msg) => {
+      const r = await t(jm);
+      assert.deepStrictEqual(r && r !== 'ERR' ? { src: r.src, sym: r.sym, cur: r.cur } : r, exp, msg || jm);
+    };
+    await eq('SNDK', { src: 'yahoo', sym: 'SNDK', cur: 'USD' }, '접미사 없는 미국 티커를 못 읽는다');
+    await eq('MU US', { src: 'yahoo', sym: 'MU', cur: 'USD' });
+    await eq('285A JP', { src: 'yahoo', sym: '285A.T', cur: 'JPY' });
+    await eq('000660', { src: 'kr', sym: '000660', cur: 'KRW' });
+    await eq('KR7005930003', { src: 'kr', sym: '005930', cur: 'KRW' });
+    // 2024년부터 국내 종목코드에 영문이 섞인다 — 이런 ETF가 구성종목으로 들어와도 추적해야 한다
+    await eq('0226A0', { src: 'kr', sym: '0226A0', cur: 'KRW' }, '영문 섞인 국내 코드를 미추적으로 버린다');
+    await eq('0104G0', { src: 'kr', sym: '0104G0', cur: 'KRW' });
+    // 현금·통화는 야후에 같은 이름의 주식이 있다 — 매핑하면 엉뚱한 시세가 붙는다
+    await eq('CASH', null, 'CASH가 주식(Pathward Financial)으로 매핑된다');
+    await eq('KRW', null); await eq('USD', null); await eq('MMF', null);
+    // 채권 코드는 시세 소스가 없다 — 변동 0으로 남아야 한다
+    await eq('국고02625-2703(25-1)', null);
+    ok('종목코드 매핑: 접미사 없는 미국 티커·영문 섞인 국내 코드를 읽고, 현금·통화는 거른다');
+  }
+
   // ---------- 3c-2. 지수 등락 부호 (하락을 상승으로 뒤집던 자리) ----------
   // 네이버 지수 응답의 등락폭에는 부호가 이미 들어 있다. code로 한 번 더 부호를 씌우면 뒤집힌다
   // (실측 2026-08-06 09:30 코스피 -198.43 → +198.43으로 표시됨).

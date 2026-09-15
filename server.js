@@ -714,6 +714,9 @@ async function resolveTicker(jm, name) {
   if ((m = jm.match(/^(\d[0-9A-Z]{3}) JP$/))) return { src: 'yahoo', sym: m[1] + '.T', cur: 'JPY' };
   if ((m = jm.match(/^(\d+) HK$/))) return { src: 'yahoo', sym: m[1].padStart(4, '0') + '.HK', cur: 'HKD' };
   if (/^\d{6}$/.test(jm)) return { src: 'kr', sym: jm, cur: 'KRW' };
+  // 2024년부터 국내 종목코드에 영문이 섞인다(예: 0226A0 PLUS SK하이닉스샌디스크채권혼합50).
+  // 이런 ETF가 다른 ETF의 구성종목으로 들어오면 6자리 숫자 규칙에 걸리지 않아 미추적이 된다.
+  if (/^\d{4}[A-Z]\d$/.test(jm)) return { src: 'kr', sym: jm, cur: 'KRW' };
   if ((m = jm.match(/^KR7(\d{6})\d{3}$/))) return { src: 'kr', sym: m[1], cur: 'KRW' }; // 국내 ISIN
   if (/^[A-Z]{2}[A-Z0-9]{10}$/.test(jm)) { // 해외 ISIN → 야후 검색으로 해석
     if (ISIN_OVERRIDE[jm]) return { src: 'yahoo', sym: ISIN_OVERRIDE[jm], cur: 'USD' };
@@ -739,6 +742,14 @@ async function resolveTicker(jm, name) {
       return { src: 'yahoo', sym: q.symbol, cur };
     });
   }
+  // 현금·통화 항목이 티커로 오인되지 않게 먼저 거른다 — 'CASH'(Pathward Financial)나 통화 코드는
+  // 야후에 실제로 존재하는 심볼이라, 아래 규칙에 그대로 걸리면 엉뚱한 주식 시세가 붙는다.
+  if (/^(CASH|WON|DEPO|RP|CD|CP|MMF|MMW|KRW|USD|JPY|HKD|CNY|EUR|GBP|TWD|SGD|AUD|CAD|CHF)$/i.test(jm)) return null;
+  // 접미사 없는 미국 티커 — 자료 제공처가 'SNDK US'가 아니라 'SNDK'로 주는 종목이 있다
+  // (실측 2026-09-15 PLUS SK하이닉스샌디스크채권혼합50: 샌디스크가 비중 24%인데 미추적이라
+  //  반영률이 59%에 머물렀다). 야후는 접미사 없는 심볼을 미국 상장으로 푼다(SNDK·MU·AMAT 확인).
+  // 없는 심볼이면 시세 조회에서 걸러져 종전처럼 미추적이 되므로 오매핑 위험은 없다.
+  if (/^[A-Z]{1,5}$/.test(jm)) return { src: 'yahoo', sym: jm, cur: 'USD' };
   return null; // 미지원 코드 → 추적 제외(변동 0으로 처리)
 }
 
@@ -3711,6 +3722,6 @@ if (require.main === module) {
     try { fs.writeFileSync(__dirname + '/server.pid', String(process.pid)); } catch (e) {}
   });
 }
-module.exports = { server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, dropBadPdf, krSession, quoteSession, idxSettled, fxMarketOpen, spotFirst, KR_PREOPEN, dayRef, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
+module.exports = { server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, dropBadPdf, krSession, quoteSession, resolveTicker, idxSettled, fxMarketOpen, spotFirst, KR_PREOPEN, dayRef, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
 
 }
