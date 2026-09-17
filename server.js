@@ -1301,7 +1301,13 @@ function resolveNavRef(analysis, pdfList, extraNavs) {
   // 오차에 묶여 ±0.4%쯤이라 1%대 차이를 가리지 못한다.
   // 실측 1Q 코스닥150채권혼합50: nav 그대로 off 1.42% / D1 굴림 off 0.36% → D1이 이겼지만
   // 공식 iNAV와 맞는 쪽은 nav 그대로였다(7,858 vs 7,998).
-  if (cands[0].off <= 0.015) best = cands[0];
+  // 다만 다른 후보가 라운드 설정단위에 '사실상 정확히' 떨어지면 그건 우연이 아니다 — PDF 총액은
+  // 곧 기준NAV × CU이기 때문이다(실측 2026-09-17 09:00 KODEX 방산TOP10: 네이버 nav가 아직 전날
+  // 값 9,938.84였는데 그대로는 CU 98,742(오차 1.27%), 전영업일 굴림 9,813.86은 정확히 100,000.
+  // 허용 오차 1.5% 안이라 그대로 통과해 iNAV가 하루치만큼 부풀었다 — 2배 상품에서는 +2.5%).
+  // 어느 쪽도 정확히 떨어지지 않으면(share 반올림 오차로 흔히 그렇다) 종전대로 공식 nav를 지킨다.
+  const exact = c => c.off <= 0.001;
+  if (cands[0].off <= 0.015 && !(exact(best) && !exact(cands[0]))) best = cands[0];
   // 어느 후보도 라운드 설정단위에 안 맞으면(목록에 없는 CU) 손대지 않는다 — 오탐 방지
   if (best.off > 0.015) {
     // 단, 어긋남이 작으면(6% 이내) PDF 총액에서 NAV를 되구한다 — CU가 라운드라는 사실이 근거.
@@ -3776,6 +3782,6 @@ if (require.main === module) {
     try { fs.writeFileSync(__dirname + '/server.pid', String(process.pid)); } catch (e) {}
   });
 }
-module.exports = { server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, dropBadPdf, krSession, quoteSession, resolveTicker, idxSettled, fxMarketOpen, spotFirst, KR_PREOPEN, dayRef, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, nearestFxDate, parseMinClose, needRegFix, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
+module.exports = { server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, dropBadPdf, krSession, quoteSession, resolveTicker, idxSettled, fxMarketOpen, spotFirst, KR_PREOPEN, dayRef, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, resolveNavRef, nearestFxDate, parseMinClose, needRegFix, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
 
 }
