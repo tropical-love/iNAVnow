@@ -210,6 +210,29 @@ if (A) {
   }
 
 {
+  // 정규장 중에도 overMarketPriceInfo는 남아 있다 — 그때는 tradingSessionType이 REGULAR_MARKET이다.
+  // 실측 2026-09-23 15:34 삼성전자: 종가 285,500인데 overPrice에 15:20자 284,500이 남아 있었고,
+  // 그걸 집는 바람에 있지도 않은 '시간외 -0.35%'가 찍혔다(사용자 지적).
+  assert.strictEqual(S.omOffHours({ tradingSessionType: 'REGULAR_MARKET', overMarketStatus: 'OPEN' }), false,
+    '정규장 시세를 시간외로 집었다');
+  assert.strictEqual(S.omOffHours({ tradingSessionType: 'AFTER_MARKET', overMarketStatus: 'OPEN' }), true);
+  assert.strictEqual(S.omOffHours({ tradingSessionType: 'PRE_MARKET', overMarketStatus: 'OPEN' }), true);
+  assert.strictEqual(S.omOffHours({ overMarketStatus: 'OPEN' }), false, '세션 표시가 없으면 시간외로 보면 안 된다');
+  assert.strictEqual(S.omOffHours(null), false);
+
+  // 시간외 체결은 15:40부터다(NXT는 15:30~15:40 호가만, KRX 애프터마켓은 16:00~).
+  // 15:30에 시간외를 시작하면 아직 아무 체결도 없는데 '애프터마켓 진행 중'으로 보인다.
+  const at = hm => S.krSession(Date.parse(`2026-09-23T${hm}:00+09:00`));
+  assert.strictEqual(at('15:29'), '본장');
+  assert.strictEqual(at('15:30'), '장마감', '호가만 받는 15:30~15:40을 시간외로 불렀다');
+  assert.strictEqual(at('15:39'), '장마감');
+  assert.strictEqual(at('15:40'), 'NXT애프터');
+  assert.strictEqual(at('19:59'), 'NXT애프터');
+  assert.strictEqual(at('20:00'), '장마감');
+  ok('시간외는 체결이 시작되는 15:40부터, 시세도 세션 표시가 시간외일 때만 집는다');
+}
+
+{
   // basic의 closePrice는 애프터 체결을 따라가므로 정규장 종가로 쓸 수 없다. 분봉의 15:30 봉이
   // 종가단일가 체결분이라 그게 정규장 종가다 — 그걸 못 집으면 '마감 후 변동'이 0%로 굳는다.
   const body = `[['날짜','시가','고가','저가','종가','거래량','외국인소진율'],

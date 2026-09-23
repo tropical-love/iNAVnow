@@ -1002,7 +1002,10 @@ const kstHm = (now = Date.now()) => {
 };
 
 function krSession(now = Date.now()) { // now는 검사용 주입구 — 평소엔 시계
-  // ponytail: KST 시계 기준 고정 창(NXT 프리 08:00~08:50, KRX 본장 09:00~15:30, NXT 애프터 15:30~20:00).
+  // ponytail: KST 시계 기준 고정 창(NXT 프리 08:00~08:50, KRX 본장 09:00~15:30, 시간외 15:40~20:00).
+  // 시간외 시작은 15:30이 아니라 15:40이다 — NXT는 15:30부터 호가만 받고 체결은 15:40부터,
+  // KRX 애프터마켓은 16:00부터다. 15:30~15:40을 시간외로 부르면 아직 아무 체결도 없는데
+  // '애프터마켓 진행 중'으로 보인다(사용자 지적 2026-09-23 15:33).
   const kst = new Date(now + 9 * 3600e3);
   if (kst.getUTCDay() === 0 || kst.getUTCDay() === 6) return '휴장';
   if (krClosedToday === todayYmd()) return '휴장'; // 평일인데 장이 안 열렸다 = 공휴일
@@ -1010,7 +1013,7 @@ function krSession(now = Date.now()) { // now는 검사용 주입구 — 평소�
   if (hm >= 800 && hm < 850) return 'NXT프리';
   if (hm >= 850 && hm < 900) return '장전'; // 프리 종료~개장. 오늘 첫 체결이 아직 없다
   if (hm >= 900 && hm < 1530) return '본장';
-  if (hm >= 1530 && hm < 2000) return 'NXT애프터';
+  if (hm >= 1540 && hm < 2000) return 'NXT애프터';
   // '휴장'은 장이 실제로 안 열리는 날(주말·공휴일)에만 쓴다 — 세션 창 밖은 장이 끝난 것이다.
   // 애프터 마감 후 밤새 '한국장 휴장'으로 보이던 문제(사용자 지적).
   return '장마감';
@@ -1173,6 +1176,7 @@ const needRegFix = (now = Date.now()) => krSession(now) !== '휴장' && kstHm(no
 // marketStatus=OPEN·regularMarket을 준다. 그대로 믿으면 그 20분 동안 '장중'으로 굳어
 // 정규장 마감가와 그 뒤 변동이 분리되지 않는다(사용자 지적 2026-09-15).
 // 그래서 우리 시계(krSession)로 정규장 여부를 먼저 가르고, 세부 세션만 거래소 응답에서 읽는다.
+const omOffHours = om => !!(om && om.tradingSessionType && om.tradingSessionType !== 'REGULAR_MARKET');
 function quoteSession(d, live, nowSess = krSession()) {
   const regularNow = nowSess === '본장';
   const offRegular = !regularNow || d.marketStatus !== 'OPEN'
@@ -1214,7 +1218,12 @@ async function krQuotesRaw(codes) {
       const reg = num(d.closePrice);
       const prev = reg - num(d.compareToPreviousClosePrice);
       const om = d.overMarketPriceInfo;
-      const live = om && om.overMarketStatus === 'OPEN' && num(om.overPrice) > 0;
+      // ⚠ overMarketPriceInfo가 있다고 시간외 시세인 게 아니다 — 정규장 중에도 남아 있고,
+      // 그때는 tradingSessionType이 REGULAR_MARKET이다(실측 2026-09-23 15:34 삼성전자:
+      // 종가 285,500인데 overPrice에 15:20자 284,500이 남아 있었다). 그대로 집으면 장이 끝나자마자
+      // 있지도 않은 '시간외 -0.35%'가 찍힌다(사용자 지적).
+      const omOff = omOffHours(om);
+      const live = omOff && om.overMarketStatus === 'OPEN' && num(om.overPrice) > 0;
       const sess = quoteSession(d, live);
       // 장 마감 뒤에는 closePrice가 애프터를 따라가므로 분봉에서 정규장 종가를 가져온다.
       // 실패하면 종전 값을 쓴다(그 경우 마감 후 변동이 0으로 보일 뿐, 나빠지지는 않는다).
@@ -1223,7 +1232,7 @@ async function krQuotesRaw(codes) {
       // 시간외 세션이 끝난 뒤에도 그 마감가가 최신 체결가 — 정규장 종가로 되돌리면
       // 애프터장 마감 후 다음 장까지 모든 변동이 0%로 굳는다(사용자 지적).
       // 정규장 중에 남아 있는 전일 시간외 값을 잘못 집지 않도록 '장마감'일 때만 쓴다.
-      const overLast = sess === '장마감' && om && num(om.overPrice) > 0 ? num(om.overPrice) : null;
+      const overLast = sess === '장마감' && omOff && num(om.overPrice) > 0 ? num(om.overPrice) : null;
       out[c] = {
         last: live ? num(om.overPrice) : (overLast ?? reg),
         prevClose: prev, regClose: regFix || reg,
@@ -3782,6 +3791,6 @@ if (require.main === module) {
     try { fs.writeFileSync(__dirname + '/server.pid', String(process.pid)); } catch (e) {}
   });
 }
-module.exports = { server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, dropBadPdf, krSession, quoteSession, resolveTicker, idxSettled, fxMarketOpen, spotFirst, KR_PREOPEN, dayRef, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, resolveNavRef, nearestFxDate, parseMinClose, needRegFix, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
+module.exports = { server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, dropBadPdf, krSession, quoteSession, omOffHours, resolveTicker, idxSettled, fxMarketOpen, spotFirst, KR_PREOPEN, dayRef, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, resolveNavRef, nearestFxDate, parseMinClose, needRegFix, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
 
 }
