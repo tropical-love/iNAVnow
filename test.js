@@ -338,6 +338,17 @@ if (A) {
   const one = [{ valAm: 785800000, wg: 100 }];
   assert.strictEqual(S.resolveNavRef(withD1(7969.6, -1.045), one, []).adjusted, false,
     '어중간하게 더 맞는 후보로 공식 NAV를 덮어썼다');
+
+  // 선물이 든 PDF는 평가금액이 계약 명목금액이라 총액 ÷ CU가 NAV가 아니다 — 공식 NAV를 고치면 안 된다
+  // (실측 2026-10-12 KODEX 삼성전자채권혼합 448330: 17,485.04를 18,166으로 '복구'해 괴리율 -3.65%)
+  const mixed = [['005930', 454570000, 25.03], ['KR103501GFC3', 353258985, 19.45], ['KR103503GG37', 271874471, 14.97],
+    ['114260', 242032235, 13.32], ['KR103501GF63', 207290224, 11.41], ['KR4A116B0004', 60926250, 3.35],
+    ['KR103501GG62', 60853335, 3.35], ['KR4A656C0009', 53300000, 2.93], ['KR103503GF95', 45972340, 2.53],
+    ['481050', 27609255, 1.52], ['214980', 23272935, 1.28], ['273140', 15491925, 0.85]]
+    .map(([jm, valAm, wg]) => ({ jm, valAm, wg }));
+  const withFut = S.resolveNavRef(withD1(17485.04, -0.77), mixed, []);
+  assert.strictEqual(withFut.adjusted, false, `선물 명목이 든 PDF로 공식 NAV를 고쳤다: ${withFut.navRef}`);
+  assert.strictEqual(withFut.navRef, 17485.04);
   ok('기준 NAV가 하루 묵었는지를 PDF 총액 ÷ 설정단위가 정확히 떨어지는지로 가린다');
 }
 

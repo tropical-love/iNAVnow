@@ -1315,6 +1315,11 @@ function resolveNavRef(analysis, pdfList, extraNavs) {
   const nav = analysis.nav;
   const total = pdfList.reduce((s, r) => s + (r.valAm || 0), 0);
   if (!nav || !total) return { navRef: nav, adjusted: false };
+  // 국내 선물·옵션(ISIN KR4…)이 있으면 그 평가금액은 순자산이 아니라 계약 명목금액이라 'PDF 총액 = 기준NAV × CU'가
+  // 성립하지 않는다. 그 총액으로 공식 NAV를 '복구'하면 엉뚱한 값이 된다(실측 2026-10-12 KODEX 삼성전자채권혼합
+  // 448330: 선물 명목 1.14억이 더해져 CU 103,876 → 기준 NAV를 17,485.04에서 18,166으로 바꿔 괴리율 -3.65%.
+  // 명목을 빼고 현금을 더하면 정확히 17,485.04 × 10만 주다). 이때는 공식 NAV를 손대지 않는다.
+  if (pdfList.some(r => /^KR4/.test(r.jm || ''))) return { navRef: nav, adjusted: false };
   const d1 = analysis.navPerformanceList?.find(x => x.periodTypeCode === 'D1')?.value;
   const share = pdfShare(pdfList, analysis);
 
