@@ -194,15 +194,45 @@ function krIsin(code) { // 6자리 종목코드 → KR ISIN (표준 체크디지
   return base + ((10 - (sum % 10)) % 10);
 }
 
+// ---------- 날짜 도구 ----------
+// 한국 날짜는 'UTC 필드를 KST로 읽는 Date'(kstD)와 8자리 문자열(20260916)로만 다룬다.
+// 로컬 시간대 Date(new Date(y, m, d)·getDay)를 섞으면 서버가 어느 시간대에서 도느냐에 따라 하루가 밀린다.
+// 함수 선언으로 둔다 — const로 두면 이보다 위에서 불렀을 때 TDZ로 조용히 깨진다(이 파일에서 두 번 당했다).
+function kstD(now = Date.now()) { return new Date(now + 9 * 3600e3); } // UTC 필드를 KST로 읽는다
+function ymd8(d) {
+  return d.getUTCFullYear() + String(d.getUTCMonth() + 1).padStart(2, '0') + String(d.getUTCDate()).padStart(2, '0');
+}
+function dig8(s) { return String(s || '').replace(/\D/g, '').slice(0, 8); } // '2026.09.16'·'2026-09-16' → '20260916'
+function utcOf(d8) { return new Date(Date.UTC(+d8.slice(0, 4), +d8.slice(4, 6) - 1, +d8.slice(6, 8))); }
+function dotYmd(d8) { return d8.slice(0, 4) + '.' + d8.slice(4, 6) + '.' + d8.slice(6, 8); } // 화면·네이버 표기
 function todayYmd(sep = '', now = Date.now()) { // now는 검사용 주입구 — 평소엔 시계
-  const kst = new Date(now + 9 * 3600e3);
-  return [kst.getUTCFullYear(), String(kst.getUTCMonth() + 1).padStart(2, '0'), String(kst.getUTCDate()).padStart(2, '0')].join(sep);
+  const d = ymd8(kstD(now));
+  return sep ? [d.slice(0, 4), d.slice(4, 6), d.slice(6)].join(sep) : d;
+}
+// d8에서 dir(+1 다음 / -1 이전) 쪽으로 가장 가까운 거래일. 자기 자신은 치지 않는다.
+// 주말은 요일로, 공휴일은 거래일 달력(isKrBiz)으로 건너뛴다. 달력이 이상해도 끝없이 돌지 않게 14칸에서 멈춘다.
+function bizStep(d8, dir) {
+  const d = utcOf(d8);
+  for (let i = 0; i < 14; i++) {
+    d.setUTCDate(d.getUTCDate() + dir);
+    if (d.getUTCDay() % 6 && isKrBiz(ymd8(d))) break;
+  }
+  return ymd8(d);
+}
+// 기준 NAV가 존재할 가장 최근 한국 영업일. 09시(당일 기준가 발표)부터는 당일 — 증권사 앱이 보여주는 NAV가
+// 바로 당일 기준가라(실측: 토스 "8월 3일 기준 NAV"), 전일 기준가를 쓰면 사용자가 보는 값과 하루 어긋난다.
+// 15:30 마감 후에는 같은 날짜로 잠정(마감 iNAV) 프레임이 이어진다. 09시 전엔 전 영업일.
+// 공휴일도 건너뛴다 — 안 그러면 존재하지 않는 기준가 날짜를 목표로 삼아 재앵커가 어긋난다.
+function navTargetD(now = Date.now()) {
+  const k = kstD(now), t = ymd8(k);
+  return k.getUTCHours() >= 9 && k.getUTCDay() % 6 && isKrBiz(t) ? t : bizStep(t, -1);
 }
 
 // ---------- 캐시 (목록·매핑류는 영속화 — 재시작 시 운용사 사이트 429 방지) ----------
 // Node는 cache.json, 안드로이드는 localStorage. 담는 내용과 키 규칙은 같다.
 const fs = NODE ? require('fs') : null;
-const CACHE_FILE = NODE ? __dirname + '/cache.json' : null;
+// 테스트는 ETF_CACHE_FILE로 임시 파일을 쓴다 — 실행 중인 로컬 서버의 cache.json을 덮어쓰지 않게
+const CACHE_FILE = NODE ? process.env.ETF_CACHE_FILE || __dirname + '/cache.json' : null;
 const CACHE_LS = 'engineCache';
 const cache = new Map(); // key -> {ts, ttl, data}
 // fxfix·navfix(기준환율 역산값)도 보존 — 재시작하면 표본이 사라져 아침마다 보정이 풀리던 문제
@@ -210,14 +240,20 @@ const cache = new Map(); // key -> {ts, ttl, data}
 // ⚠ 선언이 아래 로드 코드보다 뒤에 있으면 TDZ ReferenceError가 catch에 삼켜져 캐시가 통째로
 // 로드되지 않는다(실측 2026-08-10: 디스크에 39개가 있는데 메모리는 0개 — 앱이 켤 때마다 PDF를
 // 다시 받던 원인). 반드시 로드보다 위에 둔다.
-const PERSIST_RE = /(:list$|^acefunds$|^etflist$|^krbiz$|^pdf:|^pdfkey:|^blk:|^isin:|^tosscode:|^rise:id:|^plus:id:|^fxfix:|^navfix:|^provnav:|^fxclose:|^pdfset:|^regfix:)/;
+const PERSIST_RE = /(:list$|^acefunds$|^etflist$|^krbiz$|^pdf:|^pdfkey:|^blk:|^isin:|^tosscode:|^rise:id:|^plus:id:|^fxfix:|^navfix:|^provnav:|^fxclose:|^pdfset:)/;
 const PERSIST = k => PERSIST_RE.test(k);
+const PERSIST_GRACE_MS = 30 * 86400e3;
+function keepOnLoad(k, v, now = Date.now()) {
+  const age = now - v.ts;
+  return age < v.ttl || (PERSIST(k) && age < v.ttl + PERSIST_GRACE_MS);
+}
 try {
   const raw = NODE ? fs.readFileSync(CACHE_FILE, 'utf8') : localStorage.getItem(CACHE_LS);
-  // 만료된 단기 캐시는 싣지 않는다 — 안 그러면 저장분이 계속 자라 용량 한계에 부딪힌다
-  if (raw) for (const [k, v] of Object.entries(JSON.parse(raw))) {
-    if (PERSIST_RE.test(k) || Date.now() - v.ts < v.ttl) cache.set(k, v);
-  }
+  // 만료된 단기 캐시는 싣지 않는다 — 안 그러면 저장분이 계속 자라 용량 한계에 부딪힌다.
+  // 영속 키는 만료 뒤에도 남기지만(이전 PDF 구성처럼 낡아도 비교 기준이 되는 값) 30일이 더 지나면 버린다 —
+  // 키에 날짜가 들어가는 항목(fxfix·fxclose·navfix)은 날마다 새로 생겨 그냥 두면 끝없이 쌓인다
+  // (실측 2026-10-12: 정규장 종가 캐시가 만료된 채 1,204개, cache.json 1MB. 안드로이드는 저장 한도 5MB).
+  if (raw) for (const [k, v] of Object.entries(JSON.parse(raw))) if (keepOnLoad(k, v)) cache.set(k, v);
 // 조용히 삼키면 위와 같은 버그를 못 본다. 다만 처음 실행이라 파일이 없는 것은 오류가 아니다.
 } catch (e) { if (e.code !== 'ENOENT') console.error('캐시 로드 실패:', e.message); }
 // 숨김 작업(세션 0)으로 돌면 콘솔이 없어 오류를 확인할 방법이 아예 없다 — 파일에도 남긴다.
@@ -360,7 +396,7 @@ const pdfStdDt = d => {
     d.pdfList && d.pdfList[0] && d.pdfList[0].businessDate,
     d.content && d.content[0] && d.content[0].wkdate,
     d.results && d.results[0] && d.results[0].F12506]) {
-    const s8 = fxKeyD(v);
+    const s8 = dig8(v);
     if (s8.length === 8) return s8;
   }
   return '';
@@ -829,21 +865,19 @@ async function fxCloseSpot(cur, d8) { // d8 = '20260803'
   });
 }
 
-const fxKeyD = s => String(s || '').replace(/\D/g, '').slice(0, 8);
 // 특정 일자의 원화 환율 근사: ① 다른 ETF의 PDF에서 역산해 둔 정확값(fxfix 캐시)
 // ② 해당 통화 일봉 ③ USD 교차환율 — CNYKRW=X처럼 야후에 과거 일봉이 없는 통화가 있다(실측).
 async function fxFixOf(cur, dateStr) {
   // 키는 숫자만 남겨 통일한다 — 호출처가 '2026-08-05'와 '20260805'를 섞어 쓰면 같은 날이 다른 칸에 저장된다
-  const hit = cache.get(`fxfix:${cur}:${fxKeyD(dateStr)}`);
+  const hit = cache.get(`fxfix:${cur}:${dig8(dateStr)}`);
   if (hit && Date.now() - hit.ts < hit.ttl && hit.data) return hit.data;
-  const dig = s => String(s || '').replace(/\D/g, '');
   const direct = ((await dailyCloses(`${cur}KRW=X`).catch(() => null)) || [])
-    .filter(x => dig(x.d) <= dig(dateStr)).pop();
+    .filter(x => dig8(x.d) <= dig8(dateStr)).pop();
   if (direct) return direct.c;
   if (cur === 'USD') return null;
   const usd = await fxFixOf('USD', dateStr);
   const perUsd = ((await dailyCloses(`${cur}=X`).catch(() => null)) || []) // 예: CNY=X = USD당 위안
-    .filter(x => dig(x.d) <= dig(dateStr)).pop();
+    .filter(x => dig8(x.d) <= dig8(dateStr)).pop();
   return usd && perUsd ? usd / perUsd.c : null;
 }
 // 역산 환율이 실제 환율과 가장 가까운 날을 고른다. 1% 넘게 벌어지면 기준일을 못 정한 것으로 본다
@@ -903,7 +937,7 @@ async function resolveFxRef(holdings, quoteOf) {
     if (vals.length) {
       fxRef[cur] = medOf(vals); fxRefDate[cur] = chosen.date;
       // 역산한 고시환율을 날짜별로 남겨 둔다 — 평가금액이 없는 운용사(PLUS)의 기준액 합성에 재사용
-      cache.set(`fxfix:${cur}:${fxKeyD(chosen.date)}`, { ts: Date.now(), ttl: 7 * 86400e3, data: fxRef[cur] });
+      cache.set(`fxfix:${cur}:${dig8(chosen.date)}`, { ts: Date.now(), ttl: 7 * 86400e3, data: fxRef[cur] });
       saveCache();
       continue;
     }
@@ -955,9 +989,9 @@ function parseKrDays(json) {
 // 거래일 봉은 개장 직후부터 달력에 잡히므로(실측), 개장(09:10 KST) 이후 받아온 달력에
 // 오늘 봉이 없으면 오늘은 휴장이다. 반환: 휴장이면 오늘 날짜, 거래일 확정이면 'open', 판단 불가면 null.
 function calClosedToday(daysSet, fetchedTs, now = Date.now()) {
-  const kst = new Date(now + 9 * 3600e3);
+  const kst = kstD(now);
   if (kst.getUTCDay() === 0 || kst.getUTCDay() === 6) return null; // 주말은 krSession이 이미 처리
-  const t = [kst.getUTCFullYear(), String(kst.getUTCMonth() + 1).padStart(2, '0'), String(kst.getUTCDate()).padStart(2, '0')].join('');
+  const t = ymd8(kst);
   const openTs = Date.UTC(kst.getUTCFullYear(), kst.getUTCMonth(), kst.getUTCDate(), 0, 10); // 09:10 KST
   if (fetchedTs < openTs) return null; // 개장 전에 받은 달력엔 오늘 봉이 원래 없다 — 판단 불가
   return daysSet.has(t) ? 'open' : t;
@@ -978,7 +1012,7 @@ async function loadKrDays() {
 }
 // 달력이 없거나 오늘 이후 날짜면 판단 보류(true) — 주말만 걸러지던 기존 동작으로 안전하게 떨어진다.
 // 단 오늘이 공휴일로 판정됐으면(marketStatus) 라벨뿐 아니라 날짜 계산에서도 거래일에서 뺀다 —
-// 안 그러면 targetDt·nextBizYmd가 존재하지 않는 오늘 기준가를 목표로 삼는다.
+// 안 그러면 navTargetD·bizStep이 존재하지 않는 오늘 기준가를 목표로 삼는다.
 const isKrBiz = d8 => {
   if (krClosedToday && d8 === krClosedToday) return false;
   return (!krDays || d8 >= todayYmd()) ? true : krDays.has(d8);
@@ -989,24 +1023,23 @@ const isKrBiz = d8 => {
 let krClosedToday = null;
 function noteKrStatus(status) {
   if (!status) return;
-  const kst = new Date(Date.now() + 9 * 3600e3);
-  const hm = kst.getUTCHours() * 100 + kst.getUTCMinutes();
+  const hm = kstHm();
   if (hm < 910 || hm >= 1520) return; // 본장 시간대에서만 판단 — 그 밖에서는 CLOSE가 정상이다
   krClosedToday = status === 'OPEN' ? null : todayYmd();
 }
 
 // KST 기준 HHMM (0930 = 9시 30분)
-const kstHm = (now = Date.now()) => {
-  const k = new Date(now + 9 * 3600e3);
+function kstHm(now = Date.now()) {
+  const k = kstD(now);
   return k.getUTCHours() * 100 + k.getUTCMinutes();
-};
+}
 
 function krSession(now = Date.now()) { // now는 검사용 주입구 — 평소엔 시계
   // ponytail: KST 시계 기준 고정 창(NXT 프리 08:00~08:50, KRX 본장 09:00~15:30, 시간외 15:40~20:00).
   // 시간외 시작은 15:30이 아니라 15:40이다 — NXT는 15:30부터 호가만 받고 체결은 15:40부터,
   // KRX 애프터마켓은 16:00부터다. 15:30~15:40을 시간외로 부르면 아직 아무 체결도 없는데
   // '애프터마켓 진행 중'으로 보인다(사용자 지적 2026-09-23 15:33).
-  const kst = new Date(now + 9 * 3600e3);
+  const kst = kstD(now);
   if (kst.getUTCDay() === 0 || kst.getUTCDay() === 6) return '휴장';
   if (krClosedToday === todayYmd()) return '휴장'; // 평일인데 장이 안 열렸다 = 공휴일
   const hm = kst.getUTCHours() * 100 + kst.getUTCMinutes();
@@ -1028,9 +1061,6 @@ const KR_PREOPEN = ['NXT프리', '장전'];
 //   · 자정 넘어 다음 마감 전 → 어제보다 / 금요일보다(토·일·월) / 직전 거래일보다(연휴 뒤)
 // 16:00을 경계로 두는 이유는 지수와 같다 — 15:30 직후에는 종가가 아직 확정 전이다.
 const DAY_OPEN_HM = 900, DAY_REF_HM = 1600;
-const kstD = (now = Date.now()) => new Date(now + 9 * 3600e3); // UTC 필드를 KST로 읽는다
-const ymd8 = d => [d.getUTCFullYear(), String(d.getUTCMonth() + 1).padStart(2, '0'),
-  String(d.getUTCDate()).padStart(2, '0')].join('');
 // 어느 필드가 '가장 최근 확정 종가'인지는 시각이 아니라 '장이 열려 있는가'로 갈린다.
 // 네이버의 '전일 종가'(prev)는 자정이 지나도 한동안 그 전날을 가리킨다 — 프리장 무렵에야 넘어간다
 // (실측 2026-08-13 00:04 ACE…레버리지: 전일 종가가 46,880원(8/11)으로 나와 기준이 하루 어긋났고,
@@ -1050,15 +1080,9 @@ function dayRef(now = Date.now()) {
 }
 // 직전 거래일이 언제인지로 이름을 정한다(어제 / 금요일 / 그 밖)
 function dayPrevLabel(now) {
-  const t = kstD(now), d = kstD(now);
-  let hops = 0;
-  do { d.setUTCDate(d.getUTCDate() - 1); hops++; }
-  while (hops < 14 && (d.getUTCDay() === 0 || d.getUTCDay() === 6 || !isKrBiz(ymd8(d))));
-  const gap = Math.round((Date.UTC(t.getUTCFullYear(), t.getUTCMonth(), t.getUTCDate())
-    - Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())) / 86400e3);
-  if (d.getUTCDay() === 5) return '금요일보다'; // 토·일·월은 모두 금요일이 기준
-  if (gap === 1) return '어제보다';
-  return '직전 거래일보다';
+  const t = ymd8(kstD(now)), p = bizStep(t, -1);
+  if (utcOf(p).getUTCDay() === 5) return '금요일보다'; // 토·일·월은 모두 금요일이 기준
+  return utcOf(t) - utcOf(p) === 86400e3 ? '어제보다' : '직전 거래일보다';
 }
 // 장외 굴림에서 현물 바스켓을 야간선물보다 먼저 볼 때 — 프리마켓에는 현물이 다시 거래되고
 // 야간선물은 06:00에 멈춰 있다. 그 밖(저녁~새벽)에는 선물이 최신이라 순서가 반대다.
@@ -1066,7 +1090,7 @@ const spotFirst = (s = krSession()) => KR_PREOPEN.includes(s);
 
 // 미국주식 주간거래(Blue Ocean): 야후에 없음 → 토스 시세로 보완
 function usDaySession() { // KST 09:00~17:00 평일 = 미국 주간거래 시간대
-  const kst = new Date(Date.now() + 9 * 3600e3);
+  const kst = kstD();
   if (kst.getUTCDay() === 0 || kst.getUTCDay() === 6) return false;
   const hm = kst.getUTCHours() * 100 + kst.getUTCMinutes();
   return hm >= 900 && hm < 1700;
@@ -1337,6 +1361,8 @@ function resolveNavRef(analysis, pdfList, extraNavs) {
 const integrationOf = stockCode => cached(`ig:${stockCode}`, 300e3,
   () => getJson(`https://m.stock.naver.com/api/stock/${stockCode}/integration`));
 const igVal = (ig, code) => ig?.totalInfos?.find(t => t.code === code)?.value ?? null;
+// 숫자 항목('9,813.86' 같은 문자열) — 없거나 숫자가 아니면 0
+const igNum = (ig, code) => parseFloat(String(igVal(ig, code) ?? '').replace(/,/g, '')) || 0;
 // 거래량 — 화면 표시용. 위 캐시를 그대로 쓰므로 대부분의 경로에서 추가 호출이 없다.
 const volumeOf = async stockCode =>
   igVal(await integrationOf(stockCode).catch(() => null), 'accumulatedTradingVolume');
@@ -1344,7 +1370,7 @@ const volumeOf = async stockCode =>
 // 어떤 방법으로도 바스켓 추적이 불가할 때: 추정을 포기하고 KRX 공식 iNAV만 표시
 async function officialOnly(stockCode, analysis, basic, reason) {
   const ig = await integrationOf(stockCode);
-  const official = parseFloat((ig.totalInfos.find(t => t.code === 'nav')?.value || '0').replace(/,/g, ''));
+  const official = igNum(ig, 'nav');
   if (!official) throw new Error(reason);
   const mp = marketPx(basic), marketPrice = mp.price;
   return {
@@ -1409,7 +1435,7 @@ async function computeDomesticLev(stockCode, analysis, basic) {
 
   const [, idxCode, idxLabel, base1x, nightSym] = hit;
   const ig = await integrationOf(stockCode);
-  const official = parseFloat((ig.totalInfos.find(t => t.code === 'nav')?.value || '0').replace(/,/g, ''));
+  const official = igNum(ig, 'nav');
   if (!official) return null;
 
   let idx = null;
@@ -1571,7 +1597,7 @@ const YF_TTL = 15e3;
 // 마감이 붙는다(실측 2026-08-19 09:13: 마지막 갱신 08:24 = 49분 전인데 서울 외환시장은 09:00에 열렸다).
 // 그래서 시계로 판정하고, 값이 아주 오래됐을 때만(6시간) 마감으로 본다.
 const fxMarketOpen = (now = Date.now()) => {
-  const d = new Date(now + 9 * 3600e3);
+  const d = kstD(now);
   const day = d.getUTCDay(), hm = d.getUTCHours() * 100 + d.getUTCMinutes();
   if (day === 6) return hm < 700;   // 토요일 이른 아침까지는 아직 열려 있다
   if (day === 0) return false;      // 일요일은 닫혔다
@@ -1661,10 +1687,10 @@ async function computeSynthetic(stockCode, baseCode, analysis, basic, levOverrid
   let navRef = analysis.nav, navAdjusted = false, navRefDate = analysis.navPerformanceReferenceDate;
   if (base.navAdjusted) {
     const ig = await integrationOf(stockCode).catch(() => null);
-    const igNav = parseFloat((ig?.totalInfos?.find(t => t.code === 'nav')?.value || '0').replace(/,/g, ''));
+    const igNav = igNum(ig, 'nav');
     // 본장 중 integration nav는 실시간 iNAV라 기준으로 못 쓴다 — 장외에 저장해 둔 잠정값으로 대체.
     // 잠정값은 프레임 날짜가 기초 ETF의 현재 프레임과 같을 때만(어제 값을 오늘 프레임에 붙이면 하루치 어긋남)
-    const frameD = String(base.navRefDate || '').replace(/\D/g, '').slice(0, 8);
+    const frameD = dig8(base.navRefDate);
     const provRec = cache.get(`provnav:${stockCode}`);
     const navAlt = krSession() !== '본장' ? igNav
       : (provRec && Date.now() - provRec.ts < provRec.ttl && provRec.data?.d === frameD ? provRec.data.nav : null);
@@ -1828,7 +1854,6 @@ async function computeINav(stockCode, depth = 0) {
 
   const quoteOf = h => h.t ? (h.t.src === 'kr' ? krMap[h.t.sym] : yMap[h.t.sym]) : null;
 
-  const dig8 = s => String(s || '').replace(/\D/g, '').slice(0, 8);
   const navD = dig8(analysis.navPerformanceReferenceDate);
 
   // 평가금액 미제공 운용사(PLUS): 전일종가×수량 근사는 해외장이 새 세션을 열면 한 칸 밀리고,
@@ -1856,28 +1881,12 @@ async function computeINav(stockCode, depth = 0) {
   // (실측 2026-08-03 아침: 라벨은 07-31인데 값은 목요일 NAV 그대로 → PLUS 괴리 +12%로 표시).
   // 그래서 라벨이 아니라 데이터로 판정한다: CU 라운드 검사가 실패했거나 integration nav가 2% 이상
   // 다르면 igNav를 후보에 넣어 다시 채점하고, 현재 바스켓과 라운드로 맞아떨어지는 쪽을 쓴다.
-  const fmtYmd = dt => dt.getFullYear() + '.' + String(dt.getMonth() + 1).padStart(2, '0') + '.' + String(dt.getDate()).padStart(2, '0');
-  const targetDt = (() => { // 기준 NAV가 존재할 가장 최근 한국 영업일
-    // 09시(당일 기준가 발표)부터는 당일 — 증권사 앱이 보여주는 NAV가 바로 당일 기준가라
-    // (실측: 토스 "8월 3일 기준 NAV"), 전일 기준가를 쓰면 사용자가 보는 값과 하루 어긋난다.
-    // 15:30 마감 후에는 같은 날짜로 잠정(마감 iNAV) 프레임이 이어진다. 09시 전엔 전 영업일.
-    const k = new Date(Date.now() + 9 * 3600e3);
-    const dt = new Date(k.getUTCFullYear(), k.getUTCMonth(), k.getUTCDate());
-    if (k.getUTCHours() < 9) dt.setDate(dt.getDate() - 1);
-    // 주말뿐 아니라 공휴일도 건너뛴다 — 안 그러면 존재하지 않는 기준가 날짜를 목표로 삼아 재앵커가 어긋난다
-    while (dt.getDay() === 0 || dt.getDay() === 6 || !isKrBiz(dig8(fmtYmd(dt)))) dt.setDate(dt.getDate() - 1);
-    return dt;
-  })();
-  const targetD = dig8(fmtYmd(targetDt));
-  const nextBizYmd = b => { // basis 다음 거래일(주말·공휴일 건너뜀) — 그 basis와 짝이 되는 NAV 날짜
-    const dt = new Date(+b.slice(0, 4), +b.slice(4, 6) - 1, +b.slice(6, 8));
-    do { dt.setDate(dt.getDate() + 1); } while (dt.getDay() === 0 || dt.getDay() === 6 || !isKrBiz(dig8(fmtYmd(dt))));
-    return fmtYmd(dt);
-  };
+  const targetD = navTargetD();
+  const nextBizYmd = b => dotYmd(bizStep(b, +1)); // basis 다음 거래일 — 그 basis와 짝이 되는 NAV 날짜
   let navInfo = resolveNavRef(analysis, pdf.list);
   let navRefDateOut = analysis.navPerformanceReferenceDate;
   const ig0 = await integrationOf(stockCode).catch(() => null);
-  const igNavG = parseFloat((ig0?.totalInfos?.find(t => t.code === 'nav')?.value || '0').replace(/,/g, '')) || null;
+  const igNavG = igNum(ig0, 'nav') || null;
   const pdfHasValAm = pdf.list.some(r => r.valAm > 0);
   const curBasis0 = Object.entries(fxRefDate).filter(([c]) => c !== 'JPY').map(([, d]) => dig8(d)).sort().pop()
     || dig8(fxRefDate.JPY);
@@ -2014,7 +2023,7 @@ async function computeINav(stockCode, depth = 0) {
       // (KRX iNAV = 당일기준가 × (1 + 국내 당일변동 기여) — 해외 레그·환율은 하루 고정이므로).
       // 급변장에선 캐시된 iNAV와 지금 시세의 시점이 어긋나므로 iNAV를 새로 받아 짝을 맞춘다.
       const igF = await getJson(`https://m.stock.naver.com/api/stock/${stockCode}/integration`).catch(() => null);
-      const igNavF = parseFloat((igF?.totalInfos?.find(t => t.code === 'nav')?.value || '0').replace(/,/g, '')) || igNav;
+      const igNavF = igNum(igF, 'nav') || igNav;
       const domLive = movedHs.filter(h => h.t.cur === 'KRW').reduce((s, h) => {
         const q = quoteOf(h); return s + h.wg * (q.last / q.prevClose - 1);
       }, 0);
@@ -2031,7 +2040,7 @@ async function computeINav(stockCode, depth = 0) {
       // 맞추면 -0.77%다).
       const canRoll = pdfHasValAm ? !!navInfo.cuShares : !inKrMarket;
       if (!canRoll) {
-        if (!inKrMarket && igNav) { navInfo = { navRef: igNav, adjusted: true, staleNav: navInfo.navRef, prov: false }; navRefDateOut = fmtYmd(targetDt); }
+        if (!inKrMarket && igNav) { navInfo = { navRef: igNav, adjusted: true, staleNav: navInfo.navRef, prov: false }; navRefDateOut = dotYmd(targetD); }
         break reanchor;
       }
       const rolled = navInfo.navRef * rollRatio;
@@ -2046,7 +2055,7 @@ async function computeINav(stockCode, depth = 0) {
     }
     for (const h of movedHs) h.valRef = newRef.get(h);
     navInfo = { ...adoptNav, adjusted: true, staleNav: navInfo.navRef, prov };
-    navRefDateOut = fmtYmd(targetDt);
+    navRefDateOut = dotYmd(targetD);
     ({ fxRef, fxRefDate } = await resolveFxRef(holdings, quoteOf)); // 새 기준액으로 환율 기준 재역산
   }
   // 장외에서 잠정 NAV를 채택했으면 저장 — 다음 본장 중에도 같은 기준을 유지하기 위해
@@ -2234,6 +2243,71 @@ async function computeINav(stockCode, depth = 0) {
     moreCount: Math.max(0, rows.length - 80),
     asOf: new Date().toISOString(),
   };
+}
+
+// ---------- 서버 라우트·앱 브리지 공용 ----------
+// 같은 응답을 서버(handler)와 안드로이드 브리지(build-android.js)가 만든다. 예전엔 브리지가 이 로직을
+// 한 벌 더 갖고 있어 고칠 때마다 두 곳을 손으로 맞췄다 — 여기 한 곳에만 둔다.
+const codesParam = s => String(s || '').split(',').filter(c => /^[0-9A-Z]{6}$/.test(c));
+
+// 구성종목 자료 수동 초기화. 차단 기록(blk:)은 남긴다 — 수동 갱신마다 지우면 429로 막힌 운용사를
+// 매번 다시 두드려 차단이 길어진다(차단 상태에서도 폴백으로 새 자료를 받으므로 갱신은 된다).
+// codes를 주면 그 종목이 쓴 키만 지운다(pdfkey:<code>에 남겨 둔다) — 화면과 무관한 종목의
+// 자료를 함께 날리지 않는다. codes가 없으면 전부 비운다.
+function pdfClear(only) {
+  let n = 0, miss = 0;
+  if (only.length) {
+    for (const c of only) {
+      const keys = pdfKeysOf(c);
+      if (!keys.length) { miss++; continue; } // 아직 한 번도 계산하지 않은 종목
+      for (const k of keys) if (cache.delete(k)) n++; // 거쳐 온 출처를 모두 비운다
+      // pdfset(전일 구성 기록)은 남긴다 — 리밸런싱 비교 기준이라 지우면 편입·편출을 못 잡는다
+    }
+  } else {
+    for (const k of [...cache.keys()]) if (k.startsWith('pdf:')) { cache.delete(k); n++; }
+  }
+  saveCache();
+  return { cleared: n, miss, scope: only.length ? 'codes' : 'all' };
+}
+
+// 구성종목 자료 상태. 건수는 아직 유효한 자료만 센다(만료분·폴백 중복은 '자료 건수'일 뿐 종목 수가 아니다).
+// 기준일은 원본 응답이 아니라 정규화해 둔 pdfset에서 읽는다 — 어댑터마다 필드 이름이 달라
+// 원본을 그대로 읽으면 일부 운용사가 빠진다(Codex 지적).
+// codes를 주면 그 종목이 쓰는 자료만 센다 — 안 주면 과거에 조회한 종목까지 합쳐져
+// 화면에 없는 종목 때문에 '지난 기준일 N종목'이 뜬다
+function pdfStatus(only) {
+  const wanted = only.length ? new Set(only.flatMap(c => pdfKeysOf(c))) : null;
+  const items = [];
+  for (const [k, v] of cache) {
+    if (!k.startsWith('pdf:') || (wanted && !wanted.has(k))) continue;
+    items.push({ at: v.ts, alive: Date.now() - v.ts < pdfTtlFor(v.data, v.ts) });
+  }
+  const live = items.filter(x => x.alive).map(x => x.at);
+  const sets = [...cache.entries()]
+    .filter(([k]) => k.startsWith('pdfset:') && (!only.length || only.includes(k.slice(7))))
+    .map(([, v]) => dig8(v.data?.d)).filter(x => x.length === 8);
+  return {
+    count: live.length, total: items.length,
+    oldest: live.length ? Math.min(...live) : null,
+    newest: live.length ? Math.max(...live) : null,
+    dates: [...new Set(sets)].sort(),
+    stale: sets.filter(d => d < todayYmd()).length, // 종목별로 센다(중복 제거는 표시용 dates에만)
+    retrying: pdfRetryTime(), ttlMs: pdfTtl(), marks: PDF_MARKS,
+    blocked: [...cache.keys()].filter(k => k.startsWith('blk:') && issuerBlocked(k.slice(4))).map(k => k.slice(4)),
+    scope: only.length ? 'codes' : 'all',
+  };
+}
+
+// ETF 자체 시세만 — 구성종목을 훑지 않으므로 포트폴리오 현재가를 종목 화면과 같은 주기로 갱신할 수 있다
+async function pxOf(codes) {
+  const q = codes.length ? await krQuotes(codes) : {};
+  const ref = dayRef();
+  return Object.fromEntries(codes.map(c => [c, q[c] ? {
+    price: q[c].last, prev: q[c].prevClose,
+    // 어제 대비의 기준 종가와 그 라벨(오늘 종가보다 / 어제보다 / 금요일보다 / 직전 거래일보다)
+    base: ref.useReg ? q[c].regClose : q[c].prevClose, dayLabel: ref.label, dayReg: ref.useReg,
+    session: q[c].session,
+  } : null]));
 }
 
 // ---------- HTML ----------
@@ -2445,6 +2519,10 @@ const HTML = `<!doctype html>
   html[data-theme=dark] #pfbasis button.on { color: #1c1f26; }
   .pfrow { padding: 13px 0 0; border-top: 1px solid var(--line); margin-top: 13px; }
   .pfrow:first-child { border-top: 0; margin-top: 4px; }
+  .pfrow .grip { font-size: 15px; padding: 2px 5px; margin: 0 -2px 0 -5px; }
+  .pfrow.drag { background: var(--card); opacity: .92; box-shadow: 0 8px 22px rgba(0,0,0,.18);
+                position: relative; z-index: 5; border-radius: 8px; }
+  .pfrow.drag .grip { cursor: grabbing; background: var(--goldbg); color: var(--gold); }
   .pfrow .nm { display: flex; align-items: center; gap: 6px; font-size: 14px; font-weight: 600; }
   .pfrow .nm a { color: inherit; text-decoration: none; }
   .pfrow .nm a:hover { text-decoration: underline; }
@@ -2619,6 +2697,10 @@ const HTML = `<!doctype html>
     <div class="hint">직전 거래일 <b>종가</b>를 기준으로 오늘 얼마나 움직였는지 함께 보여줍니다(종목별·합계).</div>
   </div>
   <div class="sec">
+    <label><input type="checkbox" id="pfhide"> 포트폴리오 외부 공개용</label>
+    <div class="hint">원금·평가금액·손익 금액·보유수량을 <b>-</b>로 가리고 <b>수익률</b>만 보여줍니다. 평균단가·현재가는 그대로입니다. 화면을 캡처해 공유할 때 쓰세요.</div>
+  </div>
+  <div class="sec">
     <div class="muted">구성종목 자료(PDF)</div>
     <div class="row" style="gap:10px">
       <span class="hint" id="pdfinfo" style="margin:0">확인 중…</span>
@@ -2677,16 +2759,17 @@ const $q = document.getElementById('q'), $sugg = document.getElementById('sugg')
 const favs = () => JSON.parse(localStorage.getItem('favs')||'[]');
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; });
 
-// 최근 조회 (localStorage, 현재 종목 제외하고 5개 표시 → 6개까지 보관)
+// 최근 조회 (localStorage) — 화면마다 최대 RECENT_MAX개. 종목 화면은 지금 종목을 빼고 보여주므로 하나 더 보관한다
+const RECENT_MAX = 10;
 let recentSaved = false;
 const recents = () => JSON.parse(localStorage.getItem('recents')||'[]');
 function pushRecent(code, name){
   const r = recents().filter(function(x){ return x.code !== code; });
   r.unshift({code: code, name: name});
-  localStorage.setItem('recents', JSON.stringify(r.slice(0, 6)));
+  localStorage.setItem('recents', JSON.stringify(r.slice(0, RECENT_MAX + 1)));
 }
 function renderRecent(){
-  const list = recents().filter(function(x){ return x.code !== CODE; }).slice(0, 5);
+  const list = recents().filter(function(x){ return x.code !== CODE; }).slice(0, RECENT_MAX);
   const el = document.getElementById('recent');
   if(!list.length){ el.innerHTML = ''; return; }
   el.innerHTML = '<span class="lbl">최근</span>' + list.map(function(x){
@@ -2790,6 +2873,7 @@ function syncCfgUI(){
   si.checked = CFG.showInav && CFG.titleMode!=='noname';
   si.disabled = CFG.titleMode === 'noname';
   document.getElementById('showday').checked = localStorage.getItem('pfDay') !== '0';
+  document.getElementById('pfhide').checked = pfHidden();
 }
 function openCfg(){ syncCfgUI(); document.getElementById('cfgdlg').showModal(); pdfInfo(); }
 // 하루 한 번만 받는 자료(구성종목 PDF)의 상태. 리밸런싱이 늦게 올라온 날 손으로 새로 받을 수 있게 한다.
@@ -2882,6 +2966,12 @@ document.getElementById('showinav').onchange = function(){ CFG.showInav = this.c
 // 어제 대비 표시 — 포트폴리오 화면에만 쓰는 값이라 CFG(타이틀 설정)와 따로 둔다
 document.getElementById('showday').onchange = function(){
   localStorage.setItem('pfDay', this.checked ? '1' : '0');
+  if(typeof pfRender === 'function' && HOME) pfRender();
+};
+// 외부 공개용 — 금액만 가리고 비율은 그대로. 기본은 꺼짐(지금과 같은 화면)
+function pfHidden(){ try { return localStorage.getItem('pfHide') === '1'; } catch(e){ return false; } }
+document.getElementById('pfhide').onchange = function(){
+  try { localStorage.setItem('pfHide', this.checked ? '1' : '0'); } catch(e){}
   if(typeof pfRender === 'function' && HOME) pfRender();
 };
 function clearFavs(){
@@ -3178,7 +3268,7 @@ function showHome(){
   const r = recents().filter(function(x){ return !f.some(function(y){ return y.code === x.code; }); });
   let html = '';
   if(f.length) html += '<div class="hsec"><div class="muted">★ 관심</div>' + f.map(itemHtml).join('') + '</div>';
-  if(r.length) html += '<div class="hsec"><div class="muted">최근 조회</div>' + r.slice(0,8).map(itemHtml).join('') + '</div>';
+  if(r.length) html += '<div class="hsec"><div class="muted">최근 조회</div>' + r.slice(0, RECENT_MAX).map(itemHtml).join('') + '</div>';
   if(!f.length && !r.length) html += '<div class="hsec"><div class="muted">이런 종목으로 시작해 보세요</div>' + SAMPLES.map(itemHtml).join('') + '</div>';
   const box = document.getElementById('homeLists');
   box.innerHTML = html;
@@ -3243,34 +3333,53 @@ function applySecOrder(){
     if(el) box.appendChild(el); // 순서대로 뒤에 붙이면 그 순서가 된다
   });
 }
-function gripDown(e){
-  const card = e.target.closest('.sect');
-  if(!card) return;
+// 끌어서 순서 바꾸기 — 홈 섹션과 포트폴리오 행이 같이 쓴다. 손잡이를 누른 항목을 같은 부모 안에서
+// 옮기고, 놓으면 바뀐 순서의 항목들을 done에 넘긴다. 숨어 있는 항목은 자리 계산에서 건너뛴다.
+function dragSort(e, itemSel, done){
+  const item = e.target.closest(itemSel);
+  if(!item) return;
   e.preventDefault(); // 손잡이에서 시작한 터치는 스크롤로 넘기지 않는다
-  const box = document.getElementById('hsecs');
-  card.classList.add('drag');
+  const box = item.parentNode;
+  const items = function(){ return Array.prototype.filter.call(box.children, function(s){ return s.matches(itemSel); }); };
+  item.classList.add('drag');
   function move(ev){
     const y = ev.clientY;
-    const sibs = Array.prototype.filter.call(box.querySelectorAll('.sect'), function(s){
-      return s !== card && s.offsetParent; // 숨어 있는 섹션은 건너뛴다
-    });
+    const sibs = items().filter(function(s){ return s !== item && s.offsetParent; });
     for(let i = 0; i < sibs.length; i++){
       const r = sibs[i].getBoundingClientRect();
       if(y > r.top && y < r.bottom){
-        box.insertBefore(card, y < r.top + r.height/2 ? sibs[i] : sibs[i].nextSibling);
+        box.insertBefore(item, y < r.top + r.height/2 ? sibs[i] : sibs[i].nextSibling);
         break;
       }
     }
   }
   function up(){
-    card.classList.remove('drag');
+    item.classList.remove('drag');
     document.removeEventListener('pointermove', move);
     document.removeEventListener('pointerup', up);
-    const ks = Array.prototype.map.call(box.querySelectorAll('.sect'), function(s){ return s.dataset.sec; });
-    try { localStorage.setItem('secOrder', JSON.stringify(ks)); } catch(e){}
+    document.removeEventListener('pointercancel', up);
+    done(items());
   }
   document.addEventListener('pointermove', move);
   document.addEventListener('pointerup', up);
+  document.addEventListener('pointercancel', up);
+}
+function gripDown(e){
+  dragSort(e, '.sect', function(els){
+    try { localStorage.setItem('secOrder', JSON.stringify(els.map(function(s){ return s.dataset.sec; }))); } catch(e){}
+  });
+}
+// 포트폴리오 행 — 끄는 동안 15초 갱신이 목록을 다시 그리면 잡고 있던 행이 사라지므로 그리기를 멈춘다
+let PFDRAG = false;
+function pfGrip(e){
+  PFDRAG = true;
+  dragSort(e, '.pfrow', function(els){
+    PFDRAG = false;
+    const l = els.map(function(el){ return PF[+el.dataset.i]; });
+    if(l.length === PF.length && l.some(function(h, i){ return h !== PF[i]; })) pfSet(l);
+    pfRender();
+  });
+  if(!e.defaultPrevented) PFDRAG = false; // 행을 못 찾아 시작하지 않았다
 }
 
 // ---------- 내 포트폴리오 ----------
@@ -3373,6 +3482,7 @@ function pfSet(l){
 const amtHtml = (v, c) => (v>0?'▲':v<0?'▼':'')+fmt(Math.abs(v),0)+(c||'원');
 
 function pfRender(){
+  if(PFDRAG) return;
   const sum = document.getElementById('pfsum'), box = document.getElementById('pfbody');
   const ck = document.getElementById('pfclock'), bad = PF_DOWN || PFERR;
   ck.textContent = bad ? bad
@@ -3432,6 +3542,9 @@ function pfRender(){
   // (실측: 손익률 23.41%, 어제 22.01% → 차이 1.40%p인데 평가액 증가율은 1.14%).
   const dayPp = (dayDiff != null && cost > 0) ? dayDiff / cost * 100 : null;
   const dayOn = localStorage.getItem('pfDay') !== '0';
+  // 외부 공개용이면 금액만 '-'로 — 비율(수익률·비중·%p)과 1주 가격(평단·현재가·주당 등락)은 그대로
+  const hide = pfHidden();
+  const M = function(html){ return hide ? '-' : html; };
   // 기준이 '오늘 종가'인데 차이가 0이면 아무것도 보여주지 않는다 — 장이 끝나면 현재가는 시간외
   // 체결이 없는 한 종가 그대로여서 '오늘 종가보다 0원 +0.00%'가 종일 붙어 있다(사용자 지적).
   // iNAV는 장외에도 계속 움직이므로 그대로 나온다. 시간외 체결이 있으면 현재가도 값이 생긴다.
@@ -3439,12 +3552,12 @@ function pfRender(){
   const dayHtml = function(inner){ return dayShow
     ? '<span class="day '+cls(dayDiff)+'">'+inner+'</span>' : ''; };
   sum.innerHTML =
-    '<div class="bx"><div class="muted">원금</div><div class="v">'+fmt(cost,0)+'원</div></div>'+
+    '<div class="bx"><div class="muted">원금</div><div class="v">'+M(fmt(cost,0)+'원')+'</div></div>'+
     '<div class="bx"><div class="muted">현재가치 <span style="font-size:10.5px">'+bLbl+' 기준</span></div>'+
-      '<div class="v">'+(total!=null ? fmt(total,0)+'원' : '—')+'</div>'+
-      dayHtml(dayLbl+' '+amtHtml(dayDiff))+'</div>'+
+      '<div class="v">'+(total!=null ? M(fmt(total,0)+'원') : '—')+'</div>'+
+      dayHtml(dayLbl+' '+M(amtHtml(dayDiff)))+'</div>'+
     '<div class="bx"><div class="muted">변동</div><div class="v '+(diff!=null?cls(diff):'')+'">'+
-      (diff!=null ? amtHtml(diff)+'<span class="pct">'+sign(pct)+'%</span>' : '—')+'</div>'+
+      (diff!=null ? M(amtHtml(diff))+'<span class="pct">'+sign(pct)+'%</span>' : '—')+'</div>'+
       dayHtml(dayLbl+' '+sign(dayPp)+'%p')+'</div>';
   // 비중은 선택한 기준의 평가금액 — 값이 움직이면 막대도 따라 움직인다. 아직 못 구했으면 원금 기준.
   const base = (total != null && total > 0) ? total : cost;
@@ -3453,22 +3566,23 @@ function pfRender(){
     const w = base > 0 ? Math.min(100, mine / base * 100) : 0;
     const d = r.val != null ? r.val - r.cost : null;
     const p = (d != null && r.cost > 0) ? d / r.cost * 100 : null;
-    return '<div class="pfrow">'+
-      '<div class="nm"><a href="?code='+esc(r.h.code)+'" title="'+esc(r.h.name)+' 상세 보기">'+esc(r.h.name)+'</a>'+
+    return '<div class="pfrow" data-i="'+i+'">'+
+      '<div class="nm">'+(PF.length > 1 ? '<span class="grip" onpointerdown="pfGrip(event)" title="끌어서 순서 변경">≡</span>' : '')+
+        '<a href="?code='+esc(r.h.code)+'" title="'+esc(r.h.name)+' 상세 보기">'+esc(r.h.name)+'</a>'+
         '<span class="act">'+
           '<button type="button" title="수정" onclick="pfOpen('+i+')">'+ICON_EDIT+'</button>'+
           '<button type="button" title="삭제" onclick="pfDel('+i+')">'+ICON_DEL+'</button>'+
         '</span></div>'+
       '<div class="pfbar" title="'+(r.val!=null?bLbl:'원금')+' 기준 비중 '+fmt(w,1)+'%">'+
         '<i style="width:'+w.toFixed(1)+'%"></i><span>'+fmt(w,1)+'%'+
-        (mine!=null ? '<b>('+fmt(mine,0)+')</b>' : '')+'</span></div>'+
-      '<div class="dt"><span class="muted">'+fmt(r.h.qty,0)+'주 · 평균 '+fmt(r.h.avg,dp(r.h.avg))+'원'+
+        (mine!=null && !hide ? '<b>('+fmt(mine,0)+')</b>' : '')+'</span></div>'+
+      '<div class="dt"><span class="muted">'+M(fmt(r.h.qty,0))+'주 · 평균 '+fmt(r.h.avg,dp(r.h.avg))+'원'+
         (r.unit!=null ? ' → '+bLbl+' '+fmt(r.unit,dp(r.unit))+'원' : '')+
         (dayOn && r.dayD != null && !(dayReg && Math.round(r.dayD) === 0)
           ? ' <span class="day '+cls(r.dayD)+'" title="'+esc(dayLbl)+'">'+amtHtml(r.dayD)
           + '<span class="pct">'+sign(r.dayP)+'%</span></span>' : '')+'</span>'+
         '<span class="'+(d!=null?cls(d):'muted')+'">'+
-          (d!=null ? amtHtml(d)+' <span style="font-size:12px">'+sign(p)+'%</span>' : '계산 중…')+'</span>'+
+          (d!=null ? M(amtHtml(d))+' <span style="font-size:12px">'+sign(p)+'%</span>' : '계산 중…')+'</span>'+
       '</div></div>';
   }).join('');
 }
@@ -3662,6 +3776,7 @@ const handler = async (req, res) => {
   }
   if (u.pathname === '/api/pdfinfo') {
     // 하루 한 번만 받아도 되는 자료(구성종목 PDF·차단 기록)의 상태와 수동 초기화
+    const only = codesParam(u.searchParams.get('codes'));
     if (u.searchParams.get('clear') === '1') {
       // 지우는 요청은 POST만 받고 출처를 확인한다 — GET이면 다른 사이트가 <img src>로도 캐시를 비울 수
       // 있고(브라우저가 쿠키를 실어 보낸다), 공개 서버에서는 로그인한 세션이 그대로 쓰인다
@@ -3676,68 +3791,15 @@ const handler = async (req, res) => {
         res.end(JSON.stringify({ error: '다른 출처의 요청입니다' }));
         return;
       }
-      // 차단 기록(blk:)은 남긴다 — 수동 갱신마다 지우면 429로 막힌 운용사를 매번 다시 두드려
-      // 차단이 길어진다(차단 상태에서도 폴백으로 새 자료를 받으므로 갱신은 된다).
-      // codes를 주면 그 종목이 쓴 키만 지운다(pdfkey:<code>에 남겨 둔다) — 화면과 무관한 종목의
-      // 자료를 함께 날리지 않는다. codes가 없으면 종전처럼 전부 비운다.
-      const only = (u.searchParams.get('codes') || '').split(',').filter(c => /^[0-9A-Z]{6}$/.test(c));
-      let n = 0, miss = 0;
-      if (only.length) {
-        for (const c of only) {
-          const keys = pdfKeysOf(c);
-          if (!keys.length) { miss++; continue; } // 아직 한 번도 계산하지 않은 종목
-          for (const k of keys) if (cache.delete(k)) n++; // 거쳐 온 출처를 모두 비운다
-          // pdfset(전일 구성 기록)은 남긴다 — 리밸런싱 비교 기준이라 지우면 편입·편출을 못 잡는다
-        }
-      } else {
-        for (const k of [...cache.keys()]) if (k.startsWith('pdf:')) { cache.delete(k); n++; }
-      }
-      saveCache();
-      send(req, res, JSON.stringify({ cleared: n, miss, scope: only.length ? 'codes' : 'all' }), JSON_T);
+      send(req, res, JSON.stringify(pdfClear(only)), JSON_T);
       return;
     }
-    // 건수는 아직 유효한 자료만 센다(만료분·폴백 중복은 '자료 건수'일 뿐 종목 수가 아니다).
-    // 기준일은 원본 응답이 아니라 정규화해 둔 pdfset에서 읽는다 — 어댑터마다 필드 이름이 달라
-    // 원본을 그대로 읽으면 일부 운용사가 빠진다(Codex 지적).
-    // codes를 주면 그 종목이 쓰는 자료만 센다 — 안 주면 과거에 조회한 종목까지 합쳐져
-    // 화면에 없는 종목 때문에 '지난 기준일 N종목'이 뜬다
-    const only = (u.searchParams.get('codes') || '').split(',').filter(c => /^[0-9A-Z]{6}$/.test(c));
-    const wanted = only.length ? new Set(only.flatMap(c => pdfKeysOf(c))) : null;
-    const items = [];
-    for (const [k, v] of cache) {
-      if (!k.startsWith('pdf:')) continue;
-      if (wanted && !wanted.has(k)) continue;
-      const alive = Date.now() - v.ts < pdfTtlFor(v.data, v.ts);
-      items.push({ at: v.ts, stdDt: pdfStdDt(v.data) || null, alive });
-    }
-    const live = items.filter(x => x.alive);
-    const sets = [...cache.entries()]
-      .filter(([k]) => k.startsWith('pdfset:') && (!only.length || only.includes(k.slice(7))))
-      .map(([, v]) => fxKeyD(v.data?.d)).filter(x => x.length === 8);
-    const dates = [...new Set(sets)].sort();
-    const stale = sets.filter(d => d < todayYmd()).length; // 종목별로 센다(중복 제거는 표시용 dates에만)
-    const blocked = [...cache.keys()].filter(k => k.startsWith('blk:') && issuerBlocked(k.slice(4))).map(k => k.slice(4));
-    send(req, res, JSON.stringify({
-      count: live.length, total: items.length,
-      oldest: live.length ? Math.min(...live.map(x => x.at)) : null,
-      newest: live.length ? Math.max(...live.map(x => x.at)) : null,
-      dates, stale, retrying: pdfRetryTime(), ttlMs: pdfTtl(), marks: PDF_MARKS, blocked,
-      scope: only.length ? 'codes' : 'all',
-    }), JSON_T);
+    send(req, res, JSON.stringify(pdfStatus(only)), JSON_T);
     return;
   }
   if (u.pathname === '/api/px') {
-    // ETF 자체 시세만 — 구성종목을 훑지 않으므로 포트폴리오 현재가를 종목 화면과 같은 주기로 갱신할 수 있다
     try {
-      const codes = (u.searchParams.get('codes') || '').split(',')
-        .filter(c => /^[0-9A-Z]{6}$/.test(c)).slice(0, 30);
-      const q = codes.length ? await krQuotes(codes) : {};
-      const ref = dayRef();
-      send(req, res, JSON.stringify(Object.fromEntries(codes.map(c =>
-        [c, q[c] ? { price: q[c].last, prev: q[c].prevClose,
-          // 어제 대비의 기준 종가와 그 라벨(오늘 종가보다 / 어제보다 / 금요일보다 / 직전 거래일보다)
-          base: ref.useReg ? q[c].regClose : q[c].prevClose, dayLabel: ref.label, dayReg: ref.useReg,
-          session: q[c].session } : null]))), JSON_T);
+      send(req, res, JSON.stringify(await pxOf(codesParam(u.searchParams.get('codes')).slice(0, 30))), JSON_T);
     } catch (e) {
       console.error('/api/px 실패:', e.message);
       res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -3769,8 +3831,8 @@ const handler = async (req, res) => {
 
 // 안드로이드에서는 HTTP 서버가 없다 — 페이지가 이 함수들을 직접 부른다(에셋 index.html의 fetch shim).
 if (!NODE) {
-  globalThis.ENGINE = { computeINav, etfList, marketQuotes, krQuotes, stats, cache, saveCache, dayRef,
-    issuerBlocked, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, pdfKeysOf, fxKeyD, PDF_MARKS, krSession, todayYmd, DEFAULT_CODE };
+  // 브리지가 실제로 부르는 것만 내놓는다 — 라우트 로직은 위의 공용 함수에 있다
+  globalThis.ENGINE = { computeINav, etfList, marketQuotes, stats, codesParam, pdfClear, pdfStatus, pxOf, DEFAULT_CODE };
 } else {
 
 // async 핸들러가 던지면 unhandled rejection으로 프로세스가 죽는다 — 요청 하나로 서비스가 내려간다.
@@ -3791,6 +3853,6 @@ if (require.main === module) {
     try { fs.writeFileSync(__dirname + '/server.pid', String(process.pid)); } catch (e) {}
   });
 }
-module.exports = { server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, dropBadPdf, krSession, quoteSession, omOffHours, resolveTicker, idxSettled, fxMarketOpen, spotFirst, KR_PREOPEN, dayRef, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, resolveNavRef, nearestFxDate, parseMinClose, needRegFix, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
+module.exports = { keepOnLoad, bizStep, navTargetD, dig8, codesParam, pdfClear, pdfStatus, pxOf, server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, dropBadPdf, krSession, quoteSession, omOffHours, resolveTicker, idxSettled, fxMarketOpen, spotFirst, KR_PREOPEN, dayRef, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, resolveNavRef, nearestFxDate, parseMinClose, needRegFix, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
 
 }

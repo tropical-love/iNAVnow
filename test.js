@@ -3,8 +3,11 @@
 // 인증(auth.js)은 공개 서버 전용이라 GitHub 배포판에는 없다 — 파일이 있을 때만 검사한다.
 const assert = require('assert');
 const http = require('http');
+const fs = require('fs'), path = require('path'), vm = require('vm');
 
 process.env.ETF_PASS = 'testpass';
+// 실제 cache.json 대신 임시 파일 — 실행 중인 로컬 서버의 캐시를 테스트 상태로 덮어쓰지 않게
+process.env.ETF_CACHE_FILE = require('path').join(require('os').tmpdir(), `inav-test-cache-${process.pid}.json`);
 const S = require('./server.js');
 let A = null;
 try { A = require('./auth.js'); } catch (e) { if (e.code !== 'MODULE_NOT_FOUND') throw e; }
@@ -62,7 +65,7 @@ if (A) {
     S.noteKrStatus('CLOSE');
     assert.strictEqual(S.krSession(), '휴장', '평일 본장 시간대 CLOSE인데 휴장이 아니다');
     // 라벨만이 아니라 날짜 계산도: 오늘이 공휴일이면 isKrBiz(오늘)도 거짓이어야
-    // targetDt·nextBizYmd가 존재하지 않는 오늘 기준가를 목표로 삼지 않는다
+    // navTargetD·bizStep이 존재하지 않는 오늘 기준가를 목표로 삼지 않는다
     assert.strictEqual(S.isKrBiz(today), false, '공휴일 판정 후에도 isKrBiz(오늘)이 참이다');
     S.noteKrStatus('OPEN');
     assert.strictEqual(S.krSession(), '본장');
@@ -261,6 +264,41 @@ if (A) {
 }
 
 {
+  // 디스크 캐시가 끝없이 자라지 않아야 한다 — 키에 날짜가 들어가는 항목은 날마다 새로 생긴다
+  // (실측 2026-10-12: 만료된 정규장 종가 캐시 1,204개가 cache.json에 남아 1MB. 안드로이드 한도는 5MB).
+  const now = Date.parse('2026-10-12T09:00:00+09:00'), day = 86400e3;
+  const ent = (ageDays, ttlDays) => ({ ts: now - ageDays * day, ttl: ttlDays * day, data: 1 });
+  assert.strictEqual(S.keepOnLoad('regfix:005930:20260915', ent(27, 20 / 24), now), false,
+    '하루짜리 정규장 종가를 디스크에서 다시 실었다');
+  assert.strictEqual(S.keepOnLoad('fxfix:USD:20260801', ent(72, 7), now), false, '만료 30일 넘은 날짜 키를 실었다');
+  assert.strictEqual(S.keepOnLoad('fxfix:USD:20261001', ent(11, 7), now), true, '만료 직후 영속 키는 남는다');
+  assert.strictEqual(S.keepOnLoad('pdfset:069500', ent(20, 30), now), true);
+  assert.strictEqual(S.keepOnLoad('ba:069500', ent(1, 0.01), now), false, '만료된 단기 시세를 실었다');
+  ok('디스크 캐시는 만료된 지 30일 지난 영속 키와 만료된 단기 키를 다시 싣지 않는다');
+}
+
+{
+  // 안드로이드 엔진(engine.js = server.js 그대로)을 브라우저처럼 띄워, 앱 브리지가 부르는 함수가 실제로
+  // 있고 돈다는 걸 확인한다. 예전엔 브리지가 pdfinfo·px 로직을 한 벌 더 갖고 있어 두 곳을 손으로 맞췄다.
+  const store = {};
+  const ctx = { console, TextDecoder, URL, URLSearchParams, setTimeout, clearTimeout,
+    localStorage: { getItem: k => store[k] ?? null, setItem: (k, v) => { store[k] = v; }, removeItem: k => { delete store[k]; } } };
+  ctx.globalThis = ctx;
+  vm.createContext(ctx);
+  vm.runInContext(fs.readFileSync(path.join(__dirname, 'server.js'), 'utf8'), ctx, { filename: 'engine.js' });
+  const E = ctx.ENGINE;
+  const used = [...new Set([...fs.readFileSync(path.join(__dirname, 'tools', 'build-android.js'), 'utf8')
+    .matchAll(/ENGINE\.(\w+)/g)].map(m => m[1]))];
+  const missing = used.filter(k => !(k in E));
+  assert.deepStrictEqual(missing, [], `앱 브리지가 부르는데 엔진에 없는 함수: ${missing.join(', ')}`);
+  assert.deepStrictEqual([...E.codesParam('069500,xx,0100K0,')], ['069500', '0100K0']);
+  assert.deepStrictEqual(Object.keys(E.pdfStatus([])).sort(),
+    ['blocked', 'count', 'dates', 'marks', 'newest', 'oldest', 'retrying', 'scope', 'stale', 'total', 'ttlMs']);
+  assert.strictEqual(E.pdfClear(['069500']).miss, 1, '계산한 적 없는 종목은 지울 게 없다고 답해야 한다');
+  ok('안드로이드 엔진이 브라우저 환경에서 뜨고, 앱 브리지가 부르는 함수가 모두 있다');
+}
+
+{
   // 해외 종목이 하나뿐인 ETF(채권혼합형)는 역산 환율의 산포로 기준일을 가를 수 없다.
   // 그때는 역산값을 그날 실제 환율과 대조해 고른다 — 못 가르면 기준환율이 통째로 어긋난다
   // (실측 2026-09-15 PLUS SK하이닉스샌디스크채권혼합50: 1,290.89가 잡혀 환율 변동 +5.5%).
@@ -358,6 +396,17 @@ if (A) {
     assert.strictEqual(at(17, 3, 0).label, '금요일보다', '월요일 새벽도 금요일이 기준이다');
     assert.strictEqual(at(17, 10, 0).label, '금요일보다', '월요일 장중도 금요일이 기준이다');
     assert.strictEqual(at(17, 17, 0).label, '오늘 종가보다', '월요일 마감 뒤에는 그날 종가가 기준이다');
+    // 같은 달력으로 거래일 이동과 기준 NAV 목표일도 본다 — 예전엔 computeINav 안에 묻혀 있어 검사가 없었다
+    assert.strictEqual(S.bizStep('20260814', +1), '20260817', '금요일 다음 거래일이 월요일이 아니다');
+    assert.strictEqual(S.bizStep('20260817', -1), '20260814', '월요일 전 거래일이 금요일이 아니다');
+    assert.strictEqual(S.bizStep('20260812', -1), '20260811');
+    assert.strictEqual(S.navTargetD(K(12, 8, 59)), '20260811', '09시 전엔 전 영업일 기준가가 목표다');
+    assert.strictEqual(S.navTargetD(K(12, 9, 0)), '20260812', '09시부터는 당일 기준가가 목표다');
+    assert.strictEqual(S.navTargetD(K(12, 18, 0)), '20260812', '마감 뒤에도 같은 날짜(잠정 프레임)다');
+    assert.strictEqual(S.navTargetD(K(15, 12, 0)), '20260814', '토요일 목표는 금요일이다');
+    assert.strictEqual(S.navTargetD(K(17, 8, 0)), '20260814', '월요일 개장 전 목표는 금요일이다');
+    assert.strictEqual(S.dig8('2026.09.16'), '20260916');
+    assert.strictEqual(S.dig8('2026-09-16T00:00'), '20260916');
 
     // 어느 값을 기준으로 쓰는가 — 여기가 자정에 하루 어긋나던 자리다.
     // 네이버의 '전일 종가'는 자정이 지나도 한동안 그 전날을 가리킨다(실측 2026-08-13 00:04:
@@ -829,5 +878,9 @@ if (A) {
   }
 
   console.log(`\n${n}개 검사 통과`);
-  process.exit(0);
+  // process.exit(0)으로 끊지 않는다 — 로컬 테스트 서버로 맺은 연결이 닫히는 도중에 끊으면 Windows의
+  // Node가 'UV_HANDLE_CLOSING' assert로 죽어 다 통과하고도 종료 코드가 127이 된다(공개 저장소에서 10/10 재현).
+  // 연결이 정리되면 저절로 끝난다. 혹시 무언가 붙잡고 있으면 10초 뒤 강제로 끝낸다.
+  setTimeout(() => process.exit(0), 10e3).unref();
 })().catch(e => { console.error('\n실패:', e.message); process.exit(1); });
+process.on('exit', () => { try { require('fs').unlinkSync(process.env.ETF_CACHE_FILE); } catch (e) {} });

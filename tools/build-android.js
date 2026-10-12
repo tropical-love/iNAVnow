@@ -72,57 +72,12 @@ const SHIM = BRIDGE + `<script src="engine.js"></script>
       if(s.startsWith('/api/inav'))  return J(await ENGINE.computeINav(q.get('code') || ENGINE.DEFAULT_CODE));
       if(s.startsWith('/api/etfs'))  return J(await ENGINE.etfList());
       if(s.startsWith('/api/market'))return J(await ENGINE.marketQuotes());
-      if(s.startsWith('/api/pdfinfo')){ // 하루치 자료 상태 / 수동 초기화
-        const C = ENGINE.cache;
-        if(q.get('clear') === '1'){
-          // 차단 기록은 남기고, codes를 주면 그 종목이 쓴 키만 지운다(서버 라우트와 같은 규칙)
-          const only = (q.get('codes')||'').split(',').filter(function(c){ return /^[0-9A-Z]{6}$/.test(c); });
-          let n = 0, miss = 0;
-          if(only.length){
-            only.forEach(function(c){
-              const keys = ENGINE.pdfKeysOf(c);
-              if(!keys.length){ miss++; return; }
-              keys.forEach(function(k){ if(C.delete(k)) n++; }); // 거쳐 온 출처를 모두 비운다
-              // pdfset(전일 구성 기록)은 남긴다 — 리밸런싱 비교 기준이다
-            });
-          } else {
-            for(const k of [...C.keys()]) if(k.startsWith('pdf:')){ C.delete(k); n++; }
-          }
-          ENGINE.saveCache();
-          return J({cleared: n, miss: miss, scope: only.length ? 'codes' : 'all'});
-        }
-        // codes를 주면 그 종목 범위만 센다(서버 라우트와 같은 규칙)
-        const scope = (q.get('codes')||'').split(',').filter(function(c){ return /^[0-9A-Z]{6}$/.test(c); });
-        const wanted = scope.length ? new Set([].concat.apply([], scope.map(function(c){ return ENGINE.pdfKeysOf(c); }))) : null;
-        const items = [];
-        const live = [];
-        for(const [k, v] of C) if(k.startsWith('pdf:') && (!wanted || wanted.has(k))){
-          items.push(v.ts);
-          if(Date.now() - v.ts < ENGINE.pdfTtlFor(v.data, v.ts)) live.push(v.ts);
-        }
-        const sets = [...C.entries()]
-          .filter(function(e){ return e[0].startsWith('pdfset:') && (!scope.length || scope.indexOf(e[0].slice(7)) >= 0); })
-          .map(function(e){ return ENGINE.fxKeyD(e[1].data && e[1].data.d); }).filter(function(x){ return x.length === 8; });
-        const dates = [...new Set(sets)].sort();
-        const blocked = [...C.keys()].filter(function(k){ return k.startsWith('blk:') && ENGINE.issuerBlocked(k.slice(4)); }).map(function(k){ return k.slice(4); });
-        return J({
-          count: live.length, total: items.length,
-          oldest: live.length ? Math.min.apply(null, live) : null,
-          newest: live.length ? Math.max.apply(null, live) : null,
-          dates: dates, retrying: ENGINE.pdfRetryTime(), stale: sets.filter(function(d){ return d < ENGINE.todayYmd(); }).length, // 종목별로 센다
-          ttlMs: ENGINE.pdfTtl(), marks: ENGINE.PDF_MARKS, blocked: blocked, scope: scope.length ? 'codes' : 'all',
-        });
+      // pdfinfo·px는 서버 라우트와 같은 엔진 함수를 부른다 — 로직을 여기에 다시 쓰지 않는다
+      if(s.startsWith('/api/pdfinfo')){
+        const only = ENGINE.codesParam(q.get('codes'));
+        return J(q.get('clear') === '1' ? ENGINE.pdfClear(only) : ENGINE.pdfStatus(only));
       }
-      if(s.startsWith('/api/px')){ // ETF 자체 시세만 (포트폴리오 현재가 빠른 갱신)
-        const cs = (q.get('codes')||'').split(',').filter(function(c){ return /^[0-9A-Z]{6}$/.test(c); }).slice(0,30);
-        const m = cs.length ? await ENGINE.krQuotes(cs) : {};
-        const ref = ENGINE.dayRef(); // 어제 대비의 기준 종가·라벨(서버 라우트와 같은 규칙)
-        return J(Object.fromEntries(cs.map(function(c){
-          return [c, m[c] ? {price:m[c].last, prev:m[c].prevClose,
-            base: ref.useReg ? m[c].regClose : m[c].prevClose, dayLabel: ref.label, dayReg: ref.useReg,
-            session:m[c].session} : null];
-        })));
-      }
+      if(s.startsWith('/api/px')) return J(await ENGINE.pxOf(ENGINE.codesParam(q.get('codes')).slice(0, 30)));
       if(s.startsWith('/api/stats')) return J(ENGINE.stats);
       if(s.startsWith('/api/pf'))    return E('이 앱은 포트폴리오를 기기에 저장합니다', 404); // 로컬 저장으로 유도
     } catch(e){ return E(e.message); }
