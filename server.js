@@ -511,10 +511,13 @@ const ADAPTERS = {
       if (!f) throw new Error(`KODEX 목록에 ${stockCode} 없음`);
       const d = await pdfCached(stockCode, `pdf:kodex:${f.fId}`, () =>
         getJson(`https://www.samsungfund.com/api/v1/kodex/product-pdf/${f.fId}.do?gijunYMD=${todayYmd('.')}`));
+      const isCash = r => /^(CASH|KRD)/.test(r.itmNo || '') || r.ratio == null;
       return {
         fundNm: f.fNm, stdDt: d.pdf.gijunYMD,
+        // 현금(예금·미수미지급)은 종목이 아니라 목록에서 빼지만, 기준 NAV 검사에는 필요하다 — resolveNavRef 참고
+        cashAm: d.pdf.list.filter(isCash).reduce((s, r) => s + (parseFloat(String(r.evalA).replace(/,/g, '')) || 0), 0),
         list: d.pdf.list
-          .filter(r => !/^(CASH|KRD)/.test(r.itmNo || '') && r.ratio != null)
+          .filter(r => !isCash(r))
           .map(r => ({
             jm: (r.itmNo || '').replace(/ Equity$/i, ''), name: r.secNm,
             qty: parseFloat(String(r.applyQ).replace(/,/g, '')),
@@ -1311,17 +1314,26 @@ function notePdfSet(stockCode, pdf) {
   return { added: added.map(nameOf), removed, from: prev.d, to: cur.d };
 }
 
-function resolveNavRef(analysis, pdfList, extraNavs) {
+function resolveNavRef(analysis, pdfList, extraNavs, cashAm) {
   const nav = analysis.nav;
-  const total = pdfList.reduce((s, r) => s + (r.valAm || 0), 0);
-  if (!nav || !total) return { navRef: nav, adjusted: false };
-  // 국내 선물·옵션(ISIN KR4…)이 있으면 그 평가금액은 순자산이 아니라 계약 명목금액이라 'PDF 총액 = 기준NAV × CU'가
-  // 성립하지 않는다. 그 총액으로 공식 NAV를 '복구'하면 엉뚱한 값이 된다(실측 2026-10-12 KODEX 삼성전자채권혼합
-  // 448330: 선물 명목 1.14억이 더해져 CU 103,876 → 기준 NAV를 17,485.04에서 18,166으로 바꿔 괴리율 -3.65%.
-  // 명목을 빼고 현금을 더하면 정확히 17,485.04 × 10만 주다). 이때는 공식 NAV를 손대지 않는다.
-  if (pdfList.some(r => /^KR4/.test(r.jm || ''))) return { navRef: nav, adjusted: false };
+  const listed = pdfList.reduce((s, r) => s + (r.valAm || 0), 0);
+  if (!nav || !listed) return { navRef: nav, adjusted: false };
+  // 국내 선물·옵션(ISIN KR4…)의 평가금액은 순자산이 아니라 계약 명목금액이다. 그대로 더하면 'PDF 총액 = 기준NAV × CU'가
+  // 깨져 공식 NAV를 엉뚱하게 '복구'한다(실측 2026-10-12 KODEX 삼성전자채권혼합 448330: 선물 명목 1.14억이 더해져
+  // 기준 NAV를 17,485.04에서 18,166으로 바꿔 괴리율 -3.65%). 명목을 빼고 현금을 더하면 정확히 17,485.04 × 10만 주다.
+  // 그래서 현금을 알 때는 명목을 빼고 재고, 모를 때는 검사할 수 없으니 공식 NAV를 손대지 않는다.
+  const deriv = pdfList.reduce((s, r) => s + (/^KR4/.test(r.jm || '') ? r.valAm || 0 : 0), 0);
   const d1 = analysis.navPerformanceList?.find(x => x.periodTypeCode === 'D1')?.value;
-  const share = pdfShare(pdfList, analysis);
+  // 목록이 현금 말고 전부를 담고 어댑터가 현금 합계를 알려 주면 '목록 + 현금 = 기준NAV × CU'가 정확히 선다.
+  // 현금을 빼고 비중 합(share)으로 나누면 현금 비중만큼 기울어 하루 묵은 NAV가 검사를 통과한다
+  // (실측 2026-10-13 08:55 KODEX 전고체배터리ESS TOP2플러스: 현금 -760만(-1.7%). 빼고 재면 묵은 9,268.32가
+  //  오차 0.45%로 통과해 괴리율 -2.03%. 더하면 묵은 값은 2.1% 어긋나고 맞는 값 9,074는 CU 50,000에 딱 맞는다).
+  // 그 밖의 경우(현금을 모르거나 목록이 일부만 담는 채권혼합 등)는 종전처럼 비중 합으로 나눈다.
+  const pShare = pdfShare(pdfList, analysis);
+  const withCash = Number.isFinite(cashAm) && pShare > 0.98;
+  if (deriv && !withCash) return { navRef: nav, adjusted: false };
+  const total = withCash ? listed - deriv + cashAm : listed;
+  const share = withCash ? 1 : pShare;
 
   // 후보를 CU 역산 오차로 채점: ① nav 그대로 ② 전영업일 수익률로 하루 굴린 값(지연 가설) ③ 호출측이 준 최신 후보
   const cands = [{ nav, adjusted: false }];
@@ -1888,7 +1900,7 @@ async function computeINav(stockCode, depth = 0) {
   // 다르면 igNav를 후보에 넣어 다시 채점하고, 현재 바스켓과 라운드로 맞아떨어지는 쪽을 쓴다.
   const targetD = navTargetD();
   const nextBizYmd = b => dotYmd(bizStep(b, +1)); // basis 다음 거래일 — 그 basis와 짝이 되는 NAV 날짜
-  let navInfo = resolveNavRef(analysis, pdf.list);
+  let navInfo = resolveNavRef(analysis, pdf.list, [], pdf.cashAm);
   let navRefDateOut = analysis.navPerformanceReferenceDate;
   const ig0 = await integrationOf(stockCode).catch(() => null);
   const igNavG = igNum(ig0, 'nav') || null;
@@ -1926,7 +1938,7 @@ async function computeINav(stockCode, depth = 0) {
   const basketCurrent = !targetBasis || !curBasis0 || curBasis0 >= targetBasis;
   if (basketCurrent && refNavAlt && (!navInfo.cuShares || Math.abs(refNavAlt / navInfo.navRef - 1) > 0.02)) {
     if (pdfHasValAm) {
-      const retry = resolveNavRef(analysis, pdf.list, [refNavAlt]);
+      const retry = resolveNavRef(analysis, pdf.list, [refNavAlt], pdf.cashAm);
       if (retry.fresh) {
         navInfo = { ...retry, staleNav: analysis.nav, prov: true };
         if (curBasis0) navRefDateOut = nextBizYmd(curBasis0);

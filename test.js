@@ -349,6 +349,27 @@ if (A) {
   const withFut = S.resolveNavRef(withD1(17485.04, -0.77), mixed, []);
   assert.strictEqual(withFut.adjusted, false, `선물 명목이 든 PDF로 공식 NAV를 고쳤다: ${withFut.navRef}`);
   assert.strictEqual(withFut.navRef, 17485.04);
+  // 현금을 알면 명목을 빼고 정확히 잴 수 있다 — 공식 NAV가 맞으면 그대로, 하루 묵었으면 잡아낸다
+  const futCash = 46278166;
+  const okNav = S.resolveNavRef(withD1(17485.04, -0.77), mixed, [], futCash);
+  assert.strictEqual(okNav.adjusted, false, `맞는 공식 NAV를 고쳤다: ${okNav.navRef}`);
+  assert.strictEqual(okNav.cuShares, 100000, '명목을 빼고 현금을 더했는데 CU 10만에 안 맞는다');
+  const staleFut = S.resolveNavRef(withD1(17485.04 / (1 - 0.0077), -0.77), mixed, [], futCash);
+  assert.strictEqual(staleFut.adjusted, true, '선물이 든 ETF에서 하루 묵은 기준 NAV를 못 잡았다');
+  assert.ok(Math.abs(staleFut.navRef / 17485.04 - 1) < 0.001, `복구값이 어긋난다: ${staleFut.navRef}`);
+
+  // 현금을 빼고 재면 현금 비중만큼 기울어 묵은 NAV가 검사를 통과한다 — 어댑터가 넘긴 현금 합계를 더해야 한다
+  // (실측 2026-10-13 08:55 KODEX 전고체배터리ESS TOP2플러스: 현금 -760만. 빼고 재면 묵은 9,268.32가 통과해
+  //  괴리율 -2.03%. 더하면 전영업일 굴림 9,073.69가 CU 50,000에 딱 맞는다. KRX 마감 iNAV 9,075.21)
+  const ess = [['373220', 118206000, 25.62], ['006400', 111639000, 24.2], ['457190', 47123700, 10.22],
+    ['078600', 35794200, 7.76], ['020150', 33961200, 7.36], ['091580', 23662600, 5.13], ['003670', 23010000, 4.99],
+    ['178320', 22508500, 4.88], ['107640', 18009500, 3.9], ['066970', 15286700, 3.31], ['222080', 12094650, 2.62]]
+    .map(([jm, valAm, wg]) => ({ jm, valAm, wg }));
+  const essNav = S.resolveNavRef(withD1(9268.32, -2.1), ess, [], -7605255);
+  assert.strictEqual(essNav.adjusted, true, '현금을 더했는데도 하루 묵은 기준 NAV를 그대로 썼다');
+  assert.ok(Math.abs(essNav.navRef / 9075.21 - 1) < 0.001, `기준 NAV 복구값이 마감 iNAV와 어긋난다: ${essNav.navRef}`);
+  // 값이 이미 갱신됐으면(9,074대) 손대지 않는다
+  assert.strictEqual(S.resolveNavRef(withD1(9073.8, -2.1), ess, [], -7605255).adjusted, false);
   ok('기준 NAV가 하루 묵었는지를 PDF 총액 ÷ 설정단위가 정확히 떨어지는지로 가린다');
 }
 
