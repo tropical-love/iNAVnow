@@ -380,13 +380,13 @@ if (A) {
   {
     const KST3 = (d, h, mi) => Date.UTC(2026, 7, d, h - 9, mi); // 2026-08-11(화) 기준
     assert.strictEqual(S.idxSettled(KST3(11, 15, 31)), false, '마감 직후 값을 확정 종가로 굳힌다');
-    assert.strictEqual(S.idxSettled(KST3(11, 15, 45)), false, '종가가 확정되기 전에 굳힌다');
-    assert.strictEqual(S.idxSettled(KST3(11, 16, 0)), true, '확정 시각이 지났는데도 계속 다시 받는다');
+    assert.strictEqual(S.idxSettled(KST3(11, 15, 39)), false, '종가가 확정되기 전에 굳힌다');
+    assert.strictEqual(S.idxSettled(KST3(11, 15, 40)), true, '확정 시각(15:40)이 지났는데도 계속 다시 받는다');
     assert.strictEqual(S.idxSettled(KST3(11, 23, 0)), true, '밤에도 지수를 다시 받는다');
     assert.strictEqual(S.idxSettled(KST3(12, 8, 30)), true, '개장 전에는 전일 종가가 최종이다');
     assert.strictEqual(S.idxSettled(KST3(11, 13, 0)), false, '장중에는 굳혀선 안 된다');
     assert.strictEqual(S.idxSettled(KST3(15, 13, 0)), true, '주말은 다시 받을 이유가 없다'); // 8/15 토
-    ok('지수 종가는 확정 시각(16:00) 이후에만 고정하고, 마감 직후에는 다시 받는다');
+    ok('지수 종가는 확정 시각(15:40) 이후에만 고정하고, 마감 직후에는 다시 받는다');
   }
 
   // ---------- 3c-2c. 레버리지 장외 굴림은 프리마켓에 현물을 먼저 본다 ----------
@@ -418,7 +418,8 @@ if (A) {
     const at = (d, h, mi) => S.dayRef(K(d, h, mi));
     // 라벨
     assert.strictEqual(at(12, 13, 0).label, '어제보다', '장중 기준은 직전 거래일 종가다');
-    assert.strictEqual(at(12, 15, 45).label, '어제보다', '15:45에는 종가가 아직 확정 전이다');
+    assert.strictEqual(at(12, 15, 39).label, '어제보다', '시간외 시작(15:40) 전에는 아직 장중 기준이다');
+    assert.strictEqual(at(12, 15, 40).label, '오늘 종가보다', '15:40부터는 오늘 종가가 기준이다');
     assert.strictEqual(at(12, 16, 30).label, '오늘 종가보다', '마감 뒤인데 어제를 기준으로 본다');
     assert.strictEqual(at(12, 23, 59).label, '오늘 종가보다', '자정 전까지는 오늘 종가가 기준이다');
     assert.strictEqual(at(13, 0, 4).label, '어제보다', '자정을 넘기면 어제가 된다');
@@ -447,7 +448,8 @@ if (A) {
     assert.strictEqual(at(13, 0, 4).useReg, true, '자정 직후에 전일 종가를 쓰면 기준이 하루 밀린다');
     assert.strictEqual(at(13, 8, 31).useReg, true, '프리장에도 정규장 종가가 직전 거래일 종가다');
     assert.strictEqual(at(13, 10, 0).useReg, false, '장중에는 진행 중인 오늘 값을 기준으로 쓰면 안 된다');
-    assert.strictEqual(at(13, 15, 45).useReg, false, '종가 확정 전에는 전일 종가가 기준이다');
+    assert.strictEqual(at(13, 15, 39).useReg, false, '시간외 시작 전에는 전일 종가가 기준이다');
+    assert.strictEqual(at(13, 15, 40).useReg, true, '15:40부터는 오늘 정규장 종가가 기준이다');
     assert.strictEqual(at(13, 16, 30).useReg, true, '마감 뒤에는 오늘 종가를 기준으로 써야 한다');
     assert.strictEqual(at(15, 12, 0).useReg, true, '주말에는 정규장 종가가 곧 금요일 종가다');
     assert.strictEqual(at(17, 3, 0).useReg, true, '월요일 새벽도 마찬가지다');
