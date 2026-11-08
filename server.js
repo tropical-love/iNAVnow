@@ -1320,11 +1320,14 @@ function resolveNavRef(analysis, pdfList, extraNavs, cashAm) {
   const nav = analysis.nav;
   const listed = pdfList.reduce((s, r) => s + (r.valAm || 0), 0);
   if (!nav || !listed) return { navRef: nav, adjusted: false };
-  // 국내 선물·옵션(ISIN KR4…)의 평가금액은 순자산이 아니라 계약 명목금액이다. 그대로 더하면 'PDF 총액 = 기준NAV × CU'가
+  // 국내 선물(ISIN KR4…, 이름에 '선물')의 평가금액은 순자산이 아니라 계약 명목금액이다. 그대로 더하면 'PDF 총액 = 기준NAV × CU'가
   // 깨져 공식 NAV를 엉뚱하게 '복구'한다(실측 2026-10-12 KODEX 삼성전자채권혼합 448330: 선물 명목 1.14억이 더해져
   // 기준 NAV를 17,485.04에서 18,166으로 바꿔 괴리율 -3.65%). 명목을 빼고 현금을 더하면 정확히 17,485.04 × 10만 주다.
   // 그래서 현금을 알 때는 명목을 빼고 재고, 모를 때는 검사할 수 없으니 공식 NAV를 손대지 않는다.
-  const deriv = pdfList.reduce((s, r) => s + (/^KR4/.test(r.jm || '') ? r.valAm || 0 : 0), 0);
+  // 옵션은 다르다 — 평가액이 프리미엄(실제 가치)이라 순자산에 들어가는 게 맞다. 옵션까지 막으면 커버드콜 ETF는
+  // 묵은 NAV 검사를 통째로 건너뛴다(실측 2026-11-09 08:47 KIWOOM 코스닥150커버드콜액티브: 평가액 -8원짜리 콜옵션
+  // 하나 때문에 묵은 6,272.11을 그대로 써 괴리율 -4.66%. 검사했으면 굴린 값 5,942가 CU 50,000에 0.012%로 맞는다).
+  const deriv = pdfList.reduce((s, r) => s + (/^KR4/.test(r.jm || '') && /선물/.test(r.name || '') ? r.valAm || 0 : 0), 0);
   const d1 = analysis.navPerformanceList?.find(x => x.periodTypeCode === 'D1')?.value;
   // 목록이 현금 말고 전부를 담고 어댑터가 현금 합계를 알려 주면 '목록 + 현금 = 기준NAV × CU'가 정확히 선다.
   // 현금을 빼고 비중 합(share)으로 나누면 현금 비중만큼 기울어 하루 묵은 NAV가 검사를 통과한다
@@ -1852,6 +1855,24 @@ async function computeINav(stockCode, depth = 0) {
   const fx = Object.fromEntries(fxCurs.map((c, i) => [c, fxArr[i]]));
   const yMap = Object.fromEntries(yahooSyms.map((s, i) => [s, yq[i]]));
 
+  // 국내 ETF를 구성종목으로 담은 경우 — ETF는 시간외(NXT 프리·애프터, KRX 애프터마켓)에서 거래되지 않아 장외에는
+  // 정규장 종가에 멈춰 있지만, 그 ETF의 바스켓은 시간외에도 움직인다. 그 ETF를 직접 계산해 나온 장외 변동
+  // (sessContrib)을 종가에 얹어 추정한다(사용자 요청 2026-11-09: KIWOOM 코스닥150커버드콜액티브가 담은
+  // KIWOOM 코스닥150 10.98%가 프리마켓 내내 +0.00%로 남았다).
+  // 최상위 계산에서만 한다(재귀 없음). 레버리지·인버스·합성형은 PDF로 계산하면 안 되므로 뺀다.
+  // 추적이 안 돼 공식 iNAV로 물러난 ETF(채권형 등)는 장외 변동을 모르므로 종가 그대로 둔다.
+  if (depth === 0 && krSession() !== '본장') {
+    const etfCodes = new Set((await etfList().catch(() => [])).map(x => x.code));
+    const held = holdings.filter(h => h.t?.src === 'kr' && h.wg >= 1 && etfCodes.has(h.t.sym)
+      && krMap[h.t.sym]?.regClose > 0 && !/레버리지|인버스|합성/.test(h.name || ''));
+    await Promise.all(held.map(async h => {
+      const sub = await computeINav(h.t.sym, 1).catch(() => null);
+      if (!sub || sub.isOfficial || !Number.isFinite(sub.sessContrib)) return;
+      const q = krMap[h.t.sym];
+      krMap[h.t.sym] = { ...q, last: q.regClose * (1 + sub.sessContrib / 100), session: '추정' };
+    }));
+  }
+
   // 미국 종목: 야후가 휴장인 시간대(주간거래)엔 토스 시세로 대체
   const usHolds = holdings.filter(h => h.t?.src === 'yahoo' && h.t.cur === 'USD'
     && ['휴장', '장마감'].includes(yMap[h.t.sym]?.session)); // 장마감(당일 거래 있었음)도 주간거래 대상
@@ -2178,7 +2199,8 @@ async function computeINav(stockCode, depth = 0) {
     if (sessPct != null && h.t.cur === 'KRW') sessContrib += h.wg * sessPct / 100;
     // 국내 프리장(오늘 정규장 시작 전)엔 '정규장 등락'이 어제종가÷어제종가=0%로 계산되는
     // 무의미한 값 — 데이터 없음(—)으로 표시한다. 미국 프리는 전일 정규장 등락이라 실제 데이터.
-    const noRegYet = h.t.src === 'kr' && q.session === '프리';
+    // 개장 전 추정 ETF도 같다 — 등락은 아직 없고 추정분은 세션 변동 칸에만 나온다.
+    const noRegYet = h.t.src === 'kr' && (q.session === '프리' || (q.session === '추정' && KR_PREOPEN.includes(krSession())));
     return {
       ...base(h), tracked: true, sym: h.t.sym, cur: h.t.cur,
       price: q.last, session: q.session,
@@ -2388,7 +2410,7 @@ const HTML = `<!doctype html>
   td:first-child, th:first-child { text-align: left; max-width: 190px; overflow: hidden; text-overflow: ellipsis; }
   .badge { font-size: 11px; padding: 2px 7px; border-radius: 4px; background: var(--badge); color: var(--badgefg); }
   .badge.b본장, .badge.official { background: var(--greenbg); color: var(--green); }
-  .badge.b프리, .badge.b애프터, .badge.bNXT프리, .badge.bNXT애프터, .badge.b주간, .badge.b시간외, .badge.b시간외프리 { background: var(--amberbg); color: var(--amber); }
+  .badge.b프리, .badge.b애프터, .badge.bNXT프리, .badge.bNXT애프터, .badge.b주간, .badge.b시간외, .badge.b시간외프리, .badge.b추정 { background: var(--amberbg); color: var(--amber); }
   .badge.closed { background: var(--muted); color: var(--card); }
   /* 지수·환율 카드 — 넓으면 한 줄에 4개, 좁으면 2×2 */
   .mkt { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-top: 12px; }
@@ -3186,7 +3208,7 @@ function render(){
   document.getElementById('rows').innerHTML = rows.map(r=>{
     const curFmt = r.cur==='KRW'?'원':(' '+esc(r.cur||''));
     return '<tr><td title="'+esc(r.name)+'">'+esc(r.name)+(r.sym?' <span class="muted">'+esc(r.sym)+'</span>':'')+'</td>'+
-    '<td>'+(r.tracked?'<span class="badge b'+esc(r.session)+'">'+esc(r.session)+'</span>':'<span class="badge">미추적</span>')+'</td>'+
+    '<td>'+(r.tracked?'<span class="badge b'+esc(r.session)+'"'+(r.session==='추정'?' title="ETF는 시간외에 거래되지 않아, 그 ETF 구성종목의 시간외 시세로 추정한 값입니다"':'')+'>'+esc(r.session)+'</span>':'<span class="badge">미추적</span>')+'</td>'+
     '<td>'+(r.tracked?fmt(r.price, r.cur==='JPY'||r.cur==='KRW'?0:2)+curFmt:'—')+'</td>'+
     '<td class="'+cls(r.changePct)+'">'+(r.tracked?(r.changePct==null?'<span class="muted" title="오늘 정규장이 아직 시작 전입니다">—</span>':sign(r.changePct)+'%'):'—')
       + (r.sessPct!=null ? '<div class="sub '+(r.sessPct===0?'muted':cls(r.sessPct))
