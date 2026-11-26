@@ -295,6 +295,13 @@ if (A) {
 
   // 월물 코드 — 야후의 연결 선물 이름에서 읽는다(야후 기준가와 같은 월물을 쓰려고)
   assert.strictEqual(S.futCodeOf('NQ', 'Nasdaq 100 Dec 26'), 'NQZ26');
+  const kst = (d, hm) => Date.parse(d + 'T' + hm + ':00+09:00');
+  assert.strictEqual(S.idxFutCode('01', kst('2026-11-26', '18:01')), 'A01612');
+  assert.strictEqual(S.idxFutCode('06', kst('2026-11-26', '18:01')), 'A06612');
+  assert.strictEqual(S.idxFutCode('01', kst('2026-12-10', '12:00')), 'A01612', '만기일 낮까지는 그 월물');
+  assert.strictEqual(S.idxFutCode('01', kst('2026-12-10', '18:00')), 'A01703', '만기일 저녁부터 다음 월물');
+  assert.strictEqual(S.idxFutCode('01', kst('2026-12-11', '03:00')), 'A01703');
+  assert.strictEqual(S.idxFutCode('01', kst('2026-12-10', '03:00')), 'A01612', '자정 넘긴 세션은 전날 기준');
   assert.strictEqual(S.futCodeOf('NQ', 'Nasdaq 100 Mar 27'), 'NQH27');
   assert.strictEqual(S.futCodeOf('NQ', 'Nasdaq 100'), null, '월물을 모르면 한국투자증권을 부르지 않아야 한다');
   // 현재가 필드 — 공개 문서마다 이름이 다르다

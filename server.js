@@ -1002,9 +1002,10 @@ function calClosedToday(daysSet, fetchedTs, now = Date.now()) {
 async function loadKrDays() {
   // 매번 cached()를 거친다 — 여기서 krDays를 보고 일찍 반환하면 첫 로드 이후 영원히 갱신되지 않아
   // 서버를 며칠 켜두면 달력이 과거에 멈춘다. TTL 안에서는 메모리 Map 히트라 비용이 없다.
-  const days = await cached('krbiz', 6 * 3600e3, async () =>
-    parseKrDays(await getJson('https://query1.finance.yahoo.com/v8/finance/chart/%5EKS11?range=3mo&interval=1d'))
-  ).catch(() => null);
+  const days = await cached('krbiz', 6 * 3600e3, async () => {
+    if (kis) { try { const d = await kisKrDays(); if (d.length > 40) return d; } catch (e) { /* 아래로 */ } }
+    return parseKrDays(await getJson('https://query1.finance.yahoo.com/v8/finance/chart/%5EKS11?range=3mo&interval=1d'));
+  }).catch(() => null);
   if (days && days.length > 40) { // 3개월치(≈60거래일)가 안 오면 직전 성공분 유지
     krDays = new Set(days);
     const v = calClosedToday(krDays, cache.get('krbiz')?.ts ?? 0);
@@ -1140,11 +1141,12 @@ function marketPx(basic, sess = krSession()) {
   };
 }
 
-// 키가 있으면 정규장 ETF 시장가도 한국투자증권 시세로 바꾼다 — 구성종목은 3초마다 새 값인데 ETF 가격만
-// 네이버 30초 캐시에 묶여 있으면 괴리율이 그 사이 엉뚱하게 출렁인다. 실패하면 네이버 값 그대로.
+// 키가 있으면 ETF 시장가도 한국투자증권 시세로 바꾼다(정규장, 마감 뒤 자정까지) — 구성종목은 3초마다 새 값인데
+// ETF 가격만 네이버 30초 캐시에 묶여 있으면 괴리율이 그 사이 엉뚱하게 출렁인다. 실패하면 네이버 값 그대로.
 async function marketPxLive(basic, code) {
   const mp = marketPx(basic);
-  if (!kis || krSession() !== '본장' || mp.over) return mp;
+  const reg = krSession() === '본장';
+  if (!kis || !(reg || needRegFix()) || (reg && mp.over)) return mp;
   const q = (await krQuotes([code]).catch(() => ({})))[code];
   if (!(q?.last > 0 && q.prevClose > 0)) return mp;
   return { ...mp, price: q.last, change: q.last - q.prevClose, changePct: (q.last / q.prevClose - 1) * 100 };
@@ -1231,8 +1233,8 @@ function quoteSession(d, live, nowSess = krSession()) {
 }
 
 async function krQuotes(codes) {
-  // 정규장에 한국투자증권으로 받을 때만 짧게 쥔다 — 네이버로 받는 경우의 주기는 그대로 둔다
-  const fast = kis && krSession() === '본장';
+  // 한국투자증권으로 받는 구간(정규장, 마감 뒤 자정까지)만 짧게 쥔다 — 네이버로 받는 경우의 주기는 그대로 둔다
+  const fast = kis && (krSession() === '본장' || needRegFix());
   return cached(`kr:${codes.join(',')}`, fast ? KIS_QUOTE_TTL : QUOTE_TTL, () => krQuotesRaw(codes));
 }
 // 토스 묶음 조회가 막혀 있는지 — 막혀 있으면 정규장 국내 시세가 네이버 개별 조회로 가므로 추적 상한을 낮춘다
@@ -1251,6 +1253,20 @@ async function krQuotesRaw(codes) {
     }
   };
 
+  // 정규장이 끝난 뒤 자정까지 — 통합(KRX+NXT) 최근 체결가와 전일 종가를 30종목씩 묶어 받는다.
+  // 정규장 종가(15:30 봉)는 종목마다 하루 한 번만 받으면 되므로 아래 분봉 경로(regCloseOf)를 그대로 쓴다.
+  // 세션 이름은 네이버 경로(quoteSession)와 같은 규칙이다 — 15:40~20:00 애프터, 그 밖은 장마감.
+  if (kis && needRegFix()) {
+    try {
+      const k = await kisKrQuotes(codes, 'UN');
+      const sess = krSession() === 'NXT애프터' ? '애프터' : '장마감';
+      await Promise.all(Object.keys(k).map(async c => {
+        const reg = await regCloseOf(c, todayYmd()).catch(() => null);
+        if (reg) out[c] = { last: k[c].last, prevClose: k[c].prevClose, regClose: reg, session: sess };
+      }));
+    } catch (e) { kisLast = { ok: false, error: e.message, at: Date.now() }; }
+    if (codes.every(c => out[c])) return out;
+  }
   if (krSession() === '본장') {
     if (kis) {
       try { Object.assign(out, await kisKrQuotes(codes)); } catch (e) { kisLast = { ok: false, error: e.message, at: Date.now() }; }
@@ -1399,8 +1415,10 @@ function resolveNavRef(analysis, pdfList, extraNavs, cashAm) {
 }
 
 // integration API — 공식 iNAV·거래량이 여기 있다. 한 요청 안에서 여러 경로가 찾으므로 캐시 키를 공유한다.
-const integrationOf = stockCode => cached(`ig:${stockCode}`, 300e3,
-  () => getJson(`https://m.stock.naver.com/api/stock/${stockCode}/integration`));
+// 키가 있으면 ETF 현재가(FHPST02400000)의 nav·acml_vol을 같은 모양으로 바꿔 쓴다(값 일치 확인 2026-11-26).
+const naverIg = stockCode => getJson(`https://m.stock.naver.com/api/stock/${stockCode}/integration`);
+const integrationOf = stockCode => cached(`ig:${stockCode}`, kis ? KIS_QUOTE_TTL : 300e3,
+  () => kis ? kisEtfAsIg(stockCode).catch(() => naverIg(stockCode)) : naverIg(stockCode));
 const igVal = (ig, code) => ig?.totalInfos?.find(t => t.code === code)?.value ?? null;
 // 숫자 항목('9,813.86' 같은 문자열) — 없거나 숫자가 아니면 0
 const igNum = (ig, code) => parseFloat(String(igVal(ig, code) ?? '').replace(/,/g, '')) || 0;
@@ -1590,7 +1608,10 @@ async function nightFutures() {
     if (c?.data) return c.data; // 만료 여부와 무관하게 마지막 값을 그대로
     if (kstHm() >= 900) return {};
   }
-  return cached('night', NIGHT_TTL, async () => {
+  return cached('night', kis ? KIS_QUOTE_TTL : NIGHT_TTL, async () => {
+    if (kis) {
+      try { const k = await kisIdxFut(); if (k['^KS200'] && k['^KQ150']) return k; } catch (e) { /* 아래로 */ }
+    }
     const out = {};
     let ok1 = false;
     try {
@@ -1665,8 +1686,9 @@ const naverIndex = async (code, live) => {
     // 다시 연 사람에게 잠정 값이 종일 굳는다 — 그때는 한 번 더 받는다.
     if (c?.data && c.data.marketStatus !== 'OPEN' && idxSettled() && idxSettled(c.ts)) return c.data;
   }
-  return cached(key, live ? IDX_TTL : IDX_SETTLE_TTL,
-    () => getJson(`https://m.stock.naver.com/api/index/${code}/basic`));
+  const naver = () => getJson(`https://m.stock.naver.com/api/index/${code}/basic`);
+  return cached(key, live ? (kis ? KIS_QUOTE_TTL : IDX_TTL) : IDX_SETTLE_TTL,
+    () => kis && KIS_IDX[code] ? kisIndexAsNaver(code).catch(naver) : naver());
 };
 
 async function marketQuotes() {
@@ -1812,16 +1834,46 @@ async function kisFutQuote(srs) {
 // 국내 종목 시세 — 관심종목(멀티종목) 시세조회(국내주식-205)로 30종목씩 묶어 받는다.
 // 토스 묶음 조회가 막힌 뒤로(invalid-client-state) 정규장 국내 시세를 네이버에 종목마다 따로 받았다
 // (ETF 하나에 최대 400번). 이걸로 400종목이 14번이 된다. 정규장 체결가(KRX)라 정규장에만 쓴다.
-async function kisKrQuotes(codes) {
+// mk: J = KRX, UN = 통합(KRX·NXT 중 최근 체결). 장 마감 뒤에는 UN으로 받아야 애프터 체결이 잡힌다.
+async function kisKrQuotes(codes, mk = 'J') {
   const out = {};
   for (let i = 0; i < codes.length; i += 30) {
     const part = codes.slice(i, i + 30);
-    const qs = part.map((c, j) => `FID_COND_MRKT_DIV_CODE_${j + 1}=J&FID_INPUT_ISCD_${j + 1}=${c}`).join('&');
+    const qs = part.map((c, j) => `FID_COND_MRKT_DIV_CODE_${j + 1}=${mk}&FID_INPUT_ISCD_${j + 1}=${c}`).join('&');
     const d = await kisGet(`/uapi/domestic-stock/v1/quotations/intstock-multprice?${qs}`, 'FHKST11300006');
     for (const p of d.output || []) {
       const c = p.inter_shrn_iscd, last = num(p.inter2_prpr), prev = num(p.inter2_prdy_clpr);
       if (c && last > 0 && prev > 0) out[c] = { last, prevClose: prev, regClose: last, session: '본장' };
     }
+  }
+  return out;
+}
+
+// 국내 지수선물 최근월 코드 — 'A' + 상품(01 코스피200 · 06 코스닥150) + 연도 끝자리 + 월(분기월).
+// 만기일(분기월 둘째 목요일, 휴장이면 앞 거래일) 저녁부터는 다음 월물이다. 자정~06시는 전날 저녁에 연 세션으로 친다.
+function idxFutCode(prod, now = Date.now()) {
+  const hm = kstHm(now), k = kstD(now - (hm < 600 ? 86400e3 : 0)), d8 = ymd8(k);
+  let y = k.getUTCFullYear(), m = Math.ceil((k.getUTCMonth() + 1) / 3) * 3;
+  for (let i = 0; i < 2; i++) {
+    const first = new Date(Date.UTC(y, m - 1, 1));
+    let exp = ymd8(new Date(Date.UTC(y, m - 1, 1 + (4 - first.getUTCDay() + 7) % 7 + 7)));
+    if (!isKrBiz(exp)) exp = bizStep(exp, -1);
+    if (d8 < exp || (d8 === exp && hm >= 600 && hm < 1800)) break;
+    m += 3; if (m > 12) { m -= 12; y++; }
+  }
+  return 'A' + prod + (y % 10) + String(m).padStart(2, '0');
+}
+// 지수선물 현재가(FHMIF10000000, 시장 구분 CM). 등락의 기준은 futs_sdpr(정규장 종가)다.
+// 세션 열림 여부는 응답에 없으므로 시계와 거래일 달력으로 정한다.
+const IDX_FUT = [['01', '^KS200'], ['06', '^KQ150']];
+async function kisIdxFut(now = Date.now()) {
+  const hm = kstHm(now), sess = ymd8(kstD(now - (hm < 600 ? 86400e3 : 0)));
+  const open = (hm >= 1800 || hm < 600) && !!(utcOf(sess).getUTCDay() % 6) && isKrBiz(sess);
+  const out = {};
+  for (const [prod, key] of IDX_FUT) {
+    const d = await kisGet(`/uapi/domestic-futureoption/v1/quotations/inquire-price?FID_COND_MRKT_DIV_CODE=CM&FID_INPUT_ISCD=${idxFutCode(prod, now)}`, 'FHMIF10000000');
+    const o = d.output1 || {}, c = num(o.futs_prpr), r = num(o.futs_sdpr);
+    if (c > 0 && r > 0) out[key] = { value: c, chg: c - r, chgPct: (c / r - 1) * 100, open, ts: Date.now() };
   }
   return out;
 }
@@ -1832,9 +1884,12 @@ async function kisKrQuotes(codes) {
 // 있다(실측 2026-11-26 16:40 AAPL: base 354.07, 직전 정규장 종가 355.58).
 const KIS_DAY_EX = { NMS: 'BAQ', NGM: 'BAQ', NCM: 'BAQ', NAS: 'BAQ', NasdaqGS: 'BAQ', NasdaqGM: 'BAQ', NasdaqCM: 'BAQ',
   NYQ: 'BAY', NYS: 'BAY', NYSE: 'BAY', PCX: 'BAA', ASE: 'BAA', NYSEArca: 'BAA', AMEX: 'BAA', BTS: 'BAA' };
+// 정규장 거래소 코드(나스닥 NAS · 뉴욕 NYS · 아멕스·아카 AMS)
+const KIS_REG_EX = { NMS: 'NAS', NGM: 'NAS', NCM: 'NAS', NAS: 'NAS', NasdaqGS: 'NAS', NasdaqGM: 'NAS', NasdaqCM: 'NAS',
+  NYQ: 'NYS', NYS: 'NYS', NYSE: 'NYS', PCX: 'AMS', ASE: 'AMS', NYSEArca: 'AMS', AMEX: 'AMS' };
 const KIS_DAY_MAX = 60;
-async function kisUsDay(sym, exch) {
-  const ex = KIS_DAY_EX[exch];
+async function kisUsDay(sym, exch, map = KIS_DAY_EX) {
+  const ex = map[exch];
   if (!ex) return null;
   return cached(`kisus:${ex}:${sym}`, KIS_QUOTE_TTL * 5, async () => {
     const d = await kisGet(`/uapi/overseas-price/v1/quotations/price?AUTH=&EXCD=${ex}&SYMB=${encodeURIComponent(sym.replace(/-/g, '/'))}`, 'HHDFS00000300');
@@ -1845,12 +1900,46 @@ async function kisUsDay(sym, exch) {
 
 // ETF 현재가(국내주식-068) — 전일 기준가(prdy_last_nav)를 기준 NAV 후보로 쓴다. 후보일 뿐이라
 // resolveNavRef가 'PDF 총액 = 기준NAV × CU'에 맞는지 보고서 고른다(맞지 않으면 버린다).
+// 같은 응답의 nav(실시간 iNAV)·acml_vol(거래량)은 공식 iNAV·거래량으로 쓴다(kisEtfAsIg).
+const kisEtfPrice = code => cached(`kisq:etf:${code}`, KIS_QUOTE_TTL, async () =>
+  (await kisGet(`/uapi/etfetn/v1/quotations/inquire-price?FID_COND_MRKT_DIV_CODE=J&FID_INPUT_ISCD=${code}`, 'FHPST02400000')).output || {});
 async function kisEtfPrevNav(code) {
-  return cached(`kisnav:${code}`, 5 * 60e3, async () => {
-    const d = await kisGet(`/uapi/etfetn/v1/quotations/inquire-price?FID_COND_MRKT_DIV_CODE=J&FID_INPUT_ISCD=${code}`, 'FHPST02400000');
-    const v = num(d.output?.prdy_last_nav);
-    return v > 0 ? v : null;
-  });
+  const v = num((await kisEtfPrice(code)).prdy_last_nav);
+  return v > 0 ? v : null;
+}
+// 네이버 integration 응답과 같은 모양(totalInfos)으로 돌려줘 igVal·igNum을 그대로 쓴다
+async function kisEtfAsIg(code) {
+  const o = await kisEtfPrice(code), nav = num(o.nav);
+  if (!(nav > 0)) throw new Error('한국투자증권 iNAV 없음');
+  return { totalInfos: [{ code: 'nav', value: String(nav) },
+    { code: 'accumulatedTradingVolume', value: num(o.acml_vol).toLocaleString('en-US') }] };
+}
+
+// 국내 지수 현재가(FHPUP02100000). 네이버 지수 응답과 같은 모양으로 돌려줘 아래 코드를 그대로 쓴다.
+// 부호 코드는 네이버와 같은 체계다(1 상한 · 2 상승 · 3 보합 · 4 하한 · 5 하락).
+const KIS_IDX = { KOSPI: '0001', KOSDAQ: '1001', KPI200: '2001' };
+async function kisIndexAsNaver(code) {
+  const d = await kisGet(`/uapi/domestic-stock/v1/quotations/inquire-index-price?FID_COND_MRKT_DIV_CODE=U&FID_INPUT_ISCD=${KIS_IDX[code]}`, 'FHPUP02100000');
+  const o = d.output || {}, v = num(o.bstp_nmix_prpr), down = /^[45]$/.test(o.prdy_vrss_sign || '');
+  if (!(v > 0)) throw new Error('한국투자증권 지수 없음');
+  const sg = x => String(down ? -Math.abs(num(x)) : Math.abs(num(x)));
+  return { closePrice: String(v), compareToPreviousClosePrice: sg(o.bstp_nmix_prdy_vrss), fluctuationsRatio: sg(o.bstp_nmix_prdy_ctrt),
+    compareToPreviousPrice: { code: o.prdy_vrss_sign }, marketStatus: krSession() === '본장' ? 'OPEN' : 'CLOSE' };
+}
+
+// 거래일 달력 — 코스피 일봉이 있는 날이 거래일이다. 한 번에 50봉까지 오므로 두 번 받아 100거래일쯤 채운다.
+async function kisKrDays() {
+  const seen = new Set();
+  let end = todayYmd();
+  for (let i = 0; i < 2; i++) {
+    const start = ymd8(new Date(utcOf(end) - 120 * 86400e3));
+    const d = await kisGet(`/uapi/domestic-stock/v1/quotations/inquire-daily-indexchartprice?FID_COND_MRKT_DIV_CODE=U&FID_INPUT_ISCD=0001&FID_INPUT_DATE_1=${start}&FID_INPUT_DATE_2=${end}&FID_PERIOD_DIV_CODE=D`, 'FHKUP03500100');
+    const rows = (d.output2 || []).map(r => r.stck_bsop_date).filter(x => /^\d{8}$/.test(x || ''));
+    if (!rows.length) break;
+    rows.forEach(x => seen.add(x));
+    end = ymd8(new Date(utcOf(rows.reduce((a, b) => a < b ? a : b)) - 86400e3));
+  }
+  return [...seen].sort();
 }
 
 // ETF 구성종목시세(국내주식-073) — 구성종목 수량·전일 종가 기준 평가금액·비중을 준다. 다만 비중 상위 30종목까지만
@@ -2125,6 +2214,17 @@ async function computeINav(stockCode, depth = 0) {
     } catch (e) { /* 주간거래 시세 실패 시 야후 마지막 체결가 유지 */ }
   }
 
+  // 미국 정규장 — 키가 있으면 체결가를 한국투자증권 시세로 바꾼다. 기준가·세션은 야후 그대로.
+  if (kis) {
+    const top = holdings.filter(h => h.t?.src === 'yahoo' && h.t.cur === 'USD' && yMap[h.t.sym]?.session === '본장')
+      .sort((a, b) => b.wg - a.wg).slice(0, KIS_DAY_MAX);
+    await Promise.all(top.map(async h => {
+      const q = yMap[h.t.sym];
+      const v = await kisUsDay(h.t.sym, q?.exch, KIS_REG_EX).catch(() => null);
+      if (v) yMap[h.t.sym] = { ...q, last: v };
+    }));
+  }
+
   const quoteOf = h => h.t ? (h.t.src === 'kr' ? krMap[h.t.sym] : yMap[h.t.sym]) : null;
 
   const navD = dig8(analysis.navPerformanceReferenceDate);
@@ -2296,7 +2396,7 @@ async function computeINav(stockCode, depth = 0) {
       // 대신 KRX 실시간 iNAV에서 국내 레그의 당일 변동분을 걷어내면 당일 기준가가 나온다
       // (KRX iNAV = 당일기준가 × (1 + 국내 당일변동 기여) — 해외 레그·환율은 하루 고정이므로).
       // 급변장에선 캐시된 iNAV와 지금 시세의 시점이 어긋나므로 iNAV를 새로 받아 짝을 맞춘다.
-      const igF = await getJson(`https://m.stock.naver.com/api/stock/${stockCode}/integration`).catch(() => null);
+      const igF = await (kis ? kisEtfAsIg(stockCode) : Promise.reject()).catch(() => naverIg(stockCode)).catch(() => null);
       const igNavF = igNum(igF, 'nav') || igNav;
       const domLive = movedHs.filter(h => h.t.cur === 'KRW').reduce((s, h) => {
         const q = quoteOf(h); return s + h.wg * (q.last / q.prevClose - 1);
@@ -4218,6 +4318,6 @@ if (require.main === module) {
     try { fs.writeFileSync(__dirname + '/server.pid', String(process.pid)); } catch (e) {}
   });
 }
-module.exports = { kisBody, kisStatus, kisSetKeys, kisClear, kisKrQuotes, kisUsDay, kisEtfPrevNav, kisTop30Pdf, futCodeOf, kisLastPx, keepOnLoad, bizStep, navTargetD, dig8, codesParam, pdfClear, pdfStatus, pxOf, server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, dropBadPdf, krSession, quoteSession, omOffHours, resolveTicker, idxSettled, fxMarketOpen, spotFirst, KR_PREOPEN, dayRef, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, resolveNavRef, nearestFxDate, parseMinClose, needRegFix, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
+module.exports = { kisKrDays, kisIndexAsNaver, kisEtfAsIg, idxFutCode, kisBody, kisStatus, kisSetKeys, kisClear, kisKrQuotes, kisUsDay, kisEtfPrevNav, kisTop30Pdf, futCodeOf, kisLastPx, keepOnLoad, bizStep, navTargetD, dig8, codesParam, pdfClear, pdfStatus, pxOf, server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, dropBadPdf, krSession, quoteSession, omOffHours, resolveTicker, idxSettled, fxMarketOpen, spotFirst, KR_PREOPEN, dayRef, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, resolveNavRef, nearestFxDate, parseMinClose, needRegFix, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
 
 }
