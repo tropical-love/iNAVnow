@@ -1724,6 +1724,14 @@ async function marketQuotes() {
         if (lv) return { name, value: lv, chg: lv - prev, chgPct: (lv / prev - 1) * 100, closed, live: true };
       } catch (e) { kisFut = e.message; }
     }
+    // 무료 선물 시세는 10분 늦다 — 그 사이의 움직임을 채워 지금 값을 추정한다(nqGapRatio)
+    if (sym === 'NQ=F' && prev && !closed) {
+      const r = await nqGapRatio(m.regularMarketTime * 1000).catch(() => null);
+      if (r) {
+        const ev = v * r;
+        return { name, value: ev, chg: ev - prev, chgPct: (ev / prev - 1) * 100, closed, est: true };
+      }
+    }
     return { name, value: v, chg: prev ? v - prev : null, chgPct: prev ? (v / prev - 1) * 100 : null, closed };
   };
   const jobs = [kr('KOSPI', '코스피', nf['^KS200'], '코스피200 야간선물'), kr('KOSDAQ', '코스닥', nf['^KQ150'], '코스닥150 야간선물')]
@@ -1732,6 +1740,93 @@ async function marketQuotes() {
   const rs = await Promise.allSettled(jobs);
   // 한 곳이 막혀도 나머지 카드는 살린다 — 실패분은 값 없이 자리만 지킨다
   return rs.map((r, i) => r.status === 'fulfilled' ? r.value : { name: names[i], value: null, closed: false });
+}
+
+// ---------- 나스닥 선물 지연 공백 채우기 ----------
+// 무료 선물 시세는 10분 늦게 온다. 마지막 체결가 이후의 움직임을 24시간 거래되는 나스닥100 추종 상품
+// 두 개의 같은 구간 변동률로 채운다: 추정 = 선물 마지막 체결가 × (추종 상품 지금 ÷ 그 체결 시각의 추종 상품).
+// 가격 수준은 선물 체결가에서, 최근 움직임만 추종 상품에서 가져온다(수준은 두 상품이 0.2%쯤 다르다).
+// '체결 시각의 추종 상품 값'은 직접 기록해 둔 중간값에서 그 시각 앞뒤를 시간 비율로 나눠 구한다.
+// 분봉 종가로 대신하면 체결 시각부터 그 분 끝까지의 움직임이 빠져, 새 체결가가 올 때마다 값이 튄다
+// (실측 2026-11-26 19:30~19:43: 분봉 종가 평균 오차 0.028%·최대 0.104% → 직접 기록 0.020%·0.043%).
+// 기록이 그 시각을 덮지 못할 때(켠 직후 10분, 조회가 끊겼던 구간)는 분봉 안에서 시간 비율로 나눈다.
+// · 두 상품의 변동률이 0.10%p 넘게 어긋나면 추정하지 않는다(어느 쪽이 맞는지 모르므로)
+// · 체결가가 15분보다 오래됐으면(휴장, 휴장 직후 새 세션의 첫 체결 전) 채우지 않는다
+// · 두 번째 상품은 미국 IP를 막으므로 공개 서버(ETF_SERVER, 미국 리전)에서는 첫 번째만 쓴다
+const GAP_TTL = 2e3;
+const GAP_MAX_AGE = 15 * 60e3;
+const GAP_MAX_DIFF = 0.001;
+const GAP_HIST_MS = 16 * 60e3;  // 기록은 체결가 지연(10분)보다 조금 길게만 둔다
+const GAP_HIST_STEP = 15e3;     // 앞뒤 기록이 이보다 멀면 그 사이 값은 모르는 것으로 본다
+const GAP_SECOND = !NODE || LOCAL;
+const GAP_A = 'https://api.hyperliquid.xyz/info';
+const gapHist = [];             // [{ t, a, b }] — a·b는 두 상품의 호가 중간값
+let gapMidP = null, gapMidAt = 0;
+// 지금 중간값을 받아 기록에 남긴다. GAP_TTL 안의 조회는 한 번으로 묶는다(실패도 묶는다).
+function gapMids() {
+  if (gapMidP && Date.now() - gapMidAt < GAP_TTL) return gapMidP;
+  gapMidAt = Date.now();
+  gapMidP = (async () => {
+    const t0 = Date.now();
+    const [a, b] = await Promise.all([
+      postJson(GAP_A, JSON.stringify({ type: 'allMids', dex: 'xyz' }), 'application/json').then(d => +d['xyz:XYZ100']).catch(() => NaN),
+      GAP_SECOND ? getJson('https://fapi.binance.com/fapi/v1/ticker/bookTicker?symbol=QQQUSDT')
+        .then(d => (+d.bidPrice + +d.askPrice) / 2).catch(() => NaN) : NaN,
+    ]);
+    const smp = { t: (t0 + Date.now()) / 2, a: a > 0 ? a : NaN, b: b > 0 ? b : NaN };
+    gapHist.push(smp);
+    while (gapHist.length && smp.t - gapHist[0].t > GAP_HIST_MS) gapHist.shift();
+    return smp;
+  })();
+  return gapMidP;
+}
+// 기록에서 t 시각의 값 — 앞뒤 기록 사이를 시간 비율로 나눈다
+function gapHistAt(hist, t, f) {
+  for (let i = 1; i < hist.length; i++) {
+    const p = hist[i - 1], q = hist[i];
+    if (p.t <= t && t <= q.t) {
+      if (q.t - p.t > GAP_HIST_STEP || !(p[f] > 0) || !(q[f] > 0)) return null;
+      return p[f] + (q[f] - p[f]) * (t - p.t) / (q.t - p.t);
+    }
+  }
+  return null;
+}
+// 분봉 [[시작 시각, 시가, 종가], ...]에서 t 시각의 값 — 그 분의 시가와 종가 사이를 시간 비율로 나눈다
+function gapBarAt(bars, t) {
+  const from = Math.floor(t / 60e3) * 60e3, b = (bars || []).find(x => x[0] === from);
+  if (!b || !(b[1] > 0) || !(b[2] > 0)) return null;
+  return b[1] + (b[2] - b[1]) * (t - from) / 60e3;
+}
+const gapBarMemo = {};
+function gapBars(k, from, fn) { // 같은 분의 분봉은 GAP_TTL 동안 한 번만 받는다
+  const g = gapBarMemo[k];
+  if (g && g.from === from && Date.now() - g.at < GAP_TTL) return g.p;
+  const p = fn().catch(() => null);
+  gapBarMemo[k] = { from, at: Date.now(), p };
+  return p;
+}
+const GAP_BAR_FN = {
+  a: async from => (await postJson(GAP_A, JSON.stringify({ type: 'candleSnapshot',
+    req: { coin: 'xyz:XYZ100', interval: '1m', startTime: from, endTime: from + 60e3 } }), 'application/json'))
+    .map(c => [c.t, +c.o, +c.c]),
+  b: async from => (await getJson(`https://fapi.binance.com/fapi/v1/klines?symbol=QQQUSDT&interval=1m&startTime=${from}&limit=1`))
+    .map(r => [r[0], +r[1], +r[4]]),
+};
+function gapCombine(rs) {
+  rs = rs.filter(Number.isFinite);
+  if (!rs.length) return null;
+  if (Math.max(...rs) - Math.min(...rs) > GAP_MAX_DIFF) return null;
+  return rs.reduce((s, r) => s + r, 0) / rs.length;
+}
+async function nqGapRatio(yt, now = Date.now()) {
+  if (!(yt > 0) || now - yt > GAP_MAX_AGE) return null;
+  const cur = await gapMids();
+  const from = Math.floor(yt / 60e3) * 60e3;
+  const rs = await Promise.all(['a', 'b'].filter(f => cur[f] > 0).map(async f => {
+    const base = gapHistAt(gapHist, yt, f) ?? gapBarAt(await gapBars(f, from, () => GAP_BAR_FN[f](from)), yt);
+    return base > 0 ? cur[f] / base : NaN;
+  }));
+  return gapCombine(rs);
 }
 
 // ---------- 한국투자증권 Open API (선택) — 나스닥 선물 실시간 ----------
@@ -3093,7 +3188,7 @@ const HTML = `<!doctype html>
       <button type="button" id="kisSaveBtn" onclick="kisSave()">저장</button>
       <button type="button" id="kisDelBtn" onclick="kisDel()">지우기</button>
     </div>
-    <div class="hint" style="margin-left:0">넣으면 나스닥 선물을 본인 계정의 실시간 시세로 보여줍니다. 키는 이 기기에만 저장되고 한국투자증권 서버에만 쓰입니다.</div>
+    <div class="hint" style="margin-left:0">넣으면 시세를 본인 계정으로 받아 3초마다 갱신합니다(CME 시세를 신청한 계좌는 나스닥 선물까지). 키는 이 기기에만 저장되고 한국투자증권 서버에만 쓰입니다.</div>
   </div>
 </div></dialog>
 <dialog id="pfdlg"><form class="dlg" method="dialog" onsubmit="return pfSave()">
@@ -3745,7 +3840,7 @@ function mktRender(){
   if(!MKT) return;
   document.getElementById('mktbody').innerHTML = MKT.map(function(m){
     const amt = m.chg == null ? '—' : (m.chg>0?'▲':m.chg<0?'▼':'')+fmt(Math.abs(m.chg),2);
-    return '<div class="m"><div class="mn">'+esc(m.name)+(m.closed?'<span class="badge closed">마감</span>':'')+'</div>'
+    return '<div class="m"><div class="mn">'+esc(m.name)+(m.closed?'<span class="badge closed">마감</span>':m.est?'<span class="badge b추정" title="최근 10분 움직임을 반영한 추정값입니다">추정</span>':'')+'</div>'
       + '<div class="mv">'+(m.value==null?'—':fmt(m.value,2))+'</div>'
       + '<div class="mc '+(m.chg?cls(m.chg):'muted')+'">'+amt+(m.chgPct==null?'':' '+sign(m.chgPct)+'%')+'</div></div>';
   }).join('');
@@ -4318,6 +4413,6 @@ if (require.main === module) {
     try { fs.writeFileSync(__dirname + '/server.pid', String(process.pid)); } catch (e) {}
   });
 }
-module.exports = { kisKrDays, kisIndexAsNaver, kisEtfAsIg, idxFutCode, kisBody, kisStatus, kisSetKeys, kisClear, kisKrQuotes, kisUsDay, kisEtfPrevNav, kisTop30Pdf, futCodeOf, kisLastPx, keepOnLoad, bizStep, navTargetD, dig8, codesParam, pdfClear, pdfStatus, pxOf, server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, dropBadPdf, krSession, quoteSession, omOffHours, resolveTicker, idxSettled, fxMarketOpen, spotFirst, KR_PREOPEN, dayRef, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, resolveNavRef, nearestFxDate, parseMinClose, needRegFix, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
+module.exports = { gapHistAt, gapBarAt, gapCombine, nqGapRatio, kisKrDays, kisIndexAsNaver, kisEtfAsIg, idxFutCode, kisBody, kisStatus, kisSetKeys, kisClear, kisKrQuotes, kisUsDay, kisEtfPrevNav, kisTop30Pdf, futCodeOf, kisLastPx, keepOnLoad, bizStep, navTargetD, dig8, codesParam, pdfClear, pdfStatus, pxOf, server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, dropBadPdf, krSession, quoteSession, omOffHours, resolveTicker, idxSettled, fxMarketOpen, spotFirst, KR_PREOPEN, dayRef, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, resolveNavRef, nearestFxDate, parseMinClose, needRegFix, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
 
 }

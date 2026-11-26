@@ -86,6 +86,8 @@ public class Net {
      */
     private static final String[] HOSTS = {
             "api.finance.naver.com",
+            "api.hyperliquid.xyz",
+            "fapi.binance.com",
             "finance.naver.com",
             "investments.miraeasset.com",
             "openapi.koreainvestment.com:9443",   // 한국투자증권 Open API — 이 호스트만 9443을 쓴다

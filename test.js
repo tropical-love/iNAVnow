@@ -295,6 +295,20 @@ if (A) {
 
   // 월물 코드 — 야후의 연결 선물 이름에서 읽는다(야후 기준가와 같은 월물을 쓰려고)
   assert.strictEqual(S.futCodeOf('NQ', 'Nasdaq 100 Dec 26'), 'NQZ26');
+  {
+    const t0 = 1795684320000;
+    const hist = [{ t: t0, a: 100, b: NaN }, { t: t0 + 10e3, a: 101, b: 50 }, { t: t0 + 40e3, a: 102, b: 51 }];
+    assert.ok(Math.abs(S.gapHistAt(hist, t0 + 5e3, 'a') - 100.5) < 1e-12, '앞뒤 기록 사이는 시간 비율로 나눠야 한다');
+    assert.strictEqual(S.gapHistAt(hist, t0 + 5e3, 'b'), null, '한쪽 기록이 비면 모르는 것으로 봐야 한다');
+    assert.strictEqual(S.gapHistAt(hist, t0 + 20e3, 'a'), null, '앞뒤 기록이 15초 넘게 떨어지면 모르는 것으로 봐야 한다');
+    assert.strictEqual(S.gapHistAt(hist, t0 - 1, 'a'), null, '기록 밖 시각은 모른다');
+    assert.ok(Math.abs(S.gapBarAt([[t0, 100, 106]], t0 + 30e3) - 103) < 1e-12, '분봉 안은 시가와 종가 사이를 나눠야 한다');
+    assert.strictEqual(S.gapBarAt([[t0, 100, 106]], t0 + 60e3), null, '그 분의 봉이 없으면 모른다');
+    assert.ok(Math.abs(S.gapCombine([0.998, 0.9984]) - 0.9982) < 1e-12);
+    assert.strictEqual(S.gapCombine([0.998, 1.0]), null, '두 상품이 0.10%p 넘게 어긋나면 추정하지 않아야 한다');
+    assert.strictEqual(S.gapCombine([null, 1.002]), 1.002, '한 곳이 실패하면 남은 한 곳으로');
+    assert.strictEqual(S.gapCombine([null, null]), null);
+  }
   const kst = (d, hm) => Date.parse(d + 'T' + hm + ':00+09:00');
   assert.strictEqual(S.idxFutCode('01', kst('2026-11-26', '18:01')), 'A01612');
   assert.strictEqual(S.idxFutCode('06', kst('2026-11-26', '18:01')), 'A06612');
