@@ -8,6 +8,8 @@ const fs = require('fs'), path = require('path'), vm = require('vm');
 process.env.ETF_PASS = 'testpass';
 // 실제 cache.json 대신 임시 파일 — 실행 중인 로컬 서버의 캐시를 테스트 상태로 덮어쓰지 않게
 process.env.ETF_CACHE_FILE = require('path').join(require('os').tmpdir(), `inav-test-cache-${process.pid}.json`);
+// 한국투자증권 키 파일도 임시 경로 — 실제 kis.json(사용자가 넣은 키)을 건드리지 않게
+process.env.ETF_KIS_FILE = require('path').join(require('os').tmpdir(), `inav-test-kis-${process.pid}.json`);
 const S = require('./server.js');
 let A = null;
 try { A = require('./auth.js'); } catch (e) { if (e.code !== 'MODULE_NOT_FOUND') throw e; }
@@ -275,6 +277,34 @@ if (A) {
   assert.strictEqual(S.keepOnLoad('pdfset:069500', ent(20, 30), now), true);
   assert.strictEqual(S.keepOnLoad('ba:069500', ent(1, 0.01), now), false, '만료된 단기 시세를 실었다');
   ok('디스크 캐시는 만료된 지 30일 지난 영속 키와 만료된 단기 키를 다시 싣지 않는다');
+}
+
+{
+  // 한국투자증권 키 — 사용자가 직접 넣고, 화면(상태 응답)으로는 절대 돌려주지 않는다
+  const kf = process.env.ETF_KIS_FILE;
+  assert.strictEqual(S.kisStatus().set, false, '키를 넣지 않았는데 있다고 한다');
+  await assert.rejects(S.kisSetKeys({ appKey: 'abc', appSecret: '' }, false), '빈 앱시크릿을 받아들였다');
+  await assert.rejects(S.kisSetKeys({ appKey: 'a b', appSecret: 'x' }, false), '공백 섞인 키를 받아들였다');
+  const st = await S.kisSetKeys({ appKey: ' PSKEYTEST ', appSecret: 'SECRETTEST/+=' }, false);
+  assert.strictEqual(st.set, true);
+  assert.ok(!JSON.stringify(st).includes('PSKEYTEST') && !JSON.stringify(st).includes('SECRETTEST'), '상태 응답에 키가 실렸다');
+  const saved = JSON.parse(fs.readFileSync(kf, 'utf8'));
+  assert.deepStrictEqual([saved.appKey, saved.appSecret], ['PSKEYTEST', 'SECRETTEST/+='], '키를 앞뒤 공백 없이 저장하지 않았다');
+  assert.strictEqual(S.kisClear().set, false);
+  assert.strictEqual(fs.existsSync(kf), false, '지웠는데 키 파일이 남았다');
+
+  // 월물 코드 — 야후의 연결 선물 이름에서 읽는다(야후 기준가와 같은 월물을 쓰려고)
+  assert.strictEqual(S.futCodeOf('NQ', 'Nasdaq 100 Dec 26'), 'NQZ26');
+  assert.strictEqual(S.futCodeOf('NQ', 'Nasdaq 100 Mar 27'), 'NQH27');
+  assert.strictEqual(S.futCodeOf('NQ', 'Nasdaq 100'), null, '월물을 모르면 한국투자증권을 부르지 않아야 한다');
+  // 현재가 필드 — 공개 문서마다 이름이 다르다
+  assert.strictEqual(S.kisLastPx({ last_price: '26,176.25' }), 26176.25);
+  assert.strictEqual(S.kisLastPx({ last: '26176.25' }), 26176.25);
+  assert.strictEqual(S.kisLastPx({ diff: '76' }), null, '현재가가 없는 응답에서 값을 지어냈다');
+  // 오류 본문이 JSON이 아닐 때도 오류 코드를 읽는다(실측 EGW00550은 키에 따옴표가 없다)
+  assert.strictEqual(S.kisBody('{rt_cd:"1","msg1":"CME SUB거래소 신청 계좌가 아닙니다.","msg_cd":"EGW00550"}').msg_cd, 'EGW00550');
+  assert.strictEqual(S.kisBody('{"rt_cd":"0","output":{"last":"1"}}').output.last, '1');
+  ok('한국투자증권 키는 직접 넣은 것만 저장되고 상태로 새지 않으며, 월물 코드·현재가를 바르게 읽는다');
 }
 
 {
@@ -710,7 +740,8 @@ if (A) {
       const src = fs.readFileSync(__filename.replace(/test\.js$/, 'server.js'), 'utf8');
       // 데이터를 받는 곳이 아닌 것들: 폰트·아이콘 CDN(빌드가 제거), SVG 네임스페이스, PEM 안에 적힌 발급자 URL
       const skip = new Set(['cdn.jsdelivr.net', 'ssl.gstatic.com', 'www.w3.org', 'crt.sectigo.com']);
-      const used = [...new Set([...src.matchAll(/https:\/\/([a-z0-9.-]+\.[a-z]{2,})/g)].map(m => m[1]))]
+      // 443이 아닌 포트는 '호스트:포트'로 센다 — 허용 목록도 그렇게 적는다
+      const used = [...new Set([...src.matchAll(/https:\/\/([a-z0-9.-]+\.[a-z]{2,}(?::\d+)?)/g)].map(m => m[1].replace(/:443$/, '')))]
         .filter(h => !skip.has(h));
       const block = /HOSTS\s*=\s*\{([\s\S]*?)\}/.exec(fs.readFileSync(netJava, 'utf8')); // HOSTS 배열만
       assert.ok(block, 'Net.java에서 HOSTS 목록을 찾지 못했다');
@@ -759,7 +790,7 @@ if (A) {
       assert.ok(/originOf\(target\)\.equals\(origin\)/.test(nj),
         '출처가 바뀌는 리다이렉트를 막지 않는다 — 쿠키가 다른 곳으로 넘어간다');
       assert.ok(/getDefaultPort/.test(nj), '출처 비교가 포트를 보지 않는다');
-      assert.ok(/getPort\(\) != 443/.test(nj), '허용 목록이 포트를 보지 않는다 — 허용 호스트의 다른 포트로 나갈 수 있다');
+      assert.ok(/port == 443 \? h : h \+ ":" \+ port/.test(nj), '허용 목록이 포트를 보지 않는다 — 허용 호스트의 다른 포트로 나갈 수 있다');
       // 홉마다 타임아웃을 새로 세면 3번 이동에 8초×4까지 늘어난다. connect·read·본문 읽기가
       // 각각 남은 시간을 새로 쓰는 것도 막아야 실제 상한이 생긴다
       assert.ok(/deadline/.test(nj) && !/setReadTimeout\(timeout\)/.test(nj),
@@ -932,3 +963,4 @@ if (A) {
   setTimeout(() => process.exit(0), 10e3).unref();
 })().catch(e => { console.error('\n실패:', e.message); process.exit(1); });
 process.on('exit', () => { try { require('fs').unlinkSync(process.env.ETF_CACHE_FILE); } catch (e) {} });
+process.on('exit', () => { try { require('fs').unlinkSync(process.env.ETF_KIS_FILE); } catch (e) {} });

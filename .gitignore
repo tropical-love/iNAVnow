@@ -25,3 +25,6 @@ android/local.properties
 android/keystore.properties
 *.jks
 *.keystore
+
+# 사용자가 설정 창에서 직접 넣은 한국투자증권 앱키·앱시크릿·접근 토큰 — 절대 커밋하지 않는다
+kis.json

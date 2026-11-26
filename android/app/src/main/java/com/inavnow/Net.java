@@ -88,6 +88,7 @@ public class Net {
             "api.finance.naver.com",
             "finance.naver.com",
             "investments.miraeasset.com",
+            "openapi.koreainvestment.com:9443",   // 한국투자증권 Open API — 이 호스트만 9443을 쓴다
             "m.stock.naver.com",
             "moneyrecipe.blog",
             "papi.aceetf.co.kr",
@@ -106,10 +107,12 @@ public class Net {
 
     private static boolean allowed(URL u) {
         if (!"https".equals(u.getProtocol())) return false; // 평문 http로는 나가지 않는다
-        // 포트도 본다 — 이름만 맞추면 허용된 호스트의 8443 같은 다른 포트로도 나갈 수 있다
-        if (u.getPort() != -1 && u.getPort() != 443) return false;
+        // 포트도 본다 — 이름만 맞추면 허용된 호스트의 8443 같은 다른 포트로도 나갈 수 있다.
+        // 443이 아닌 포트는 목록에 '호스트:포트'로 적힌 것만 허용한다(한국투자증권 9443).
+        int port = u.getPort() == -1 ? 443 : u.getPort();
         String h = u.getHost().toLowerCase();
-        for (String ok : HOSTS) if (h.equals(ok)) return true;
+        String key = port == 443 ? h : h + ":" + port;
+        for (String ok : HOSTS) if (key.equals(ok)) return true;
         return false;
     }
 

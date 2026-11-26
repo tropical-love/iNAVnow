@@ -972,7 +972,7 @@ async function yahooQuoteRaw(sym) {
     const day = t => new Date((t + off) * 1000).toISOString().slice(0, 10);
     if (day(r.meta.regularMarketTime) === day(now)) session = '장마감';
   }
-  return { last, prevClose: r.meta.chartPreviousClose, regClose: r.meta.regularMarketPrice, session };
+  return { last, prevClose: r.meta.chartPreviousClose, regClose: r.meta.regularMarketPrice, session, exch: r.meta.exchangeName };
 }
 
 // ---------- KRX 거래일 달력 ----------
@@ -1140,6 +1140,16 @@ function marketPx(basic, sess = krSession()) {
   };
 }
 
+// 키가 있으면 정규장 ETF 시장가도 한국투자증권 시세로 바꾼다 — 구성종목은 3초마다 새 값인데 ETF 가격만
+// 네이버 30초 캐시에 묶여 있으면 괴리율이 그 사이 엉뚱하게 출렁인다. 실패하면 네이버 값 그대로.
+async function marketPxLive(basic, code) {
+  const mp = marketPx(basic);
+  if (!kis || krSession() !== '본장' || mp.over) return mp;
+  const q = (await krQuotes([code]).catch(() => ({})))[code];
+  if (!(q?.last > 0 && q.prevClose > 0)) return mp;
+  return { ...mp, price: q.last, change: q.last - q.prevClose, changePct: (q.last / q.prevClose - 1) * 100 };
+}
+
 // 괴리율의 기준: 본장 중엔 '현재가 vs 실시간 추정 iNAV'. 장 마감 후엔 '종가 vs 기준 NAV' —
 // 둘 다 15:30 시점 값이라 같은 시점끼리의 비교가 된다(표준 공시 괴리율과 동일).
 // 마감 후에도 움직이는 iNAV 대비로 재면 시점이 어긋나 밤새 값이 떠다니고 '종가 대비'와 중복된다.
@@ -1221,8 +1231,12 @@ function quoteSession(d, live, nowSess = krSession()) {
 }
 
 async function krQuotes(codes) {
-  return cached(`kr:${codes.join(',')}`, QUOTE_TTL, () => krQuotesRaw(codes));
+  // 정규장에 한국투자증권으로 받을 때만 짧게 쥔다 — 네이버로 받는 경우의 주기는 그대로 둔다
+  const fast = kis && krSession() === '본장';
+  return cached(`kr:${codes.join(',')}`, fast ? KIS_QUOTE_TTL : QUOTE_TTL, () => krQuotesRaw(codes));
 }
+// 토스 묶음 조회가 막혀 있는지 — 막혀 있으면 정규장 국내 시세가 네이버 개별 조회로 가므로 추적 상한을 낮춘다
+let tossDownAt = 0;
 async function krQuotesRaw(codes) {
   const out = {};
   const tossBatch = async () => {
@@ -1238,10 +1252,15 @@ async function krQuotesRaw(codes) {
   };
 
   if (krSession() === '본장') {
-    try { await tossBatch(); return out; } catch (e) { /* 네이버로 폴백 */ }
+    if (kis) {
+      try { Object.assign(out, await kisKrQuotes(codes)); } catch (e) { kisLast = { ok: false, error: e.message, at: Date.now() }; }
+      if (codes.every(c => out[c])) return out;
+    }
+    try { await tossBatch(); return out; } catch (e) { tossDownAt = Date.now(); /* 네이버로 폴백 */ }
   }
 
-  await Promise.all(codes.map(async c => {
+  // 이미 받은 종목(한국투자증권)은 다시 부르지 않는다
+  await Promise.all(codes.filter(c => !out[c]).map(async c => {
     try {
       const d = await getJson(`https://m.stock.naver.com/api/stock/${c}/basic`);
       const reg = num(d.closePrice);
@@ -1394,7 +1413,7 @@ async function officialOnly(stockCode, analysis, basic, reason) {
   const ig = await integrationOf(stockCode);
   const official = igNum(ig, 'nav');
   if (!official) throw new Error(reason);
-  const mp = marketPx(basic), marketPrice = mp.price;
+  const mp = await marketPxLive(basic, stockCode), marketPrice = mp.price;
   return {
     etfName: basic.stockName, code: stockCode,
     issuer: analysis.issuerName, baseIndex: analysis.etfBaseIndex,
@@ -1472,7 +1491,7 @@ async function computeDomesticLev(stockCode, analysis, basic) {
 
   const navRef = analysis.nav;
   const spotEst = idx ? navRef * (1 + lev * idx.changePct / 100) : null;
-  const mp = marketPx(basic), marketPrice = mp.price;
+  const mp = await marketPxLive(basic, stockCode), marketPrice = mp.price;
 
   // KRX 공식 iNAV는 정규장 마감(15:30)으로 산출이 끝난다. 그대로 두면 1배수가 애프터에 2% 내려가 있어도
   // 레버리지는 마감값에 머물러 '종가 대비'가 4%씩 어긋난다
@@ -1674,6 +1693,15 @@ async function marketQuotes() {
     // 환율은 그 방식이 맞지 않아 시계로 본다(위 fxMarketOpen 설명).
     const age = m.regularMarketTime ? Date.now() - m.regularMarketTime * 1000 : Infinity;
     const closed = fx ? (!fxMarketOpen() || age > FX_DEAD_MS) : age > 30 * 60e3;
+    // 한국투자증권 키가 있으면 선물은 그쪽 실시간 체결가로 바꾼다. 기준가는 야후 그대로(같은 월물의 전일 정산가).
+    const code = !fx && kis ? futCodeOf(sym.replace(/=F$/, ''), m.shortName || m.longName) : null;
+    if (code && prev) {
+      try {
+        const lv = kisLastPx(await kisFutQuote(code));
+        kisFut = lv ? '' : '현재가가 비어 있습니다';
+        if (lv) return { name, value: lv, chg: lv - prev, chgPct: (lv / prev - 1) * 100, closed, live: true };
+      } catch (e) { kisFut = e.message; }
+    }
     return { name, value: v, chg: prev ? v - prev : null, chgPct: prev ? (v / prev - 1) * 100 : null, closed };
   };
   const jobs = [kr('KOSPI', '코스피', nf['^KS200'], '코스피200 야간선물'), kr('KOSDAQ', '코스닥', nf['^KQ150'], '코스닥150 야간선물')]
@@ -1682,6 +1710,197 @@ async function marketQuotes() {
   const rs = await Promise.allSettled(jobs);
   // 한 곳이 막혀도 나머지 카드는 살린다 — 실패분은 값 없이 자리만 지킨다
   return rs.map((r, i) => r.status === 'fulfilled' ? r.value : { name: names[i], value: null, closed: false });
+}
+
+// ---------- 한국투자증권 Open API (선택) — 나스닥 선물 실시간 ----------
+// 무료로 열린 CME 선물 시세(야후·네이버·CNBC·TradingView)는 모두 10분 늦다. 사용자가 자기 한국투자증권
+// 앱키를 넣으면 그 계정으로 해외선물 현재가를 받아 나스닥 선물 카드에 쓴다. 키가 없거나 실패하면 야후 그대로.
+// 키는 사용자가 설정 창에 직접 넣는다 — 코드·저장소·배포본 어디에도 들어가지 않는다. 저장 위치는
+// PC판은 서버 폴더의 kis.json(공개 저장소 .gitignore), 앱은 기기의 localStorage다. 화면으로는 키를 돌려주지 않는다.
+const KIS_HOST = 'https://openapi.koreainvestment.com:9443';
+const KIS_FILE = NODE ? process.env.ETF_KIS_FILE || __dirname + '/kis.json' : null;
+const KIS_LS = 'kisKeys';
+function kisLoad() {
+  try {
+    const raw = NODE ? fs.readFileSync(KIS_FILE, 'utf8') : localStorage.getItem(KIS_LS);
+    const o = raw ? JSON.parse(raw) : null;
+    return o && o.appKey && o.appSecret ? o : null;
+  } catch (e) { return null; }
+}
+function kisPersist() {
+  try {
+    if (!kis) { if (NODE) fs.rmSync(KIS_FILE, { force: true }); else localStorage.removeItem(KIS_LS); return; }
+    const j = JSON.stringify(kis);
+    if (NODE) fs.writeFileSync(KIS_FILE, j, { mode: 0o600 }); else localStorage.setItem(KIS_LS, j);
+  } catch (e) { console.error('한국투자증권 키 저장 실패:', e.message); }
+}
+let kis = kisLoad();              // { appKey, appSecret, token?, tokenExp? }
+let kisLast = { ok: null, error: '', at: 0 }; // 마지막 호출 결과(키 값은 담지 않는다)
+let kisFut = null; // 나스닥 선물 조회 결과 — ''이면 정상, 문자열이면 그 오류(CME 시세 미신청 등)
+let kisTokenP = null, kisTokenFailAt = 0;
+
+// 접근 토큰 — 하루 유효하고 발급은 1분에 한 번으로 제한된다. 그래서 받아 둔 토큰을 저장해 두고(재시작해도
+// 다시 받지 않게) 만료 10분 전까지 쓴다. 발급이 실패하면 1분 동안은 다시 시도하지 않는다.
+async function kisToken(force = false) {
+  if (!kis) throw new Error('한국투자증권 키가 없습니다');
+  if (!force && kis.token && Date.now() < kis.tokenExp - 10 * 60e3) return kis.token;
+  if (kisTokenP) return kisTokenP;
+  if (Date.now() - kisTokenFailAt < 60e3) throw new Error('토큰 발급 대기 중(1분에 한 번)');
+  kisTokenP = (async () => {
+    const res = await fetchOrThrow(KIS_HOST + '/oauth2/tokenP', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ grant_type: 'client_credentials', appkey: kis.appKey, appsecret: kis.appSecret }),
+    });
+    const d = await res.json().catch(() => ({}));
+    if (!d.access_token) { kisTokenFailAt = Date.now(); throw new Error(`토큰 발급 실패: ${d.error_description || d.msg1 || res.status}`); }
+    kis.token = d.access_token;
+    kis.tokenExp = Date.now() + (Number(d.expires_in) || 86400) * 1000;
+    kisPersist();
+    return kis.token;
+  })().finally(() => { kisTokenP = null; });
+  return kisTokenP;
+}
+
+// 시세 요청은 전부 이 함수를 거친다. 실전 계좌 한도(초당 20건) 아래로 줄을 세워 보낸다 — 넘기면 그 요청이
+// 거부되고(EGW00201) 그 시세가 통째로 네이버·야후로 밀린다. 동시에 여러 ETF를 계산해도 이 줄 하나를 쓴다.
+const KIS_GAP_MS = 70; // 초당 약 14건
+let kisNext = 0;
+async function kisSlot() {
+  const now = Date.now(), at = Math.max(now, kisNext);
+  kisNext = at + KIS_GAP_MS;
+  if (at > now) await new Promise(r => setTimeout(r, at - now));
+}
+// 오류 응답은 JSON이 아닐 때가 있다 — 실측 EGW00550: {rt_cd:"1","msg1":"CME SUB거래소 신청 계좌가 아닙니다.",...}
+// (키에 따옴표가 없다). 그대로 파싱하면 오류 코드를 잃으므로 그때는 코드·문구만 뽑는다.
+function kisBody(t) {
+  try { return JSON.parse(t); } catch (e) {}
+  const g = k => (new RegExp(k + '"?\s*:\s*"([^"]*)"').exec(t) || [])[1];
+  return { rt_cd: g('rt_cd'), msg_cd: g('msg_cd'), msg1: g('msg1') };
+}
+async function kisGet(path, trId) {
+  const call = async tok => {
+    await kisSlot();
+    const res = await fetchOrThrow(KIS_HOST + path, {
+      headers: { 'content-type': 'application/json; charset=utf-8', authorization: 'Bearer ' + tok,
+        appkey: kis.appKey, appsecret: kis.appSecret, tr_id: trId, custtype: 'P' },
+    });
+    return [res, kisBody(await res.text())];
+  };
+  let [res, d] = await call(await kisToken());
+  // 토큰이 만료·폐기됐으면(다른 곳에서 새로 발급하면 이전 토큰이 끊긴다) 한 번만 새로 받아 다시 부른다
+  if (res.status === 401 || /EGW0012[13]/.test(d.msg_cd || '')) [res, d] = await call(await kisToken(true));
+  if (d.rt_cd !== '0') throw new Error(`${d.msg_cd || res.status} ${d.msg1 || ''}`.trim());
+  kisLast = { ...kisLast, ok: true, error: '', at: Date.now() };
+  return d;
+}
+// 키가 있을 때 한국투자증권에서 받는 값의 캐시 — 네이버·야후 주기(30초 등)와 따로 짧게 둔다.
+// 화면 갱신도 이 주기로 당긴다(KIS_REFRESH_MS). 네이버·야후 캐시는 그대로라 그쪽 호출은 늘지 않는다.
+const KIS_QUOTE_TTL = 3e3;
+const KIS_REFRESH_MS = 3000;
+
+// 해외선물 현재가(해외선물-009, tr_id HHDFC55010000). 종목코드는 'NQZ26' 꼴(상품+월물+연도 두 자리).
+// 계좌에 CME 시세 신청이 없으면 EGW00550으로 거부된다 — 그때는 야후 값을 쓴다.
+async function kisFutQuote(srs) {
+  return cached(`kisq:${srs}`, KIS_QUOTE_TTL, async () => {
+    const d = await kisGet(`/uapi/overseas-futureoption/v1/quotations/inquire-price?SRS_CD=${srs}`, 'HHDFC55010000');
+    const o = d.output1 || d.output;
+    if (!o) throw new Error('응답에 시세가 없습니다');
+    return o;
+  });
+}
+
+// 국내 종목 시세 — 관심종목(멀티종목) 시세조회(국내주식-205)로 30종목씩 묶어 받는다.
+// 토스 묶음 조회가 막힌 뒤로(invalid-client-state) 정규장 국내 시세를 네이버에 종목마다 따로 받았다
+// (ETF 하나에 최대 400번). 이걸로 400종목이 14번이 된다. 정규장 체결가(KRX)라 정규장에만 쓴다.
+async function kisKrQuotes(codes) {
+  const out = {};
+  for (let i = 0; i < codes.length; i += 30) {
+    const part = codes.slice(i, i + 30);
+    const qs = part.map((c, j) => `FID_COND_MRKT_DIV_CODE_${j + 1}=J&FID_INPUT_ISCD_${j + 1}=${c}`).join('&');
+    const d = await kisGet(`/uapi/domestic-stock/v1/quotations/intstock-multprice?${qs}`, 'FHKST11300006');
+    for (const p of d.output || []) {
+      const c = p.inter_shrn_iscd, last = num(p.inter2_prpr), prev = num(p.inter2_prdy_clpr);
+      if (c && last > 0 && prev > 0) out[c] = { last, prevClose: prev, regClose: last, session: '본장' };
+    }
+  }
+  return out;
+}
+
+// 미국 주간거래 시세 — 해외주식 현재가(HHDFS00000300)에 주간거래 거래소 코드를 넣는다.
+// 야후 거래소 이름으로 주간거래 코드를 고른다(나스닥 BAQ · 뉴욕 BAY · 아멕스·아카 BAA). 종목마다 1건이라
+// 비중 큰 순으로 상한을 둔다. 기준은 야후의 마지막 정규장 종가를 쓴다 — 한국투자증권 base는 하루 전 값일 때가
+// 있다(실측 2026-11-26 16:40 AAPL: base 354.07, 직전 정규장 종가 355.58).
+const KIS_DAY_EX = { NMS: 'BAQ', NGM: 'BAQ', NCM: 'BAQ', NAS: 'BAQ', NasdaqGS: 'BAQ', NasdaqGM: 'BAQ', NasdaqCM: 'BAQ',
+  NYQ: 'BAY', NYS: 'BAY', NYSE: 'BAY', PCX: 'BAA', ASE: 'BAA', NYSEArca: 'BAA', AMEX: 'BAA', BTS: 'BAA' };
+const KIS_DAY_MAX = 60;
+async function kisUsDay(sym, exch) {
+  const ex = KIS_DAY_EX[exch];
+  if (!ex) return null;
+  return cached(`kisus:${ex}:${sym}`, KIS_QUOTE_TTL * 5, async () => {
+    const d = await kisGet(`/uapi/overseas-price/v1/quotations/price?AUTH=&EXCD=${ex}&SYMB=${encodeURIComponent(sym.replace(/-/g, '/'))}`, 'HHDFS00000300');
+    const v = num(d.output?.last);
+    return v > 0 ? v : null;
+  });
+}
+
+// ETF 현재가(국내주식-068) — 전일 기준가(prdy_last_nav)를 기준 NAV 후보로 쓴다. 후보일 뿐이라
+// resolveNavRef가 'PDF 총액 = 기준NAV × CU'에 맞는지 보고서 고른다(맞지 않으면 버린다).
+async function kisEtfPrevNav(code) {
+  return cached(`kisnav:${code}`, 5 * 60e3, async () => {
+    const d = await kisGet(`/uapi/etfetn/v1/quotations/inquire-price?FID_COND_MRKT_DIV_CODE=J&FID_INPUT_ISCD=${code}`, 'FHPST02400000');
+    const v = num(d.output?.prdy_last_nav);
+    return v > 0 ? v : null;
+  });
+}
+
+// ETF 구성종목시세(국내주식-073) — 구성종목 수량·전일 종가 기준 평가금액·비중을 준다. 다만 비중 상위 30종목까지만
+// 오고(이어받기 없음, 실측 KODEX 200: 202종목 중 30) 해외 종목 ETF는 0건이다. 그래서 운용사 자료를 대신하지는
+// 못하고, 운용사·FunETF가 다 막혔을 때 네이버 상위 10종목보다 나은 대체 자료로만 쓴다.
+async function kisTop30Pdf(code) {
+  return cached(`kispdf:${code}`, 10 * 60e3, async () => {
+    const d = await kisGet(`/uapi/etfetn/v1/quotations/inquire-component-stock-price?FID_COND_MRKT_DIV_CODE=J&FID_INPUT_ISCD=${code}&FID_COND_SCR_DIV_CODE=11216`, 'FHKST121600C0');
+    const list = (d.output2 || []).map(r => ({
+      jm: r.stck_shrn_iscd, name: r.hts_kor_isnm,
+      qty: num(r.etf_cu_unit_scrt_cnt), valAm: num(r.etf_vltn_amt) || null, wg: num(r.etf_cnfg_issu_rlim),
+    })).filter(r => /^[0-9A-Z]{6}$/.test(r.jm || '') && r.qty > 0 && r.wg > 0);
+    if (!list.length) throw new Error('한국투자증권 구성종목 없음(해외형·채권형)');
+    const total = num(d.output1?.etf_cnfg_issu_cnt);
+    return { fundNm: '', stdDt: todayYmd('-'), list, partial: !(total > 0 && total <= list.length), altSource: '한국투자증권' };
+  });
+}
+// 응답 필드 이름이 공개 문서마다 달라(last_price / last 등) 둘 다 본다
+const kisLastPx = o => { const v = num(o.last_price ?? o.last ?? o.ovrs_futr_prpr); return v > 0 ? v : null; };
+
+// 야후의 연결 선물 이름('Nasdaq 100 Dec 26')에서 월물을 읽어 한국투자증권 종목코드로 바꾼다 —
+// 월물이 넘어가는 날짜를 따로 계산하지 않고 야후와 같은 월물을 쓴다(기준가 chartPreviousClose도 같은 월물이다).
+const MONTH_CODE = { Jan: 'F', Feb: 'G', Mar: 'H', Apr: 'J', May: 'K', Jun: 'M', Jul: 'N', Aug: 'Q', Sep: 'U', Oct: 'V', Nov: 'X', Dec: 'Z' };
+function futCodeOf(root, yahooName) {
+  const m = /\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{2})\b/.exec(yahooName || '');
+  return m ? root + MONTH_CODE[m[1]] + m[2] : null;
+}
+
+// 설정 창이 부르는 것들 — 상태에는 키 값을 넣지 않는다
+function kisStatus() {
+  return { set: !!kis, ok: kisLast.ok, error: kisLast.error, at: kisLast.at, fut: kisFut, refreshMs: kis ? KIS_REFRESH_MS : null };
+}
+async function kisSetKeys(b, probe = true) {
+  const k = String(b?.appKey || '').trim(), s = String(b?.appSecret || '').trim();
+  if (!k || !s || k.length > 200 || s.length > 600 || /\s/.test(k + s)) throw new Error('앱키·앱시크릿을 확인해 주세요');
+  kis = { appKey: k, appSecret: s };
+  kisLast = { ok: null, error: '', at: 0 }; kisFut = null;
+  kisTokenFailAt = 0;
+  for (const key of [...cache.keys()]) if (/^kis(q|us|nav|pdf):/.test(key)) cache.delete(key);
+  kisPersist();
+  if (probe) {
+    try { await kisToken(); kisLast = { ok: true, error: '', at: Date.now() }; }
+    catch (e) { kisLast = { ok: false, error: e.message, at: Date.now() }; }
+  }
+  return kisStatus();
+}
+function kisClear() {
+  kis = null; kisLast = { ok: null, error: '', at: 0 }; kisFut = null;
+  kisPersist();
+  return kisStatus();
 }
 
 // ---------- 레버리지·인버스·합성: 기초 ETF 바스켓 × 배수로 추정 ----------
@@ -1739,7 +1958,7 @@ async function computeSynthetic(stockCode, baseCode, analysis, basic, levOverrid
   const combined = /\(합성\s*H\)|\(H\)/.test(nm) ? localRatio : basketRatio; // (H)=환헤지
   // ponytail: 일간 복리 리셋 무시(기준 NAV 이후 1거래일 가정) — 주말 낀 구간은 오차 가능
   const inav = navRef * (1 + lev * (combined - 1));
-  const mp = marketPx(basic), marketPrice = mp.price;
+  const mp = await marketPxLive(basic, stockCode), marketPrice = mp.price;
   // 기초의 정규장 이후 세션분에 배수 적용 → 시장가(정규장 종가)와 시점을 맞춘 괴리율
   const sessContrib = lev * (base.sessContrib || 0);
   const inavRegular = inav / (1 + sessContrib / 100);
@@ -1817,7 +2036,7 @@ async function computeINav(stockCode, depth = 0) {
       const sib = depth === 0 ? await findSiblingCode(basic.stockName, stockCode).catch(() => null) : null;
       if (sib) return computeSynthetic(stockCode, sib, analysis, basic, 1);
       // ③ 네이버 상위10
-      try { pdf = await naverTop10Pdf(stockCode, analysis); }
+      try { pdf = kis ? await kisTop30Pdf(stockCode).catch(() => naverTop10Pdf(stockCode, analysis)) : await naverTop10Pdf(stockCode, analysis); }
       // ④ 그래도 안 되면 추정을 포기하고 KRX 공식 iNAV만 보여준다.
       //    대체 경로가 왜 실패했는지도 함께 남긴다 — 첫 실패만 적어 두면 나중에 원인을 못 찾는다
       //    (실측 2026-08-12 08:24 PLUS 글로벌HBM반도체가 이 상태였는데 이유가 화면에 없었다).
@@ -1829,7 +2048,11 @@ async function computeINav(stockCode, depth = 0) {
   // 국내는 토스 배치 1회(정규장) → 사실상 전량 추적 가능. 해외는 야후 종목별 호출이라 상위 비중만.
   // (코스닥150 같은 국내 다종목 ETF의 반영률이 78%에 머물던 원인)
   const isKrCode = jm => /^\d{6}$/.test(jm) || /^KR7\d{9}$/.test(jm);
-  const MAX_KR = krSession() === '본장' ? 400 : 100; // 정규장 외엔 네이버 개별 조회라 보수적으로
+  // 정규장엔 묶음 조회(한국투자증권·토스)라 넉넉히, 그 밖엔 네이버 개별 조회라 보수적으로.
+  // 토스가 막혀 있고 한국투자증권 키도 없으면 정규장도 네이버 개별 조회라 같은 상한을 쓴다
+  // (그대로 두면 ETF 하나에 네이버를 400번 동시에 부른다).
+  const batchOk = kis || Date.now() - tossDownAt > 30 * 60e3;
+  const MAX_KR = krSession() === '본장' && batchOk ? 400 : 100;
   const MAX_FRN = MAX_FRN_TRACK;
   const byWg = [...pdf.list].sort((a, b) => b.wg - a.wg);
   let nKr = 0, nFrn = 0;
@@ -1876,7 +2099,14 @@ async function computeINav(stockCode, depth = 0) {
   // 미국 종목: 야후가 휴장인 시간대(주간거래)엔 토스 시세로 대체
   const usHolds = holdings.filter(h => h.t?.src === 'yahoo' && h.t.cur === 'USD'
     && ['휴장', '장마감'].includes(yMap[h.t.sym]?.session)); // 장마감(당일 거래 있었음)도 주간거래 대상
-  if (usHolds.length) {
+  if (usHolds.length && kis && usDaySession()) {
+    const top = [...usHolds].sort((a, b) => b.wg - a.wg).slice(0, KIS_DAY_MAX);
+    await Promise.all(top.map(async h => {
+      const q = yMap[h.t.sym];
+      const v = await kisUsDay(h.t.sym, q?.exch).catch(() => null);
+      if (v) yMap[h.t.sym] = { ...q, last: v, session: '주간' };
+    }));
+  } else if (usHolds.length) {
     try {
       const codes = await Promise.all(usHolds.map(h => tossCodeOf(h.t.sym).catch(() => null)));
       const codeMap = {};
@@ -1926,7 +2156,8 @@ async function computeINav(stockCode, depth = 0) {
   // 다르면 igNav를 후보에 넣어 다시 채점하고, 현재 바스켓과 라운드로 맞아떨어지는 쪽을 쓴다.
   const targetD = navTargetD();
   const nextBizYmd = b => dotYmd(bizStep(b, +1)); // basis 다음 거래일 — 그 basis와 짝이 되는 NAV 날짜
-  let navInfo = resolveNavRef(analysis, pdf.list, [], pdf.cashAm);
+  const kisNav = kis ? await kisEtfPrevNav(stockCode).catch(() => null) : null;
+  let navInfo = resolveNavRef(analysis, pdf.list, kisNav ? [kisNav] : [], pdf.cashAm);
   let navRefDateOut = analysis.navPerformanceReferenceDate;
   const ig0 = await integrationOf(stockCode).catch(() => null);
   const igNavG = igNum(ig0, 'nav') || null;
@@ -2246,7 +2477,7 @@ async function computeINav(stockCode, depth = 0) {
   const inav = navRef * (1 + sumContrib / 100);
   // ETF는 시간외 시세가 없다(개별 주식만 있음). 시장가가 정규장 종가면 iNAV도 정규장 시점으로 맞춰 괴리율 계산.
   const inavRegular = inav / (1 + sessContrib / 100);
-  const mp = marketPx(basic), marketPrice = mp.price;
+  const mp = await marketPxLive(basic, stockCode), marketPrice = mp.price;
 
   return {
     etfName: basic.stockName, code: stockCode,
@@ -2532,6 +2763,7 @@ const HTML = `<!doctype html>
   .dlg #theme { width: 100%; }
   .dlg #otitle { width: calc(100% - 24px); margin: 4px 0 0 24px; }
   .dlg input[type=number], .dlg #pfq { width: 100%; }
+  .dlg .kisin { width: 100%; margin-top: 6px; }
   .dlg .err { color: var(--up); font-size: 12px; margin-top: 8px; min-height: 16px; }
   .dlg button.primary { background: var(--gold); border-color: var(--gold); color: #fff; font-weight: 600; }
   html[data-theme=dark] .dlg button.primary { color: #1c1f26; }
@@ -2752,6 +2984,17 @@ const HTML = `<!doctype html>
     </div>
     <div class="hint">운용사가 올리는 때에 맞춰 <b>장 시작 전(08:00) · 마감 직후(15:40) · 저녁(19:00)</b> 세 번만 새로 받습니다. 리밸런싱이 늦게 반영됐을 때만 눌러 주세요.</div>
   </div>
+  <div class="sec">
+    <div class="muted">한국투자증권 Open API</div>
+    <input id="kisKey" class="kisin" placeholder="앱키(App Key)" autocomplete="off" spellcheck="false">
+    <input id="kisSecret" class="kisin" type="password" placeholder="앱시크릿(App Secret)" autocomplete="new-password" spellcheck="false">
+    <div class="row" style="gap:8px;margin-top:6px">
+      <span class="hint" id="kisState" style="margin:0;flex:1">확인 중…</span>
+      <button type="button" id="kisSaveBtn" onclick="kisSave()">저장</button>
+      <button type="button" id="kisDelBtn" onclick="kisDel()">지우기</button>
+    </div>
+    <div class="hint" style="margin-left:0">넣으면 나스닥 선물을 본인 계정의 실시간 시세로 보여줍니다. 키는 이 기기에만 저장되고 한국투자증권 서버에만 쓰입니다.</div>
+  </div>
 </div></dialog>
 <dialog id="pfdlg"><form class="dlg" method="dialog" onsubmit="return pfSave()">
   <div class="row"><h2 id="pfdlgh">포트폴리오 추가</h2><button type="button" class="x" onclick="pfdlg.close()">✕</button></div>
@@ -2919,7 +3162,43 @@ function syncCfgUI(){
   document.getElementById('showday').checked = localStorage.getItem('pfDay') !== '0';
   document.getElementById('pfhide').checked = pfHidden();
 }
-function openCfg(){ syncCfgUI(); document.getElementById('cfgdlg').showModal(); pdfInfo(); }
+function openCfg(){ syncCfgUI(); document.getElementById('cfgdlg').showModal(); pdfInfo(); kisInfo(); }
+// 한국투자증권 키 — 저장된 키는 화면으로 돌아오지 않는다(있는지·마지막 호출 결과만 받는다)
+function kisShow(d){
+  const el = document.getElementById('kisState');
+  document.getElementById('kisDelBtn').disabled = !d.set;
+  if(d.error && !d.set){ el.textContent = d.error; el.className = 'hint up'; return; }
+  el.className = 'hint';
+  el.textContent = !d.set ? '키 없음'
+    : d.ok === false ? '저장됨 · 오류: ' + (d.error || '알 수 없음')
+    : (d.ok ? '저장됨 · 연결됨' : '저장됨 · 아직 시세를 받지 않았습니다')
+      + (d.fut ? ' · 나스닥 선물: ' + (/EGW00550/.test(d.fut) ? 'CME 시세 신청이 필요합니다' : d.fut) : '');
+  if(d.ok === false) el.className = 'hint up';
+  setFast(d.set && d.ok !== false ? d.refreshMs : null);
+}
+async function kisInfo(){
+  try { kisShow(await (await fetch('/api/kis')).json()); }
+  catch(e){ document.getElementById('kisState').textContent = '상태를 읽지 못했습니다.'; }
+}
+async function kisSave(){
+  const k = document.getElementById('kisKey'), sc = document.getElementById('kisSecret');
+  const btn = document.getElementById('kisSaveBtn');
+  if(!k.value.trim() || !sc.value.trim()){ kisShow({set:false, error:'앱키와 앱시크릿을 모두 넣어 주세요'}); return; }
+  btn.disabled = true; document.getElementById('kisState').textContent = '확인 중…';
+  try {
+    const r = await fetch('/api/kis', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({appKey: k.value.trim(), appSecret: sc.value.trim()})});
+    const d = await r.json();
+    if(!r.ok) kisShow({set:false, error: d.error || '저장하지 못했습니다'});
+    else { kisShow(d); k.value = ''; sc.value = ''; if(HOME && typeof mktLoad === 'function') mktLoad(); }
+  } catch(e){ kisShow({set:false, error:'저장하지 못했습니다'}); }
+  btn.disabled = false;
+}
+async function kisDel(){
+  if(!confirm('저장한 한국투자증권 키를 지울까요?')) return;
+  try { kisShow(await (await fetch('/api/kis?clear=1', {method:'POST'})).json()); if(HOME && typeof mktLoad === 'function') mktLoad(); }
+  catch(e){ kisShow({set:false, error:'지우지 못했습니다'}); }
+}
 // 하루 한 번만 받는 자료(구성종목 PDF)의 상태. 리밸런싱이 늦게 올라온 날 손으로 새로 받을 수 있게 한다.
 // 설정 창은 지금 보고 있는 것만 이야기한다 — 홈이면 포트폴리오 종목, 종목 화면이면 그 종목.
 // 이 범위가 '지금 다시 받기'가 실제로 다시 받는 범위와 같아야 숫자와 동작이 어긋나지 않는다.
@@ -3273,7 +3552,11 @@ async function refresh(){
 // (브라우저가 숨은 탭 타이머를 1분 단위로 묶으므로 실제 갱신은 약 1분 간격)
 const BG_OK = ${LOCAL};
 let timer = null;
-function startLoop(){ if(!timer) timer = setInterval(refresh, ${REFRESH_MS}); }
+// 갱신 주기 — 한국투자증권 키가 살아 있으면 그쪽 주기(3초)로 당긴다(setFast). 네이버·야후 값은 서버 캐시가
+// 제 주기대로 묶어 두므로 화면이 자주 물어도 그쪽 호출은 늘지 않는다.
+const BASE_MS = ${REFRESH_MS};
+let REFRESH = BASE_MS;
+function startLoop(){ if(!timer) timer = setInterval(refresh, REFRESH); }
 function stopLoop(){ if(timer){ clearInterval(timer); timer = null; } }
 // 마지막 응답이 갱신 주기 안이면 다시 받지 않는다(있으면 그걸 그린다).
 // 재진입·탭 복귀마다 무조건 refresh()를 부르면 12초 전에 받아 둔 값이 있어도 전체를 다시 훑는다.
@@ -3326,8 +3609,18 @@ function showHome(){
 // 주말·휴장에만 붙는다(판단은 서버에서). 값은 localStorage에 남겨 홈 재진입 때 빈 칸이 없게 한다.
 // 지수·환율은 종목 화면과 같은 주기로 그린다. 실제 외부 호출 간격은 서버 캐시가 정한다 —
 // 국내 지수는 이 주기 그대로, 야후(선물·환율)는 15초, 야간선물은 25초로 각각 묶인다.
-const MKT_MS = ${REFRESH_MS};
+let MKT_MS = BASE_MS;
 let MKT = null, MKTAT = 0, mktTimer = null;
+let pxTimer = null;
+function setFast(ms){
+  const next = ms || BASE_MS;
+  if(next === REFRESH) return;
+  REFRESH = MKT_MS = next;
+  if(timer){ stopLoop(); startLoop(); }
+  if(mktTimer){ clearInterval(mktTimer); mktTimer = null; mktStart(); }
+  if(pxTimer){ clearInterval(pxTimer); pxTimer = setInterval(pxTickVisible, MKT_MS); }
+}
+function pxTickVisible(){ if(BG_OK || !document.hidden) pfPxTick(); }
 function mktStart(){
   if(!MKT){
     try { const c = JSON.parse(localStorage.getItem('mktLast')||'null');
@@ -3588,7 +3881,8 @@ function pfRender(){
   const dayOn = localStorage.getItem('pfDay') !== '0';
   // 외부 공개용이면 금액만 '-'로 — 비율(수익률·비중·%p)과 1주 가격(평단·현재가·주당 등락)은 그대로
   const hide = pfHidden();
-  const M = function(html){ return hide ? '-' : html; };
+  // 가린 자리는 '-'도 남기지 않고 비운다(사용자 요청) — 큰 숫자 칸은 높이만 지키게 빈칸을 둔다
+  const M = function(html){ return hide ? '' : html; };
   // 기준이 '오늘 종가'인데 차이가 0이면 아무것도 보여주지 않는다 — 장이 끝나면 현재가는 시간외
   // 체결이 없는 한 종가 그대로여서 '오늘 종가보다 0원 +0.00%'가 종일 붙어 있다(사용자 지적).
   // iNAV는 장외에도 계속 움직이므로 그대로 나온다. 시간외 체결이 있으면 현재가도 값이 생긴다.
@@ -3596,12 +3890,13 @@ function pfRender(){
   const dayHtml = function(inner){ return dayShow
     ? '<span class="day '+cls(dayDiff)+'">'+inner+'</span>' : ''; };
   sum.innerHTML =
-    '<div class="bx"><div class="muted">원금</div><div class="v">'+M(fmt(cost,0)+'원')+'</div></div>'+
+    '<div class="bx"><div class="muted">원금</div><div class="v">'+(hide ? '&nbsp;' : fmt(cost,0)+'원')+'</div></div>'+
     '<div class="bx"><div class="muted">현재가치 <span style="font-size:10.5px">'+bLbl+' 기준</span></div>'+
-      '<div class="v">'+(total!=null ? M(fmt(total,0)+'원') : '—')+'</div>'+
-      dayHtml(dayLbl+' '+M(amtHtml(dayDiff)))+'</div>'+
+      '<div class="v">'+(hide ? '&nbsp;' : total!=null ? fmt(total,0)+'원' : '—')+'</div>'+
+      (hide ? '' : dayHtml(dayLbl+' '+amtHtml(dayDiff)))+'</div>'+
     '<div class="bx"><div class="muted">변동</div><div class="v '+(diff!=null?cls(diff):'')+'">'+
-      (diff!=null ? M(amtHtml(diff))+'<span class="pct">'+sign(pct)+'%</span>' : '—')+'</div>'+
+      // 금액을 가리면 수익률이 그 자리를 큰 글씨로 차지한다
+      (diff==null ? '—' : hide ? sign(pct)+'%' : amtHtml(diff)+'<span class="pct">'+sign(pct)+'%</span>')+'</div>'+
       dayHtml(dayLbl+' '+sign(dayPp)+'%p')+'</div>';
   // 비중은 선택한 기준의 평가금액 — 값이 움직이면 막대도 따라 움직인다. 아직 못 구했으면 원금 기준.
   const base = (total != null && total > 0) ? total : cost;
@@ -3620,13 +3915,13 @@ function pfRender(){
       '<div class="pfbar" title="'+(r.val!=null?bLbl:'원금')+' 기준 비중 '+fmt(w,1)+'%">'+
         '<i style="width:'+w.toFixed(1)+'%"></i><span>'+fmt(w,1)+'%'+
         (mine!=null && !hide ? '<b>('+fmt(mine,0)+')</b>' : '')+'</span></div>'+
-      '<div class="dt"><span class="muted">'+M(fmt(r.h.qty,0))+'주 · 평균 '+fmt(r.h.avg,dp(r.h.avg))+'원'+
+      '<div class="dt"><span class="muted">'+M(fmt(r.h.qty,0)+'주 · ')+'평균 '+fmt(r.h.avg,dp(r.h.avg))+'원'+
         (r.unit!=null ? ' → '+bLbl+' '+fmt(r.unit,dp(r.unit))+'원' : '')+
         (dayOn && r.dayD != null && !(dayReg && Math.round(r.dayD) === 0)
           ? ' <span class="day '+cls(r.dayD)+'" title="'+esc(dayLbl)+'">'+amtHtml(r.dayD)
           + '<span class="pct">'+sign(r.dayP)+'%</span></span>' : '')+'</span>'+
         '<span class="'+(d!=null?cls(d):'muted')+'">'+
-          (d!=null ? M(amtHtml(d))+' <span style="font-size:12px">'+sign(p)+'%</span>' : '계산 중…')+'</span>'+
+          (d!=null ? M(amtHtml(d)+' ')+'<span style="font-size:12px">'+sign(p)+'%</span>' : '계산 중…')+'</span>'+
       '</div></div>';
   }).join('');
 }
@@ -3773,7 +4068,7 @@ if(HOME){
   setInterval(pfTick, 30e3);
   // 현재가는 ETF 자체 시세만 있으면 되므로(구성종목을 훑지 않는다) 종목 화면과 같은 주기로 돌린다.
   // iNAV 전체 재계산은 위 pfTick이 PF_TTL 주기로 맡는다.
-  setInterval(function(){ if(BG_OK || !document.hidden) pfPxTick(); }, MKT_MS);
+  pxTimer = setInterval(pxTickVisible, MKT_MS);
 }
 else {
   renderRecent();
@@ -3783,6 +4078,8 @@ else {
   refreshIfStale();
   if(BG_OK || !document.hidden) startLoop();
 }
+// 한국투자증권 키가 있으면 갱신 주기를 당긴다(설정 창을 열지 않아도)
+kisInfo();
 </script></body></html>`;
 
 const handler = async (req, res) => {
@@ -3841,6 +4138,29 @@ const handler = async (req, res) => {
     send(req, res, JSON.stringify(pdfStatus(only)), JSON_T);
     return;
   }
+  if (u.pathname === '/api/kis') {
+    // 키를 바꾸거나 지우는 요청은 POST + 같은 출처만 — 다른 사이트가 사용자 키를 바꿔 넣지 못하게
+    if (req.method === 'POST') {
+      const org = req.headers.origin;
+      if (org && org !== 'null' && new URL(org).host !== req.headers.host) {
+        res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: '다른 출처의 요청입니다' }));
+        return;
+      }
+      try {
+        if (u.searchParams.get('clear') === '1') return send(req, res, JSON.stringify(kisClear()), JSON_T);
+        let raw = '';
+        for await (const ch of req) { raw += ch; if (raw.length > 4096) throw new Error('요청이 너무 큽니다'); }
+        send(req, res, JSON.stringify(await kisSetKeys(JSON.parse(raw || '{}'))), JSON_T);
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+      return;
+    }
+    send(req, res, JSON.stringify(kisStatus()), JSON_T);
+    return;
+  }
   if (u.pathname === '/api/px') {
     try {
       send(req, res, JSON.stringify(await pxOf(codesParam(u.searchParams.get('codes')).slice(0, 30))), JSON_T);
@@ -3876,7 +4196,8 @@ const handler = async (req, res) => {
 // 안드로이드에서는 HTTP 서버가 없다 — 페이지가 이 함수들을 직접 부른다(에셋 index.html의 fetch shim).
 if (!NODE) {
   // 브리지가 실제로 부르는 것만 내놓는다 — 라우트 로직은 위의 공용 함수에 있다
-  globalThis.ENGINE = { computeINav, etfList, marketQuotes, stats, codesParam, pdfClear, pdfStatus, pxOf, DEFAULT_CODE };
+  globalThis.ENGINE = { computeINav, etfList, marketQuotes, stats, codesParam, pdfClear, pdfStatus, pxOf,
+    kisStatus, kisSetKeys, kisClear, DEFAULT_CODE };
 } else {
 
 // async 핸들러가 던지면 unhandled rejection으로 프로세스가 죽는다 — 요청 하나로 서비스가 내려간다.
@@ -3897,6 +4218,6 @@ if (require.main === module) {
     try { fs.writeFileSync(__dirname + '/server.pid', String(process.pid)); } catch (e) {}
   });
 }
-module.exports = { keepOnLoad, bizStep, navTargetD, dig8, codesParam, pdfClear, pdfStatus, pxOf, server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, dropBadPdf, krSession, quoteSession, omOffHours, resolveTicker, idxSettled, fxMarketOpen, spotFirst, KR_PREOPEN, dayRef, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, resolveNavRef, nearestFxDate, parseMinClose, needRegFix, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
+module.exports = { kisBody, kisStatus, kisSetKeys, kisClear, kisKrQuotes, kisUsDay, kisEtfPrevNav, kisTop30Pdf, futCodeOf, kisLastPx, keepOnLoad, bizStep, navTargetD, dig8, codesParam, pdfClear, pdfStatus, pxOf, server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, dropBadPdf, krSession, quoteSession, omOffHours, resolveTicker, idxSettled, fxMarketOpen, spotFirst, KR_PREOPEN, dayRef, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, resolveNavRef, nearestFxDate, parseMinClose, needRegFix, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
 
 }

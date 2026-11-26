@@ -78,6 +78,12 @@ const SHIM = BRIDGE + `<script src="engine.js"></script>
         return J(q.get('clear') === '1' ? ENGINE.pdfClear(only) : ENGINE.pdfStatus(only));
       }
       if(s.startsWith('/api/px')) return J(await ENGINE.pxOf(ENGINE.codesParam(q.get('codes')).slice(0, 30)));
+      if(s.startsWith('/api/kis')){ // 한국투자증권 키 — 기기 localStorage에만 저장(엔진이 처리)
+        if(((o && o.method) || 'GET').toUpperCase() !== 'POST') return J(ENGINE.kisStatus());
+        if(q.get('clear') === '1') return J(ENGINE.kisClear());
+        try { return J(await ENGINE.kisSetKeys(JSON.parse((o && o.body) || '{}'))); }
+        catch(e){ return E(e.message, 400); }
+      }
       if(s.startsWith('/api/stats')) return J(ENGINE.stats);
       if(s.startsWith('/api/pf'))    return E('이 앱은 포트폴리오를 기기에 저장합니다', 404); // 로컬 저장으로 유도
     } catch(e){ return E(e.message); }
