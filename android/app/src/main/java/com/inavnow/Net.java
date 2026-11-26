@@ -54,7 +54,15 @@ public class Net {
     private final Object lifecycle = new Object();
     private SSLSocketFactory sectigoFactory; // 지연 생성
 
-    Net(MainActivity act) { this.act = act; }
+    /** 트레이딩뷰 시세 웹소켓(Vantage NAS100FT) — 브리지와 따로 연다(Ws.java 설명) */
+    private final Ws ws;
+
+    Net(MainActivity act) { this.act = act; this.ws = new Ws(act); }
+
+    /** engine.js의 window.__ws가 부른다. 주소는 Ws.URL 하나만 받는다. 이벤트는 resolveWs로 돌아간다. */
+    @JavascriptInterface public void wsOpen(String id, String url) { if (!closed) ws.open(id, url); }
+    @JavascriptInterface public void wsSend(String id, String text) { ws.send(id, text); }
+    @JavascriptInterface public void wsClose(String id) { ws.close(id); }
 
     /** engine.js의 window.__net이 부른다. 응답은 콜백 id로 되돌려 준다(WebView는 동기 반환이 위험). */
     @JavascriptInterface
@@ -248,6 +256,7 @@ public class Net {
     void close() {
         synchronized (lifecycle) {
             closed = true;
+            ws.closeAll();
             for (HttpURLConnection c : active) {
                 try { c.disconnect(); } catch (Throwable ignore) {}
             }

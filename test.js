@@ -308,6 +308,15 @@ if (A) {
     assert.strictEqual(S.gapCombine([0.998, 1.0]), null, '두 상품이 0.10%p 넘게 어긋나면 추정하지 않아야 한다');
     assert.strictEqual(S.gapCombine([null, 1.002]), 1.002, '한 곳이 실패하면 남은 한 곳으로');
     assert.strictEqual(S.gapCombine([null, null]), null);
+    // Vantage NAS100FT 기록 — 다음 값이 올 때까지 앞 값이 유효하다(계단)
+    const vh = [];
+    S.vtPush(vh, t0, 100); S.vtPush(vh, t0 + 10e3, 101);
+    assert.strictEqual(S.vtHistAt(vh, t0 + 5e3), 100, '다음 값 전까지는 앞 값이어야 한다');
+    assert.strictEqual(S.vtHistAt(vh, t0 + 60e3), 101, '마지막 값은 새 값이 올 때까지 유효하다');
+    assert.strictEqual(S.vtHistAt(vh, t0 - 1), null, '연결 전 시각은 기록으로 모른다(분봉으로)');
+    S.vtPush(vh, t0 + 20 * 60e3, 102);
+    assert.strictEqual(vh.length, 2, '16분 넘은 기록은 버리되');
+    assert.strictEqual(S.vtHistAt(vh, t0 + 15 * 60e3), 101, '그 뒤 값을 받치는 마지막 하나는 남겨야 한다');
   }
   const kst = (d, hm) => Date.parse(d + 'T' + hm + ':00+09:00');
   assert.strictEqual(S.idxFutCode('01', kst('2026-11-26', '18:01')), 'A01612');
@@ -759,8 +768,9 @@ if (A) {
     const netJava = path.join(__dirname, 'android/app/src/main/java/com/inavnow/Net.java');
     if (fs.existsSync(netJava)) { // PC 배포판에는 android 폴더가 없다
       const src = fs.readFileSync(__filename.replace(/test\.js$/, 'server.js'), 'utf8');
-      // 데이터를 받는 곳이 아닌 것들: 폰트·아이콘 CDN(빌드가 제거), SVG 네임스페이스, PEM 안에 적힌 발급자 URL
-      const skip = new Set(['cdn.jsdelivr.net', 'ssl.gstatic.com', 'www.w3.org', 'crt.sectigo.com']);
+      // 데이터를 받는 곳이 아닌 것들: 폰트·아이콘 CDN(빌드가 제거), SVG 네임스페이스, PEM 안에 적힌 발급자 URL,
+      // 트레이딩뷰 웹소켓의 Origin 헤더 값(앱에서는 브리지가 아니라 Net.java의 웹소켓이 따로 연다)
+      const skip = new Set(['cdn.jsdelivr.net', 'ssl.gstatic.com', 'www.w3.org', 'crt.sectigo.com', 'www.tradingview.com']);
       // 443이 아닌 포트는 '호스트:포트'로 센다 — 허용 목록도 그렇게 적는다
       const used = [...new Set([...src.matchAll(/https:\/\/([a-z0-9.-]+\.[a-z]{2,}(?::\d+)?)/g)].map(m => m[1].replace(/:443$/, '')))]
         .filter(h => !skip.has(h));

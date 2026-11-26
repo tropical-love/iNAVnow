@@ -96,6 +96,14 @@ public class MainActivity extends Activity {
         runOnUiThread(() -> { if (!destroyed) web.evaluateJavascript(js, null); });
     }
 
+    /** Ws가 읽기 스레드에서 부른다 — 열림·메시지·닫힘을 window.__wsEvent(id, type, data)로 넘긴다 */
+    void resolveWs(String id, String type, String data) {
+        if (destroyed) return;
+        final String js = "window.__wsEvent&&window.__wsEvent(" + JSONObject.quote(id) + "," + JSONObject.quote(type) + ","
+                + (data == null ? "null" : JSONObject.quote(data)) + ")";
+        runOnUiThread(() -> { if (!destroyed) web.evaluateJavascript(js, null); });
+    }
+
     /**
      * 종목 상세에서는 뒤로가기가 히스토리를 따라가고, 메인 화면에서는 두 번 눌러야 끝난다.
      *

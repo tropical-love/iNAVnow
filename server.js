@@ -1724,12 +1724,15 @@ async function marketQuotes() {
         if (lv) return { name, value: lv, chg: lv - prev, chgPct: (lv / prev - 1) * 100, closed, live: true };
       } catch (e) { kisFut = e.message; }
     }
-    // 무료 선물 시세는 10분 늦다 — 그 사이의 움직임을 채워 지금 값을 추정한다(nqGapRatio)
+    // 무료 선물 시세는 10분 늦다 — 그 사이의 움직임을 채워 지금 값을 추정한다.
+    // 1순위 Vantage NAS100FT(vtRatio), 안 되면 24시간 추종 상품 두 개(nqGapRatio).
     if (sym === 'NQ=F' && prev && !closed) {
-      const r = await nqGapRatio(m.regularMarketTime * 1000).catch(() => null);
+      const yt = m.regularMarketTime * 1000;
+      const vr = await vtRatio(yt).catch(() => null);
+      const r = vr || await nqGapRatio(yt).catch(() => null);
       if (r) {
         const ev = v * r;
-        return { name, value: ev, chg: ev - prev, chgPct: (ev / prev - 1) * 100, closed, est: true };
+        return { name, value: ev, chg: ev - prev, chgPct: (ev / prev - 1) * 100, closed, est: true, estBy: vr ? 'vantage' : 'gap' };
       }
     }
     return { name, value: v, chg: prev ? v - prev : null, chgPct: prev ? (v / prev - 1) * 100 : null, closed };
@@ -1742,7 +1745,7 @@ async function marketQuotes() {
   return rs.map((r, i) => r.status === 'fulfilled' ? r.value : { name: names[i], value: null, closed: false });
 }
 
-// ---------- 나스닥 선물 지연 공백 채우기 ----------
+// ---------- 나스닥 선물 지연 공백 채우기 (2순위 — 1순위는 아래 Vantage NAS100FT) ----------
 // 무료 선물 시세는 10분 늦게 온다. 마지막 체결가 이후의 움직임을 24시간 거래되는 나스닥100 추종 상품
 // 두 개의 같은 구간 변동률로 채운다: 추정 = 선물 마지막 체결가 × (추종 상품 지금 ÷ 그 체결 시각의 추종 상품).
 // 가격 수준은 선물 체결가에서, 최근 움직임만 추종 상품에서 가져온다(수준은 두 상품이 0.2%쯤 다르다).
@@ -1827,6 +1830,119 @@ async function nqGapRatio(yt, now = Date.now()) {
     return base > 0 ? cur[f] / base : NaN;
   }));
   return gapCombine(rs);
+}
+
+// ---------- 나스닥 선물 지연 공백 채우기 1순위 — Vantage NAS100FT ----------
+// 트레이딩뷰에 올라온 Vantage의 나스닥100 선물 CFD(VANTAGE:NAS100FT)는 로그인 없이 실시간(1~2초)으로 온다
+// (같은 연결에서 CME NQ1!은 delayed_streaming_600). CME 최근월물을 거의 그대로 따른다 —
+// 실측 2026-11-26 5시간 1분봉: 수준 차 평균 −0.9pt·표준편차 1.2pt, 10분 변동률 차 표준편차 0.0067%p·최대 0.023%p
+// (같은 구간 위 XYZ100은 0.015%p·0.050%p).
+// 값을 그대로 쓰지 않고 위 방식과 같은 비율로 쓴다: 추정 = 선물 마지막 체결가 × (NAS100FT 지금 ÷ 그 체결 시각의 NAS100FT).
+//  · 전일 종가가 CME 정산가와 다르다(실측 25,997.4 대 26,100.25) — 등락의 기준은 야후 그대로 둔다
+//  · 다음 월물로 넘어가는 날이 야후와 다르면 수준이 수백 pt 어긋나는데, 비율로 쓰면 그 영향이 없다
+// 공개 API가 아니라 트레이딩뷰 웹소켓이다. 열리지 않거나 끊기거나 값이 낡으면 위 추종 상품 방식으로 넘어간다.
+// 트레이딩뷰는 Origin을 가린다 — tradingview.com·localhost는 받고 file://·null·빈 값·남의 도메인은 끊는다(실측).
+// 그래서 Node는 Origin을 직접 넣고, 안드로이드는 WebView(file://) 대신 네이티브(window.__ws)가 연다.
+// 연결은 물을 때 열고, VT_IDLE_MS 동안 묻지 않으면 닫는다(주말·휴장에는 열지 않는다 — 부르는 쪽이 '마감'이면 안 묻는다).
+const VT_SYM = 'VANTAGE:NAS100FT';
+const VT_URL = 'wss://data.tradingview.com/socket.io/websocket?type=chart';
+const VT_IDLE_MS = 3 * 60e3;
+const VT_LIVE_MS = 45e3;     // 이보다 오래 아무 메시지(하트비트 포함)도 없으면 죽은 연결로 본다
+const VT_RETRY_MS = 60e3;    // 열기에 실패하거나 끊기면 이만큼은 다시 열지 않는다
+const VT_WAIT_MS = 2500;     // 처음 열 때 첫 시세·분봉을 이만큼 기다린다
+const VT_MAX_MOVE = 0.05;    // 15분 사이 5% 넘는 비율은 깨진 값으로 본다
+const vt = { ws: null, hist: [], bars: new Map(), msgAt: 0, failAt: 0, ready: null, idle: null };
+function vtSocket() {
+  if (NODE) return typeof WebSocket === 'function'
+    ? new WebSocket(VT_URL, { headers: { Origin: 'https://www.tradingview.com' } }) : null;
+  return typeof globalThis.__ws === 'function' ? globalThis.__ws(VT_URL) : null;
+}
+// 시세 기록 — 체결 시각의 값을 찾으려고 GAP_HIST_MS만큼 둔다. 맨 앞 하나는 그보다 오래돼도 남긴다
+// (다음 값이 올 때까지 그 값이 유효하므로). 연결이 끊기면 통째로 비운다(그 사이 값은 모른다).
+function vtPush(hist, t, v) {
+  hist.push({ t, v });
+  while (hist.length > 1 && t - hist[1].t > GAP_HIST_MS) hist.shift();
+}
+// 기록에서 t 시각의 값 — 시세는 다음 값이 올 때까지 그대로이므로 t 이전의 마지막 값이다
+function vtHistAt(hist, t) {
+  if (!hist.length || hist[0].t > t) return null;
+  let v = null;
+  for (const s of hist) { if (s.t > t) break; v = s.v; }
+  return v;
+}
+function vtClose() {
+  const ws = vt.ws;
+  vt.ws = null; vt.hist = []; vt.bars = new Map();
+  clearTimeout(vt.idle);
+  if (ws) try { ws.close(); } catch (e) {}
+}
+function vtOpen() {
+  let ws = null;
+  try { ws = vtSocket(); } catch (e) {}
+  if (!ws) { vt.failAt = Date.now(); return; }
+  vt.ws = ws; vt.hist = []; vt.bars = new Map(); vt.msgAt = Date.now();
+  let done;
+  vt.ready = new Promise(r => { done = r; });
+  const send = (m, p) => { const s = JSON.stringify({ m, p }); ws.send(`~m~${s.length}~m~${s}`); };
+  const lost = () => { if (vt.ws !== ws) return; vtClose(); vt.failAt = Date.now(); done(); };
+  ws.onmessage = e => {
+    if (vt.ws !== ws) return;
+    vt.msgAt = Date.now();
+    // 프레임은 '~m~길이~m~내용'이 여럿 붙어 온다. 하트비트('~h~N')는 그대로 되돌려 줘야 끊기지 않는다.
+    for (const part of String(e.data).split(/~m~\d+~m~/)) {
+      if (!part) continue;
+      if (part.startsWith('~h~')) { ws.send(`~m~${part.length}~m~${part}`); continue; }
+      let j;
+      try { j = JSON.parse(part); } catch (e) { continue; }
+      if (j.session_id) {
+        send('set_auth_token', ['unauthorized_user_token']);
+        send('quote_create_session', ['qs_vt']);
+        send('quote_set_fields', ['qs_vt', 'lp']);
+        send('quote_add_symbols', ['qs_vt', VT_SYM]);
+        // 연 직후 10분은 체결 시각의 값이 기록에 없다 — 그동안은 분봉으로 메운다
+        send('chart_create_session', ['cs_vt', '']);
+        send('resolve_symbol', ['cs_vt', 'sym', '=' + JSON.stringify({ symbol: VT_SYM })]);
+        send('create_series', ['cs_vt', 's1', 's1', 'sym', '1', 20, '']);
+      } else if (j.m === 'qsd') {
+        const q = j.p && j.p[1];
+        if (q && q.s === 'error') return lost(); // 심볼이 사라졌다
+        if (q && q.v && q.v.lp > 0) vtPush(vt.hist, Date.now(), q.v.lp);
+      } else if ((j.m === 'timescale_update' || j.m === 'du') && j.p && j.p[0] === 'cs_vt') {
+        for (const b of (j.p[1] && j.p[1].s1 && j.p[1].s1.s) || []) {
+          const [t, o, , , c] = b.v;
+          vt.bars.set(t * 1e3, [t * 1e3, o, c]);
+        }
+        for (const t of vt.bars.keys()) if (Date.now() - t > 20 * 60e3) vt.bars.delete(t);
+      } else if (/error/.test(j.m || '')) return lost(); // critical_error·protocol_error·symbol_error
+      if (vt.hist.length && vt.bars.size) done();
+    }
+  };
+  ws.onclose = lost;
+  ws.onerror = lost;
+}
+// 선물 체결 시각 yt부터 지금까지의 NAS100FT 변동 비율. 모르면 null(→ 추종 상품 방식으로).
+async function vtRatio(yt) {
+  const now = Date.now();
+  if (!(yt > 0) || now - yt > GAP_MAX_AGE) return null;
+  if (vt.ws && now - vt.msgAt > VT_LIVE_MS) vtClose(); // 조용히 죽은 연결
+  if (!vt.ws) {
+    if (now - vt.failAt < VT_RETRY_MS) return null;
+    vtOpen();
+    if (!vt.ws) return null;
+  }
+  clearTimeout(vt.idle);
+  vt.idle = setTimeout(vtClose, VT_IDLE_MS);
+  if (vt.idle.unref) vt.idle.unref(); // 이 타이머가 Node 프로세스를 붙잡지 않게
+  if (!vt.hist.length || !vt.bars.size) {
+    await Promise.race([vt.ready, new Promise(r => { const tm = setTimeout(r, VT_WAIT_MS); if (tm.unref) tm.unref(); })]);
+  }
+  const h = vt.hist;
+  if (!h.length) return null;
+  const cur = h[h.length - 1].v;
+  const base = vtHistAt(h, yt) ?? gapBarAt([...vt.bars.values()], yt);
+  if (!(base > 0) || !(cur > 0)) return null;
+  const r = cur / base;
+  return Math.abs(r - 1) > VT_MAX_MOVE ? null : r;
 }
 
 // ---------- 한국투자증권 Open API (선택) — 나스닥 선물 실시간 ----------
@@ -3840,7 +3956,7 @@ function mktRender(){
   if(!MKT) return;
   document.getElementById('mktbody').innerHTML = MKT.map(function(m){
     const amt = m.chg == null ? '—' : (m.chg>0?'▲':m.chg<0?'▼':'')+fmt(Math.abs(m.chg),2);
-    return '<div class="m"><div class="mn">'+esc(m.name)+(m.closed?'<span class="badge closed">마감</span>':m.est?'<span class="badge b추정" title="최근 10분 움직임을 반영한 추정값입니다">추정</span>':'')+'</div>'
+    return '<div class="m"><div class="mn">'+esc(m.name)+(m.closed?'<span class="badge closed">마감</span>':m.est?'<span class="badge b추정" title="'+(m.estBy==='vantage'?'10분 늦은 선물 체결가에 그 뒤 움직임(Vantage 나스닥100 선물 CFD, 실시간)을 반영한 추정값입니다':'10분 늦은 선물 체결가에 그 뒤 움직임(나스닥100 추종 상품)을 반영한 추정값입니다')+'">추정</span>':'')+'</div>'
       + '<div class="mv">'+(m.value==null?'—':fmt(m.value,2))+'</div>'
       + '<div class="mc '+(m.chg?cls(m.chg):'muted')+'">'+amt+(m.chgPct==null?'':' '+sign(m.chgPct)+'%')+'</div></div>';
   }).join('');
@@ -4413,6 +4529,6 @@ if (require.main === module) {
     try { fs.writeFileSync(__dirname + '/server.pid', String(process.pid)); } catch (e) {}
   });
 }
-module.exports = { gapHistAt, gapBarAt, gapCombine, nqGapRatio, kisKrDays, kisIndexAsNaver, kisEtfAsIg, idxFutCode, kisBody, kisStatus, kisSetKeys, kisClear, kisKrQuotes, kisUsDay, kisEtfPrevNav, kisTop30Pdf, futCodeOf, kisLastPx, keepOnLoad, bizStep, navTargetD, dig8, codesParam, pdfClear, pdfStatus, pxOf, server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, dropBadPdf, krSession, quoteSession, omOffHours, resolveTicker, idxSettled, fxMarketOpen, spotFirst, KR_PREOPEN, dayRef, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, resolveNavRef, nearestFxDate, parseMinClose, needRegFix, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
+module.exports = { gapHistAt, gapBarAt, gapCombine, nqGapRatio, vtPush, vtHistAt, vtRatio, kisKrDays, kisIndexAsNaver, kisEtfAsIg, idxFutCode, kisBody, kisStatus, kisSetKeys, kisClear, kisKrQuotes, kisUsDay, kisEtfPrevNav, kisTop30Pdf, futCodeOf, kisLastPx, keepOnLoad, bizStep, navTargetD, dig8, codesParam, pdfClear, pdfStatus, pxOf, server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, dropBadPdf, krSession, quoteSession, omOffHours, resolveTicker, idxSettled, fxMarketOpen, spotFirst, KR_PREOPEN, dayRef, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, resolveNavRef, nearestFxDate, parseMinClose, needRegFix, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
 
 }

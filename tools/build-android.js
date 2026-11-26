@@ -51,6 +51,27 @@ const BRIDGE = `<script>
       } catch(e){ waiting.delete(id); rej(new Error('브리지 없음: ' + e.message)); }
     });
   };
+  // 트레이딩뷰 시세 웹소켓 — WebView의 WebSocket은 Origin이 file://라 끊긴다. Ws.java가 대신 연다.
+  // 엔진이 쓰는 만큼만 흉내 낸다: send·close, onopen·onmessage·onclose·onerror, readyState.
+  // id에 시각을 붙인다 — 페이지를 옮기면 번호가 1부터 다시 시작해 옛 페이지의 연결과 겹친다.
+  let wseq = 0; const socks = new Map();
+  window.__ws = function(url){
+    const id = 'w' + (++wseq) + '_' + Date.now();
+    const o = { readyState: 0, onopen: null, onmessage: null, onclose: null, onerror: null,
+      send: function(t){ if(o.readyState === 1) AndroidNet.wsSend(id, String(t)); },
+      close: function(){ if(o.readyState > 1) return; o.readyState = 2; AndroidNet.wsClose(id); } };
+    socks.set(id, o);
+    try { AndroidNet.wsOpen(id, url); } catch(e){ socks.delete(id); throw e; }
+    return o;
+  };
+  window.__wsEvent = function(id, type, data){
+    const o = socks.get(id);
+    // 모르는 연결(옛 페이지가 연 것)이면 닫아 달라고 한다 — 안 그러면 아무도 안 쓰는 연결이 남는다
+    if(!o){ if(type !== 'close') try { AndroidNet.wsClose(id); } catch(e){} return; }
+    if(type === 'open'){ o.readyState = 1; if(o.onopen) o.onopen({}); }
+    else if(type === 'message'){ if(o.onmessage) o.onmessage({data: data}); }
+    else { socks.delete(id); o.readyState = 3; if(o.onclose) o.onclose({}); }
+  };
 })();
 </script>
 `;
