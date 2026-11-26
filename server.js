@@ -9,7 +9,7 @@
 // 엔진을 <script src>로 싣기 전에 window.__net(url, opts) → Promise<Response>를 넣어 두면 된다.
 const NODE = typeof process !== 'undefined' && !!(process.versions && process.versions.node);
 // 설정 창 제목 옆에 보이는 버전. 안드로이드 versionName(android/app/build.gradle)과 같아야 한다(test.js가 본다).
-const APP_VERSION = '1.7.0';
+const APP_VERSION = '1.7.1';
 const http = NODE ? require('http') : null;
 const https = NODE ? require('https') : null;
 const zlib = NODE ? require('zlib') : null;
@@ -1604,6 +1604,22 @@ const NIGHT_TTL = 25e3;
 // 09:00부터는 쓰지 않으므로 캐시가 비어 있어도 부르지 않는다.
 const nightSessionNow = () => { const hm = kstHm(); return hm >= 1750 || hm < 600; };
 
+// 야간선물 1분봉 기록 — 차트가 트레이딩뷰 선물 봉(20분 지연) 뒤를 이 기록으로 잇는다(nightChart).
+// 1순위 출처는 지금 분의 봉(b: 시·고·저·종·거래량)을 함께 주므로 그대로 쓰고, 나머지는 받은 값으로 분봉을 만든다.
+// 시세를 받을 때(카드 25초 · 차트 3초 주기, 캐시가 25초로 묶음)마다 쌓이므로 이 프로세스가 켜진 뒤부터만 있다.
+const NIGHT_KEEP_MS = 40 * 60e3;
+const nightBars = { '^KS200': new Map(), '^KQ150': new Map() };
+function nightRecord(key, q, b, now = Date.now()) {
+  const m = nightBars[key];
+  if (!m || !q) return;
+  if (b && b.x > 0 && b.c > 0) m.set(b.x, [b.x, b.o || b.c, b.h || b.c, b.l || b.c, b.c, b.v || 0]);
+  else if (q.value > 0) {
+    const t = Math.floor((q.ts || now) / 60e3) * 60e3, o = m.get(t), v = q.value;
+    m.set(t, o ? [t, o[1], Math.max(o[2], v), Math.min(o[3], v), v, o[5]] : [t, v, v, v, v, 0]);
+  }
+  for (const t of m.keys()) if (now - t > NIGHT_KEEP_MS) m.delete(t);
+}
+
 async function nightFutures() {
   if (!nightSessionNow()) {
     const c = cache.get('night');
@@ -1612,7 +1628,10 @@ async function nightFutures() {
   }
   return cached('night', kis ? KIS_QUOTE_TTL : NIGHT_TTL, async () => {
     if (kis) {
-      try { const k = await kisIdxFut(); if (k['^KS200'] && k['^KQ150']) return k; } catch (e) { /* 아래로 */ }
+      try {
+        const k = await kisIdxFut();
+        if (k['^KS200'] && k['^KQ150']) { for (const key in k) nightRecord(key, k[key]); return k; }
+      } catch (e) { /* 아래로 */ }
     }
     const out = {};
     let ok1 = false;
@@ -1628,6 +1647,7 @@ async function nightFutures() {
           // 갱신 시각은 타임존 없는 KST 문자열 — 서버가 UTC(GCP)면 그냥 파싱하면 9시간 어긋난다
           ts: Date.parse(String(d.m.u).replace(' ', 'T') + '+09:00'),
         };
+        nightRecord(key, out[key], d.b);
       }));
     } catch (e) { /* 아래 폴백 */ }
     if (ok1) return out; // 1순위가 답했으면 '세션 없음'이라는 판단도 그대로 받는다
@@ -1638,6 +1658,7 @@ async function nightFutures() {
         // 이쪽은 세션 플래그가 없다 — 체결 시각이 최근이면 열린 것으로 본다
         if (r && r.price > 0) out[key] = { value: r.price, chg: r.change, chgPct: r.changePercent,
           ts: r.timestamp, open: Date.now() - r.timestamp < 6 * 60e3 };
+        if (out[key]) nightRecord(key, out[key]);
       }
     } catch (e) { /* 둘 다 막히면 지수+'마감'으로 돌아간다 */ }
     return out;
@@ -2019,19 +2040,47 @@ function vtStatus() {
 //  · 코스피·코스닥·ETF: 네이버(카드·시세와 같은 출처, 실시간). 1분봉은 약 6거래일치만 있어 3·5·15·60분은
 //    1분봉을 묶어 만든다(그래서 60분봉은 40개 남짓). 일봉은 넉넉히, 주·월·연봉은 네이버가 주는 만큼(110·110·25개).
 //  · 나스닥 선물·달러/원: 트레이딩뷰(위 연결에 차트 구독을 함께 싣는다). 나스닥 선물은 카드와 같은 Vantage NAS100FT.
-//    트레이딩뷰의 KRX 종목은 20분 늦어 국내는 쓰지 않는다(실측 delay 1200).
+//    트레이딩뷰의 KRX 종목은 20분 늦어 국내는 쓰지 않는다(실측 delay 1200) — 야간선물만 예외(nightChart).
 // 화면은 차트가 열려 있는 동안만 몇 초마다 다시 묻는다 — 서버 쪽 캐시가 그 사이 외부 호출을 묶는다.
 const CHART_RES = ['1', '3', '5', '15', '60', 'D', 'W', 'M', 'Y'];
 const CHART_TV = { NQ: VT_SYM, USDKRW: 'FX_IDC:USDKRW' };
 const CHART_KR_INDEX = new Set(['KOSPI', 'KOSDAQ']);
+// 야간선물 카드 → 지수선물 차트. 트레이딩뷰 최근월 연결물(20분 지연, 야간 시간대 포함) + 그 뒤는 nightBars.
+const CHART_NIGHT = { K200F: ['KRX:K2I1!', '^KS200'], KQ150F: ['KRX:KQI1!', '^KQ150'] };
 const TV_RES = { 1: '1', 3: '3', 5: '5', 15: '15', 60: '60', D: 'D', W: 'W', M: 'M', Y: '12M' };
 const CHART_N = 300;
 async function chartBars(id, res) {
   if (!CHART_RES.includes(res)) throw new Error('알 수 없는 주기: ' + res);
   if (CHART_TV[id]) return { bars: await tvChart(CHART_TV[id], TV_RES[res]) };
   if (CHART_KR_INDEX.has(id)) return { bars: await naverChart('index', id, res) };
+  if (CHART_NIGHT[id]) return nightChart(id, res);
   if (/^[0-9A-Z]{6}$/.test(id)) return { bars: await naverChart('item', id, res) };
   throw new Error('알 수 없는 차트: ' + id);
+}
+async function nightChart(id, res) {
+  const [sym, key] = CHART_NIGHT[id];
+  // 시세도 함께 물어 기록을 이어 간다(25초 캐시라 3초마다 물어도 밖으로는 25초에 한 번)
+  const [bars] = await Promise.all([tvChart(sym, TV_RES[res]), nightFutures().catch(() => null)]);
+  const live = [...nightBars[key].values()].sort((a, b) => a[0] - b[0]);
+  return nightMerge(bars, live, res);
+}
+// 트레이딩뷰 봉(늦음) 뒤에 실시간 1분봉을 잇는다. 마지막 봉과 같은 구간이면 고·저·종만 고친다
+// (거래량은 겹쳐 셀 수 있어 더하지 않는다). 둘 사이가 비면 note로 알린다.
+function nightMerge(bars, live, res) {
+  const out = bars.map(b => b.slice());
+  if (!out.length || !live.length) return { bars: out };
+  const tvLast = out[out.length - 1][0];
+  const minute = /^\d+$/.test(res), n = minute ? +res * 60e3 : 0;
+  let gap = false;
+  for (const b of live) {
+    const L = out[out.length - 1];
+    const k = minute ? Math.floor(b[0] / n) * n : L[0];
+    if (minute ? k < L[0] : b[0] < L[0]) continue; // 트레이딩뷰에 이미 있는 구간
+    if (k === L[0]) { L[2] = Math.max(L[2], b[2]); L[3] = Math.min(L[3], b[3]); L[4] = b[4]; continue; }
+    if (out[out.length - 1][0] === tvLast && b[0] - tvLast > n) gap = true; // 트레이딩뷰 끝과 기록 처음 사이가 빈다
+    out.push([k, b[1], b[2], b[3], b[4], b[5]]);
+  }
+  return gap ? { bars: out, note: '선물 봉은 20분 늦게 옵니다. 최근 구간은 이 화면을 연 뒤 받은 시세로 채워 빠진 분이 있을 수 있습니다.' } : { bars: out };
 }
 async function tvChart(sym, res) {
   if (!vtEnsure()) throw new Error(vt.why || '트레이딩뷰에 연결하지 못했습니다');
@@ -4304,7 +4353,7 @@ function makeChart(box, id, dec){
       const prev = c.bars.length ? c.bars[c.bars.length - 1][0] : null;
       if(c.end > 0 && prev != null) c.end += d.bars.filter(function(b){ return b[0] > prev; }).length;
       c.bars = d.bars || []; c.err = ''; clampEnd();
-      stEl.textContent = c.bars.length ? '' : '봉이 없습니다.';
+      stEl.textContent = !c.bars.length ? '봉이 없습니다.' : (d.note || '');
     } catch(e){
       if(seq !== c.seq) return;
       c.err = e.message; stEl.textContent = '차트를 받지 못했습니다: ' + e.message;
@@ -4321,9 +4370,16 @@ function makeChart(box, id, dec){
   window.addEventListener('resize', function(){ if(c.on) draw(); });
   return c;
 }
-// 지수·환율 카드 → 팝업 차트. 코스피·코스닥 카드는 야간선물을 보여 줄 때도 지수 차트다(야간선물 봉은 공개 출처가 없다).
-const CH_CARD = { KOSPI: '코스피', KOSDAQ: '코스닥', NQ: '나스닥 선물 · Vantage NAS100FT', USDKRW: '달러/원' };
-function chCardId(name){ return /나스닥/.test(name) ? 'NQ' : /달러/.test(name) ? 'USDKRW' : /코스닥/.test(name) ? 'KOSDAQ' : /코스피/.test(name) ? 'KOSPI' : ''; }
+// 지수·환율 카드 → 팝업 차트. 코스피·코스닥 카드가 야간선물을 보여 줄 때는 지수선물 차트다.
+const CH_CARD = { KOSPI: '코스피', KOSDAQ: '코스닥', K200F: '코스피200 선물', KQ150F: '코스닥150 선물', NQ: '나스닥 선물 · Vantage NAS100FT', USDKRW: '달러/원' };
+function chCardId(name){
+  if(/나스닥/.test(name)) return 'NQ';
+  if(/달러/.test(name)) return 'USDKRW';
+  const night = /야간선물/.test(name); // 정규장이 끝나면 지수 카드가 야간선물 카드로 바뀐다
+  if(/코스닥/.test(name)) return night ? 'KQ150F' : 'KOSDAQ';
+  if(/코스피/.test(name)) return night ? 'K200F' : 'KOSPI';
+  return '';
+}
 let CHPOP = null;
 function chOpen(id){
   if(!CH_CARD[id]) return;
@@ -4920,6 +4976,6 @@ if (require.main === module) {
     try { fs.writeFileSync(__dirname + '/server.pid', String(process.pid)); } catch (e) {}
   });
 }
-module.exports = { APP_VERSION, vtStatus, chartBars, aggBars, nvTime, nvBar, gapHistAt, gapBarAt, gapCombine, nqGapRatio, vtPush, vtHistAt, vtPick, vtQuote, kisKrDays, kisIndexAsNaver, kisEtfAsIg, idxFutCode, kisBody, kisStatus, kisSetKeys, kisClear, kisKrQuotes, kisUsDay, kisEtfPrevNav, kisTop30Pdf, futCodeOf, kisLastPx, keepOnLoad, bizStep, navTargetD, dig8, codesParam, pdfClear, pdfStatus, pxOf, server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, dropBadPdf, krSession, quoteSession, omOffHours, resolveTicker, idxSettled, fxMarketOpen, spotFirst, KR_PREOPEN, dayRef, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, resolveNavRef, nearestFxDate, parseMinClose, needRegFix, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
+module.exports = { APP_VERSION, vtStatus, chartBars, nightMerge, nightRecord, aggBars, nvTime, nvBar, gapHistAt, gapBarAt, gapCombine, nqGapRatio, vtPush, vtHistAt, vtPick, vtQuote, kisKrDays, kisIndexAsNaver, kisEtfAsIg, idxFutCode, kisBody, kisStatus, kisSetKeys, kisClear, kisKrQuotes, kisUsDay, kisEtfPrevNav, kisTop30Pdf, futCodeOf, kisLastPx, keepOnLoad, bizStep, navTargetD, dig8, codesParam, pdfClear, pdfStatus, pxOf, server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, dropBadPdf, krSession, quoteSession, omOffHours, resolveTicker, idxSettled, fxMarketOpen, spotFirst, KR_PREOPEN, dayRef, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, resolveNavRef, nearestFxDate, parseMinClose, needRegFix, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
 
 }

@@ -320,6 +320,21 @@ if (A) {
     assert.strictEqual(S.vtPick(26320, 26276, 26275), 26320, '같은 시각 야후와 수준이 맞으면 지금 값을 그대로 쓴다');
     assert.strictEqual(S.vtPick(26320, 26276, 26030), null, '0.3% 넘게 다르면(다른 월물) 쓰지 않는다');
     assert.strictEqual(S.vtPick(26320, null, 26275), null, '야후 체결 시각의 값을 모르면 쓰지 않는다');
+    { // 야간선물 차트 — 트레이딩뷰(늦음) 뒤에 실시간 1분봉을 잇는다
+      const M = 60e3, T = 1795700000000 - (1795700000000 % (5 * M));
+      const tv = [[T, 100, 101, 99, 100, 5]];
+      const live = [[T + 2 * M, 100, 104, 100, 103, 1], [T + 5 * M, 103, 106, 102, 105, 2]];
+      const r1 = S.nightMerge(tv, live, '1');
+      assert.deepStrictEqual(r1.bars.map(b => b[0]), [T, T + 2 * M, T + 5 * M], '1분봉은 기록을 뒤에 붙인다');
+      assert.ok(r1.note, '트레이딩뷰 끝과 기록 처음 사이가 비면 알린다');
+      const r5 = S.nightMerge(tv, live, '5');
+      assert.deepStrictEqual(r5.bars, [[T, 100, 104, 99, 103, 5], [T + 5 * M, 103, 106, 102, 105, 2]], '같은 5분 구간은 고·저·종만 고친다');
+      assert.ok(!r5.note, '기록이 트레이딩뷰 마지막 구간 안에서 시작하면 빈틈이 없다');
+      const rd = S.nightMerge([[T, 100, 101, 99, 100, 5]], live, 'D');
+      assert.deepStrictEqual(rd.bars, [[T, 100, 106, 99, 105, 5]], '일봉 이상은 마지막 봉에 합친다');
+      assert.deepStrictEqual(S.nightMerge(tv, [], '1').bars, tv);
+      assert.notStrictEqual(r5.bars[0], tv[0], '입력 봉을 고쳐 쓰지 않는다');
+    }
     { // 설정 창에 보이는 버전이 앱 버전과 같다
       const g = require('path').join(__dirname, 'android/app/build.gradle');
       if (require('fs').existsSync(g)) assert.strictEqual(S.APP_VERSION, /versionName '([^']+)'/.exec(require('fs').readFileSync(g, 'utf8'))[1], 'server.js APP_VERSION과 build.gradle versionName이 다르다');
