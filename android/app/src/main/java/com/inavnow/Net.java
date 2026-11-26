@@ -95,6 +95,7 @@ public class Net {
     private static final String[] HOSTS = {
             "api.finance.naver.com",
             "api.hyperliquid.xyz",
+            "api.stock.naver.com",
             "fapi.binance.com",
             "finance.naver.com",
             "investments.miraeasset.com",

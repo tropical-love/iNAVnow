@@ -9,7 +9,7 @@
 // 엔진을 <script src>로 싣기 전에 window.__net(url, opts) → Promise<Response>를 넣어 두면 된다.
 const NODE = typeof process !== 'undefined' && !!(process.versions && process.versions.node);
 // 설정 창 제목 옆에 보이는 버전. 안드로이드 versionName(android/app/build.gradle)과 같아야 한다(test.js가 본다).
-const APP_VERSION = '1.6.6';
+const APP_VERSION = '1.7.0';
 const http = NODE ? require('http') : null;
 const https = NODE ? require('https') : null;
 const zlib = NODE ? require('zlib') : null;
@@ -1857,7 +1857,10 @@ const VT_LIVE_MS = 45e3;     // 이보다 오래 아무 메시지(하트비트 �
 const VT_RETRY_MS = 60e3;    // 열기에 실패하거나 끊기면 이만큼은 다시 열지 않는다
 const VT_WAIT_MS = 4000;     // 처음 열 때 첫 시세·분봉을 이만큼 기다린다(폰은 TLS·첫 응답이 PC보다 느리다)
 const VT_MAX_GAP = 0.003;    // 같은 시각 야후 선물과 0.3% 넘게 다르면 다른 월물(또는 깨진 값)로 본다
-const vt = { ws: null, hist: [], bars: new Map(), msgAt: 0, failAt: 0, ready: null, idle: null,
+const TV_SUB_IDLE_MS = 2 * 60e3; // 차트 구독은 이만큼 안 물으면 지운다(그 차트를 닫은 것)
+// 연결 하나에 나스닥 선물 시세(quote 세션)와 차트 구독(chart 세션 여러 개)을 함께 싣는다.
+// 앱(Ws.java)은 연결을 하나만 열 수 있어 차트용 연결을 따로 두지 않는다.
+const vt = { ws: null, live: false, send: null, hist: [], subs: new Map(), seq: 0, msgAt: 0, failAt: 0, idle: null,
   why: '', usedAt: 0 }; // why·usedAt은 설정 창에 보여 줄 상태 — 왜 안 쓰였는지, 마지막으로 쓴 때
 function vtSocket() {
   if (NODE) return typeof WebSocket === 'function'
@@ -1879,24 +1882,70 @@ function vtHistAt(hist, t) {
 }
 function vtClose() {
   const ws = vt.ws;
-  vt.ws = null; vt.hist = []; vt.bars = new Map();
+  vt.ws = null; vt.live = false; vt.send = null; vt.hist = []; vt.subs = new Map();
   clearTimeout(vt.idle);
   if (ws) try { ws.close(); } catch (e) {}
+}
+// 차트 구독을 보낸다 — 세션이 열린 뒤에만 보낼 수 있어, 그 전에 들어온 구독은 열릴 때 한꺼번에 보낸다
+function tvStartSub(s) {
+  vt.send('chart_create_session', [s.cs, '']);
+  vt.send('resolve_symbol', [s.cs, 'sym', '=' + JSON.stringify({ symbol: s.sym })]);
+  vt.send('create_series', [s.cs, 's1', 's1', 'sym', s.res, s.n, '']);
+}
+// sym·res 봉을 구독한다(이미 있으면 그대로). 봉은 sub.bars에 t(ms) → [t, 시, 고, 저, 종, 거래량]으로 계속 갱신된다.
+function tvSub(sym, res, n) {
+  const key = sym + '|' + res, now = Date.now();
+  for (const o of vt.subs.values()) if (o.key !== key && now - o.askedAt > TV_SUB_IDLE_MS) {
+    vt.subs.delete(o.key);
+    if (vt.live) vt.send('chart_delete_session', [o.cs]);
+  }
+  let s = vt.subs.get(key);
+  // 같은 봉을 더 많이 원하면 새로 구독한다(나스닥 선물 1분봉: 카드 추정은 20개, 차트는 300개)
+  if (s && s.n < n) { vt.subs.delete(key); if (vt.live) vt.send('chart_delete_session', [s.cs]); s = null; }
+  if (!s) {
+    s = { key, cs: 'cs_' + (++vt.seq), sym, res, n, bars: new Map(), ok: false, err: '', askedAt: now };
+    vt.subs.set(key, s);
+    if (vt.live) tvStartSub(s);
+  }
+  s.askedAt = now;
+  return s;
+}
+// 연결을 쓸 수 있게 한다(없으면 연다). 직전에 실패했으면 VT_RETRY_MS 동안은 false.
+// 물을 때마다 닫힘 타이머를 늦춘다 — VT_IDLE_MS 동안 아무도 안 물으면 닫는다.
+function vtEnsure() {
+  const now = Date.now();
+  if (vt.ws && now - vt.msgAt > VT_LIVE_MS) { vtClose(); vt.why = '응답이 멈췄습니다'; } // 조용히 죽은 연결
+  if (!vt.ws) {
+    if (now - vt.failAt < VT_RETRY_MS) return false; // 직전 실패 사유(vt.why)를 그대로 둔다
+    vtOpen();
+    if (!vt.ws) return false;
+  }
+  clearTimeout(vt.idle);
+  vt.idle = setTimeout(vtClose, VT_IDLE_MS);
+  if (vt.idle.unref) vt.idle.unref(); // 이 타이머가 Node 프로세스를 붙잡지 않게
+  return true;
+}
+// ok()가 참이 되거나, ms가 지나거나, 연결이 끊길 때까지 기다린다
+function vtWait(ok, ms) {
+  const t0 = Date.now();
+  return new Promise(r => {
+    const tick = () => (ok() || !vt.ws || Date.now() - t0 > ms) ? r() : setTimeout(tick, 100);
+    tick();
+  });
 }
 function vtOpen() {
   let ws = null;
   try { ws = vtSocket(); } catch (e) { vt.why = '연결을 열지 못했습니다: ' + e.message; }
   if (!ws) { vt.failAt = Date.now(); vt.why = vt.why || '이 환경에서는 웹소켓을 열 수 없습니다'; return; }
-  vt.ws = ws; vt.hist = []; vt.bars = new Map(); vt.msgAt = Date.now();
-  let done;
-  vt.ready = new Promise(r => { done = r; });
+  vt.ws = ws; vt.live = false; vt.send = null; vt.hist = []; vt.subs = new Map(); vt.msgAt = Date.now();
   const send = (m, p) => { const s = JSON.stringify({ m, p }); ws.send(`~m~${s.length}~m~${s}`); };
   const lost = (why, e) => {
     if (vt.ws !== ws) return;
     const r = e && (e.reason || e.message || (e.error && e.error.message) || (e.code && 'code ' + e.code));
     vt.why = why + (r ? ': ' + r : '');
-    vtClose(); vt.failAt = Date.now(); done();
+    vtClose(); vt.failAt = Date.now();
   };
+  const subOf = cs => { for (const s of vt.subs.values()) if (s.cs === cs) return s; return null; };
   ws.onmessage = e => {
     if (vt.ws !== ws) return;
     vt.msgAt = Date.now();
@@ -1907,26 +1956,32 @@ function vtOpen() {
       let j;
       try { j = JSON.parse(part); } catch (e) { continue; }
       if (j.session_id) {
+        vt.send = send; vt.live = true;
         send('set_auth_token', ['unauthorized_user_token']);
         send('quote_create_session', ['qs_vt']);
         send('quote_set_fields', ['qs_vt', 'lp']);
         send('quote_add_symbols', ['qs_vt', VT_SYM]);
-        // 연 직후 10분은 체결 시각의 값이 기록에 없다 — 그동안은 분봉으로 메운다
-        send('chart_create_session', ['cs_vt', '']);
-        send('resolve_symbol', ['cs_vt', 'sym', '=' + JSON.stringify({ symbol: VT_SYM })]);
-        send('create_series', ['cs_vt', 's1', 's1', 'sym', '1', 20, '']);
+        for (const s of vt.subs.values()) tvStartSub(s);
       } else if (j.m === 'qsd') {
         const q = j.p && j.p[1];
         if (q && q.s === 'error') return lost('심볼을 받지 못했습니다'); // 심볼이 사라졌다
         if (q && q.v && q.v.lp > 0) vtPush(vt.hist, Date.now(), q.v.lp);
-      } else if ((j.m === 'timescale_update' || j.m === 'du') && j.p && j.p[0] === 'cs_vt') {
+      } else if (j.m === 'timescale_update' || j.m === 'du') {
+        const s = subOf(j.p && j.p[0]);
+        if (!s) continue;
         for (const b of (j.p[1] && j.p[1].s1 && j.p[1].s1.s) || []) {
-          const [t, o, , , c] = b.v;
-          vt.bars.set(t * 1e3, [t * 1e3, o, c]);
+          const [t, o, h, l, c, v] = b.v;
+          s.bars.set(t * 1e3, [t * 1e3, o, h, l, c, v || 0]);
         }
-        for (const t of vt.bars.keys()) if (Date.now() - t > 20 * 60e3) vt.bars.delete(t);
-      } else if (/error/.test(j.m || '')) return lost('트레이딩뷰 오류 ' + j.m); // critical_error·protocol_error·symbol_error
-      if (vt.hist.length && vt.bars.size) done();
+        if (s.bars.size > s.n + 50) { // 오래된 봉부터 버린다
+          const ks = [...s.bars.keys()].sort((a, b) => a - b);
+          for (const k of ks.slice(0, s.bars.size - s.n)) s.bars.delete(k);
+        }
+        s.ok = true;
+      } else if (j.m === 'symbol_error' || j.m === 'series_error') {
+        const s = subOf(j.p && j.p[0]); // 그 차트만 실패 — 연결은 그대로 둔다
+        if (s) s.err = j.m;
+      } else if (/error/.test(j.m || '')) return lost('트레이딩뷰 오류 ' + j.m); // critical_error·protocol_error
     }
   };
   ws.onclose = e => lost('연결이 끊겼습니다', e);
@@ -1941,21 +1996,13 @@ function vtPick(cur, base, yv) {
 async function vtQuote(yt, yv) {
   const now = Date.now();
   if (!(yt > 0) || now - yt > GAP_MAX_AGE) { vt.why = 'CME 선물 시세가 15분 넘게 멈춰 있습니다'; return null; }
-  if (vt.ws && now - vt.msgAt > VT_LIVE_MS) { vtClose(); vt.why = '응답이 멈췄습니다'; } // 조용히 죽은 연결
-  if (!vt.ws) {
-    if (now - vt.failAt < VT_RETRY_MS) return null; // 직전 실패 사유(vt.why)를 그대로 둔다
-    vtOpen();
-    if (!vt.ws) return null;
-  }
-  clearTimeout(vt.idle);
-  vt.idle = setTimeout(vtClose, VT_IDLE_MS);
-  if (vt.idle.unref) vt.idle.unref(); // 이 타이머가 Node 프로세스를 붙잡지 않게
-  if (!vt.hist.length || !vt.bars.size) {
-    await Promise.race([vt.ready, new Promise(r => { const tm = setTimeout(r, VT_WAIT_MS); if (tm.unref) tm.unref(); })]);
-  }
+  if (!vtEnsure()) return null;
+  // 연 직후 10분은 체결 시각의 값이 기록에 없다 — 그동안은 1분봉으로 메운다
+  const sub = tvSub(VT_SYM, '1', 20);
+  if (!vt.hist.length || !sub.ok) await vtWait(() => vt.hist.length && sub.ok, VT_WAIT_MS);
   const h = vt.hist;
   if (!h.length) { vt.why = vt.ws ? '첫 시세를 기다리는 중입니다' : vt.why; return null; }
-  const base = vtHistAt(h, yt) ?? gapBarAt([...vt.bars.values()], yt);
+  const base = vtHistAt(h, yt) ?? gapBarAt([...sub.bars.values()].map(b => [b[0], b[1], b[4]]), yt);
   const v = vtPick(h[h.length - 1].v, base, yv);
   if (v) { vt.why = ''; vt.usedAt = Date.now(); }
   else vt.why = base > 0 ? `CME 선물과 ${(Math.abs(base / yv - 1) * 100).toFixed(2)}% 달라 쓰지 않습니다(다른 월물일 수 있음)`
@@ -1965,6 +2012,94 @@ async function vtQuote(yt, yv) {
 // 설정 창용 상태 — 쓰고 있는지, 아니면 왜 안 쓰는지
 function vtStatus() {
   return { used: !!vt.usedAt && Date.now() - vt.usedAt < 2 * 60e3, why: vt.why, open: !!vt.ws };
+}
+
+// ---------- 차트 봉 (/api/chart) ----------
+// 지수·환율 카드와 ETF 상세 화면의 차트가 부른다. 봉은 [t(ms), 시, 고, 저, 종, 거래량], 오래된 것부터.
+//  · 코스피·코스닥·ETF: 네이버(카드·시세와 같은 출처, 실시간). 1분봉은 약 6거래일치만 있어 3·5·15·60분은
+//    1분봉을 묶어 만든다(그래서 60분봉은 40개 남짓). 일봉은 넉넉히, 주·월·연봉은 네이버가 주는 만큼(110·110·25개).
+//  · 나스닥 선물·달러/원: 트레이딩뷰(위 연결에 차트 구독을 함께 싣는다). 나스닥 선물은 카드와 같은 Vantage NAS100FT.
+//    트레이딩뷰의 KRX 종목은 20분 늦어 국내는 쓰지 않는다(실측 delay 1200).
+// 화면은 차트가 열려 있는 동안만 몇 초마다 다시 묻는다 — 서버 쪽 캐시가 그 사이 외부 호출을 묶는다.
+const CHART_RES = ['1', '3', '5', '15', '60', 'D', 'W', 'M', 'Y'];
+const CHART_TV = { NQ: VT_SYM, USDKRW: 'FX_IDC:USDKRW' };
+const CHART_KR_INDEX = new Set(['KOSPI', 'KOSDAQ']);
+const TV_RES = { 1: '1', 3: '3', 5: '5', 15: '15', 60: '60', D: 'D', W: 'W', M: 'M', Y: '12M' };
+const CHART_N = 300;
+async function chartBars(id, res) {
+  if (!CHART_RES.includes(res)) throw new Error('알 수 없는 주기: ' + res);
+  if (CHART_TV[id]) return { bars: await tvChart(CHART_TV[id], TV_RES[res]) };
+  if (CHART_KR_INDEX.has(id)) return { bars: await naverChart('index', id, res) };
+  if (/^[0-9A-Z]{6}$/.test(id)) return { bars: await naverChart('item', id, res) };
+  throw new Error('알 수 없는 차트: ' + id);
+}
+async function tvChart(sym, res) {
+  if (!vtEnsure()) throw new Error(vt.why || '트레이딩뷰에 연결하지 못했습니다');
+  const s = tvSub(sym, res, CHART_N);
+  if (!s.ok && !s.err) await vtWait(() => s.ok || s.err, 6000);
+  if (s.err) throw new Error('차트를 받지 못했습니다(' + s.err + ')');
+  if (!s.ok) throw new Error(vt.why || '차트를 기다리다 시간이 지났습니다');
+  return [...s.bars.values()].sort((a, b) => a[0] - b[0]);
+}
+// 같은 키의 봉을 하나로 묶는다 — 시가는 첫 봉, 종가는 끝 봉, 고·저는 극값, 거래량은 합. 입력은 시간순.
+function aggBars(bars, keyOf) {
+  const out = [];
+  let cur = null, ck = null;
+  for (const b of bars) {
+    const k = keyOf(b[0]);
+    if (!cur || k !== ck) { cur = [k, b[1], b[2], b[3], b[4], b[5]]; ck = k; out.push(cur); continue; }
+    cur[2] = Math.max(cur[2], b[2]); cur[3] = Math.min(cur[3], b[3]); cur[4] = b[4]; cur[5] += b[5];
+  }
+  return out;
+}
+// 네이버 시각 문자열(한국 시간 'yyyyMMdd' 또는 'yyyyMMddHHmmss') → epoch ms
+const nvTime = s => Date.UTC(+s.slice(0, 4), +s.slice(4, 6) - 1, +s.slice(6, 8), +(s.slice(8, 10) || 0) - 9, +(s.slice(10, 12) || 0));
+// 거래가 없던 분은 시·고·저가 0으로 올 수 있다 — 종가로 채운다
+function nvBar(x) {
+  const c = x.currentPrice ?? x.closePrice;
+  if (!(c > 0)) return null;
+  const f = v => (v > 0 ? v : c);
+  return [nvTime(x.localDateTime || x.localDate), f(x.openPrice), f(x.highPrice), f(x.lowPrice), c, x.accumulatedTradingVolume || 0];
+}
+const NV_CHART = 'https://api.stock.naver.com/chart/domestic/';
+const kstStamp = (t, n) => new Date(t + 9 * 3600e3).toISOString().slice(0, 16).replace(/[-T:]/g, '').slice(0, n);
+// 1분봉 — 처음(그리고 10분마다)은 8일치를 통째로, 그 사이에는 마지막 봉 2분 전부터만 받아 이어 붙인다
+// (8일치는 150KB 남짓이라 몇 초마다 받을 크기가 아니다)
+const nvMin = new Map();
+function naverMinutes(kind, code) {
+  return cached(`nvmin:${kind}:${code}`, 3e3, async () => {
+    const key = kind + ':' + code, now = Date.now();
+    let st = nvMin.get(key);
+    const full = !st || !st.bars.size || now - st.fullAt > 10 * 60e3;
+    if (full) st = { bars: new Map(), fullAt: now };
+    const from = full ? now - 8 * 86400e3 : Math.max(...st.bars.keys()) - 2 * 60e3;
+    const rows = await getJson(`${NV_CHART}${kind}/${code}/minute?startDateTime=${kstStamp(from, 12)}&endDateTime=${kstStamp(now + 60e3, 12)}`);
+    for (const r of Array.isArray(rows) ? rows : []) { const b = nvBar(r); if (b) st.bars.set(b[0], b); }
+    for (const t of st.bars.keys()) if (now - t > 10 * 86400e3) st.bars.delete(t);
+    nvMin.set(key, st);
+    return [...st.bars.values()].sort((a, b) => a[0] - b[0]);
+  });
+}
+async function naverChart(kind, code, res) {
+  if (/^\d+$/.test(res)) {
+    const m = await naverMinutes(kind, code);
+    const n = +res;
+    // 분 단위로 epoch에 맞춰 자르면 한국 시간 정시에 맞는다(9시간은 60분의 배수)
+    const bars = n === 1 ? m : aggBars(m, t => Math.floor(t / (n * 60e3)) * n * 60e3);
+    return bars.slice(-CHART_N);
+  }
+  if (res === 'D') {
+    const now = Date.now();
+    return cached(`nvday:${kind}:${code}`, 30e3, async () => {
+      const rows = await getJson(`${NV_CHART}${kind}/${code}/day?startDateTime=${kstStamp(now - 450 * 86400e3, 8)}&endDateTime=${kstStamp(now, 8)}`);
+      return (Array.isArray(rows) ? rows : []).map(nvBar).filter(Boolean).slice(-CHART_N);
+    });
+  }
+  const pt = { W: 'weekCandle', M: 'monthCandle', Y: 'yearCandle' }[res];
+  return cached(`nv${pt}:${kind}:${code}`, 30e3, async () => {
+    const d = await getJson(`${NV_CHART}${kind}/${code}?periodType=${pt}`);
+    return ((d && d.priceInfos) || []).map(nvBar).filter(Boolean);
+  });
 }
 
 // ---------- 한국투자증권 Open API (선택) — 나스닥 선물 실시간 ----------
@@ -3018,6 +3153,19 @@ const HTML = `<!doctype html>
     background: var(--soft); color: var(--muted2); max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .recent button:hover { background: var(--hover); border-color: var(--bd); }
   summary { cursor: pointer; user-select: none; list-style: none; }
+  .mkt .m { cursor: pointer; }
+  .mkt .m:hover { background: var(--hover); }
+  #chdlg { width: 760px; max-width: 96vw; }
+  .chres { display: flex; gap: 4px; margin: 2px 0 8px; overflow-x: auto; scrollbar-width: none; }
+  .chres::-webkit-scrollbar { display: none; }
+  .chres button { flex: none; font-size: 12px; padding: 3px 9px; border-radius: 12px; border: 1px solid var(--bd2); background: var(--soft); color: var(--muted2); }
+  @media (max-width: 520px) { .chres { gap: 3px; } .chres button { padding: 3px 7px; } }
+  .chres button.on { background: var(--fg); color: var(--card); border-color: var(--fg); }
+  .chtip { font-size: 12px; min-height: 17px; margin-bottom: 2px; }
+  @media (max-width: 520px) { .chtip { min-height: 34px; } } /* 두 줄로 감겨도 차트가 들썩이지 않게 */
+  .chcv { display: block; width: 100%; height: 300px; touch-action: pan-y; }
+  #chartcard .chcv { height: 260px; }
+  .chst { margin: 4px 0 0; }
   summary::-webkit-details-marker { display: none; }
   .arrow { color: var(--muted); font-size: 12px; margin-left: 2px; }
   .arrow::before { content: '▼'; }
@@ -3250,6 +3398,13 @@ const HTML = `<!doctype html>
   <div class="muted" id="bdnote" style="margin-top:7px;font-size:12px"></div>
   <div class="cover" id="cov"><span id="updown"></span><span class="muted">반영률</span><div class="bar"><i id="coverbar"></i></div><span id="coverpct"></span></div>
 </div>
+<details class="card" id="chartcard">
+  <summary class="row">
+    <b>차트</b>
+    <span class="arrow"></span>
+  </summary>
+  <div id="etfchart" style="margin-top:10px"></div>
+</details>
 <details class="card" id="holdcard">
   <summary class="row">
     <b>구성 종목</b>
@@ -3332,6 +3487,10 @@ const HTML = `<!doctype html>
     </div>
     <div class="hint" style="margin-left:0">넣으면 시세를 본인 계정으로 받아 3초마다 갱신합니다(CME 시세를 신청한 계좌는 나스닥 선물까지). 키는 이 기기에만 저장되고 한국투자증권 서버에만 쓰입니다.</div>
   </div>
+</div></dialog>
+<dialog id="chdlg"><div class="dlg">
+  <div class="row"><h2 id="chttl">차트</h2><button class="x" onclick="chdlg.close()">✕</button></div>
+  <div id="chbox" style="margin-top:8px"></div>
 </div></dialog>
 <dialog id="pfdlg"><form class="dlg" method="dialog" onsubmit="return pfSave()">
   <div class="row"><h2 id="pfdlgh">포트폴리오 추가</h2><button type="button" class="x" onclick="pfdlg.close()">✕</button></div>
@@ -3924,7 +4083,7 @@ function itemHtml(x){
 function showHome(){
   document.getElementById('name').textContent = 'iNAVnow';
   document.getElementById('meta').textContent = '한국 상장 ETF의 실시간 iNAV · 종목명이나 코드로 검색해 보세요';
-  ['homelink','pricerow','stats','rets','recent','fav','trackcard','holdcard','treecard'].forEach(function(id){
+  ['homelink','pricerow','stats','rets','recent','fav','trackcard','chartcard','holdcard','treecard'].forEach(function(id){
     const el = document.getElementById(id); if(el) el.style.display = 'none';
   });
   document.getElementById('foot').style.display = 'none';
@@ -3986,12 +4145,205 @@ function mktRender(){
   if(!MKT) return;
   document.getElementById('mktbody').innerHTML = MKT.map(function(m){
     const amt = m.chg == null ? '—' : (m.chg>0?'▲':m.chg<0?'▼':'')+fmt(Math.abs(m.chg),2);
-    return '<div class="m"><div class="mn">'+esc(m.name)+(m.closed?'<span class="badge closed">마감</span>':m.est?'<span class="badge b추정" title="10분 늦은 선물 체결가에 그 뒤 움직임(나스닥100 추종 상품)을 반영한 추정값입니다">추정</span>':m.delayed?'<span class="badge b추정" title="10분 늦은 시세입니다">지연</span>':'')+'</div>'
+    const ch = chCardId(m.name);
+    return '<div class="m"'+(ch ? ' data-ch="'+ch+'" title="차트 보기"' : '')+'><div class="mn">'+esc(m.name)+(m.closed?'<span class="badge closed">마감</span>':m.est?'<span class="badge b추정" title="10분 늦은 선물 체결가에 그 뒤 움직임(나스닥100 추종 상품)을 반영한 추정값입니다">추정</span>':m.delayed?'<span class="badge b추정" title="10분 늦은 시세입니다">지연</span>':'')+'</div>'
       + '<div class="mv">'+(m.value==null?'—':fmt(m.value,2))+'</div>'
       + '<div class="mc '+(m.chg?cls(m.chg):'muted')+'">'+amt+(m.chgPct==null?'':' '+sign(m.chgPct)+'%')+'</div></div>';
   }).join('');
   document.getElementById('mktclock').textContent = MKTAT ? new Date(MKTAT).toLocaleTimeString('ko-KR')+' 기준' : '';
 }
+
+// ---------- 차트 ----------
+// 외부 라이브러리 없이 캔버스에 직접 그린다(앱은 오프라인 에셋이라 CDN을 못 쓴다).
+// 열려 있는 동안만 /api/chart를 다시 묻는다 — 분봉은 3초, 일봉 이상은 15초마다.
+// 조작: 끌기 = 지난 봉 보기, 휠·두 손가락 = 확대/축소, 탭(마우스는 올리기) = 그 봉의 시·고·저·종.
+// (이 코드는 서버 템플릿 문자열 안에 있다 — 역슬래시·백틱·달러+중괄호를 쓰지 않는다)
+const CH_RES = [['1','1분'],['3','3분'],['5','5분'],['15','15분'],['60','60분'],['D','일'],['W','주'],['M','월'],['Y','년']];
+const CH_AX = 58, CH_TB = 18; // 오른쪽 가격 축, 아래 시간 축
+function chCss(n){ return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
+function chP2(n){ return (n<10?'0':'')+n; }
+function chMinute(res){ return res !== 'D' && res !== 'W' && res !== 'M' && res !== 'Y'; }
+// 봉 시각은 한국 시간으로 적는다(나스닥 선물·환율도)
+function chLabel(t, res, full){
+  const d = new Date(t + 9*3600e3), Y = d.getUTCFullYear(), M = chP2(d.getUTCMonth()+1), D = chP2(d.getUTCDate());
+  if(res==='Y') return ''+Y;
+  if(res==='M') return full ? Y+'-'+M : String(Y).slice(2)+'.'+M;
+  if(res==='W' || res==='D') return full ? Y+'-'+M+'-'+D : M+'/'+D;
+  const hm = chP2(d.getUTCHours())+':'+chP2(d.getUTCMinutes());
+  return full ? Y+'-'+M+'-'+D+' '+hm : hm;
+}
+function chStep(r){ const p = Math.pow(10, Math.floor(Math.log10(r))), f = r/p; return (f<1.5?1:f<3?2:f<7?5:10)*p; }
+function makeChart(box, id, dec){
+  const c = { id: id, dec: dec, res: '5', bars: [], end: 0, bw: 8, hover: -1, timer: null, on: false, err: '', seq: 0 };
+  try { const r = localStorage.getItem('chRes'); if(r && CH_RES.some(function(x){ return x[0]===r; })) c.res = r; } catch(e){}
+  box.innerHTML = '<div class="chres">' + CH_RES.map(function(r){ return '<button type="button" data-r="'+r[0]+'">'+r[1]+'</button>'; }).join('') + '</div>'
+    + '<div class="chtip"></div><canvas class="chcv"></canvas><div class="hint chst"></div>';
+  const cv = box.querySelector('canvas'), tip = box.querySelector('.chtip'), stEl = box.querySelector('.chst');
+  const btns = box.querySelectorAll('.chres button');
+  function mark(){ btns.forEach(function(b){ b.classList.toggle('on', b.dataset.r === c.res); }); }
+  btns.forEach(function(b){ b.onclick = function(){
+    c.res = this.dataset.r; try { localStorage.setItem('chRes', c.res); } catch(e){}
+    c.bars = []; c.end = 0; c.hover = -1; c.err = ''; stEl.textContent = ''; mark(); draw(); load();
+  }; });
+  mark();
+  function geom(){ const w = cv.clientWidth, h = cv.clientHeight, pw = w - CH_AX; return { w: w, h: h, pw: pw, n: Math.max(5, Math.floor(pw / c.bw)) }; }
+  function vis(g){ const last = c.bars.length - 1 - c.end; return { first: Math.max(0, last - g.n + 1), last: last }; }
+  function xOf(g, v, i){ return g.pw - (v.last - i + 0.5) * c.bw; }
+  function clampEnd(){ c.end = Math.max(0, Math.min(Math.max(0, c.bars.length - 5), c.end)); }
+  function draw(){
+    const dpr = window.devicePixelRatio || 1, w = cv.clientWidth, h = cv.clientHeight;
+    if(!w || !h) return;
+    if(cv.width !== Math.round(w*dpr) || cv.height !== Math.round(h*dpr)){ cv.width = Math.round(w*dpr); cv.height = Math.round(h*dpr); }
+    const x = cv.getContext('2d');
+    x.setTransform(dpr, 0, 0, dpr, 0, 0); x.clearRect(0, 0, w, h);
+    const up = chCss('--up'), dn = chCss('--down'), mu = chCss('--muted'), bd = chCss('--bd');
+    x.font = '11px system-ui, -apple-system, sans-serif'; x.lineWidth = 1;
+    if(!c.bars.length){
+      x.fillStyle = mu; x.textAlign = 'center'; x.textBaseline = 'middle';
+      x.fillText(c.err ? '차트를 받지 못했습니다' : '불러오는 중…', w/2, h/2); tip.innerHTML = '&nbsp;'; return;
+    }
+    const g = geom(), v = vis(g);
+    let lo = Infinity, hi = -Infinity, vmax = 0;
+    for(let i = v.first; i <= v.last; i++){ const b = c.bars[i]; if(b[3] < lo) lo = b[3]; if(b[2] > hi) hi = b[2]; if(b[5] > vmax) vmax = b[5]; }
+    if(hi === lo){ hi += Math.abs(hi)*0.001 || 1; lo -= Math.abs(lo)*0.001 || 1; }
+    const ph = h - CH_TB, volH = vmax > 0 ? ph*0.18 : 0, top = 6, pBot = ph - volH - 6;
+    const pad = (hi - lo)*0.06; hi += pad; lo -= pad;
+    const Y = function(p){ return top + (hi - p) / (hi - lo) * (pBot - top); };
+    // 가격 눈금
+    const step = chStep((hi - lo)/5), sd = Math.max(c.dec, step < 1 ? Math.ceil(-Math.log10(step)) : 0);
+    x.strokeStyle = bd; x.fillStyle = mu; x.textAlign = 'left'; x.textBaseline = 'middle';
+    for(let p = Math.ceil(lo/step)*step; p <= hi; p += step){
+      const y = Math.round(Y(p)) + 0.5;
+      x.beginPath(); x.moveTo(0, y); x.lineTo(g.pw, y); x.stroke(); x.fillText(fmt(p, sd), g.pw + 6, y);
+    }
+    // 시간 눈금 — 최근 봉부터 약 90px마다
+    const every = Math.max(1, Math.round(90 / c.bw));
+    x.textAlign = 'center'; x.textBaseline = 'top';
+    for(let i = v.last; i >= v.first; i -= every){
+      const xx = Math.round(xOf(g, v, i)) + 0.5;
+      x.globalAlpha = 0.5; x.beginPath(); x.moveTo(xx, top); x.lineTo(xx, ph); x.stroke(); x.globalAlpha = 1;
+      if(xx > 18 && xx < g.pw - 10) x.fillText(chLabel(c.bars[i][0], c.res), xx, ph + 4);
+    }
+    // 봉 — 오르면 빨강, 내리면 파랑(종가가 시가 이상이면 오름)
+    const body = Math.max(1, c.bw*0.7);
+    for(let i = v.first; i <= v.last; i++){
+      const b = c.bars[i], xx = xOf(g, v, i), col = b[4] >= b[1] ? up : dn;
+      x.strokeStyle = col; x.fillStyle = col;
+      x.beginPath(); x.moveTo(Math.round(xx) + 0.5, Y(b[2])); x.lineTo(Math.round(xx) + 0.5, Y(b[3])); x.stroke();
+      const y1 = Y(Math.max(b[1], b[4])), y2 = Y(Math.min(b[1], b[4]));
+      x.fillRect(xx - body/2, y1, body, Math.max(1, y2 - y1));
+      if(volH && b[5] > 0){ const vh = b[5]/vmax*volH; x.globalAlpha = 0.3; x.fillRect(xx - body/2, ph - vh, body, vh); x.globalAlpha = 1; }
+    }
+    // 현재가 선과 축 표시
+    const L = c.bars[c.bars.length - 1], ly = Y(L[4]), lc = L[4] >= L[1] ? up : dn;
+    if(ly >= top && ly <= pBot){
+      x.strokeStyle = lc; x.setLineDash([3, 3]); x.beginPath(); x.moveTo(0, Math.round(ly) + 0.5); x.lineTo(g.pw, Math.round(ly) + 0.5); x.stroke(); x.setLineDash([]);
+      x.fillStyle = lc; x.fillRect(g.pw + 1, ly - 8, CH_AX - 1, 16);
+      x.fillStyle = '#fff'; x.textAlign = 'left'; x.textBaseline = 'middle'; x.fillText(fmt(L[4], c.dec), g.pw + 5, ly);
+    }
+    // 고른 봉(없으면 마지막 봉)의 시·고·저·종 — 등락은 앞 봉 종가 대비
+    const hv = c.hover >= v.first && c.hover <= v.last ? c.hover : -1;
+    if(hv >= 0){
+      const xx = Math.round(xOf(g, v, hv)) + 0.5;
+      x.strokeStyle = mu; x.setLineDash([2, 3]); x.beginPath(); x.moveTo(xx, top); x.lineTo(xx, ph); x.stroke(); x.setLineDash([]);
+    }
+    const k = hv >= 0 ? hv : c.bars.length - 1, tb = c.bars[k], pb = c.bars[k - 1];
+    const chg = pb ? (tb[4]/pb[4] - 1)*100 : null;
+    tip.innerHTML = '<span class="muted" style="white-space:nowrap">'+esc(chLabel(tb[0], c.res, true))+'</span> <span style="white-space:nowrap">시 '+fmt(tb[1], c.dec)+' 고 '+fmt(tb[2], c.dec)+' 저 '+fmt(tb[3], c.dec)
+      +' 종 <b class="'+(chg == null ? '' : cls(chg))+'">'+fmt(tb[4], c.dec)+(chg == null ? '' : ' '+sign(chg)+'%')+'</b></span>';
+  }
+  function idxAt(e){
+    const r = cv.getBoundingClientRect(), px = e.clientX - r.left, g = geom(), v = vis(g);
+    if(px > g.pw || !c.bars.length) return -1;
+    return Math.max(v.first, Math.min(v.last, v.last - Math.floor((g.pw - px) / c.bw)));
+  }
+  // 끌기·두 손가락·탭. 세로로 밀면 브라우저가 화면을 굴린다(touch-action: pan-y)
+  const pts = new Map(); let drag = null, pinch = null;
+  cv.addEventListener('pointerdown', function(e){
+    try { cv.setPointerCapture(e.pointerId); } catch(err){}
+    pts.set(e.pointerId, e.clientX);
+    if(pts.size === 1) drag = { x: e.clientX, end: c.end, moved: false };
+    else if(pts.size === 2){ const a = Array.from(pts.values()); pinch = { d: Math.abs(a[0] - a[1]) || 1, bw: c.bw }; drag = null; }
+  });
+  cv.addEventListener('pointermove', function(e){
+    if(pts.has(e.pointerId)) pts.set(e.pointerId, e.clientX);
+    if(pinch && pts.size === 2){
+      const a = Array.from(pts.values());
+      c.bw = Math.max(2, Math.min(40, pinch.bw * (Math.abs(a[0] - a[1]) || 1) / pinch.d)); clampEnd(); draw(); return;
+    }
+    if(drag){
+      const dx = e.clientX - drag.x;
+      if(Math.abs(dx) > 5) drag.moved = true;
+      if(drag.moved){ c.end = drag.end + Math.round(dx / c.bw); clampEnd(); draw(); }
+      return;
+    }
+    if(e.pointerType === 'mouse'){ c.hover = idxAt(e); draw(); }
+  });
+  function lift(e){
+    const tap = drag && !drag.moved && pts.size === 1;
+    pts.delete(e.pointerId);
+    if(pts.size < 2) pinch = null;
+    if(!pts.size){
+      if(tap && e.type === 'pointerup' && e.pointerType !== 'mouse'){ const i = idxAt(e); c.hover = c.hover === i ? -1 : i; draw(); }
+      drag = null;
+    }
+  }
+  cv.addEventListener('pointerup', lift);
+  cv.addEventListener('pointercancel', lift);
+  cv.addEventListener('pointerleave', function(e){ if(e.pointerType === 'mouse' && !drag){ c.hover = -1; draw(); } });
+  cv.addEventListener('wheel', function(e){
+    e.preventDefault(); c.bw = Math.max(2, Math.min(40, c.bw * (e.deltaY < 0 ? 1.15 : 1/1.15))); clampEnd(); draw();
+  }, { passive: false });
+  async function load(){
+    const seq = ++c.seq, res = c.res;
+    try {
+      const d = await (await fetch('/api/chart?id='+encodeURIComponent(c.id)+'&r='+res)).json();
+      if(seq !== c.seq || res !== c.res) return; // 그 사이 주기를 바꿨거나 더 새 응답이 있다
+      if(d.error) throw new Error(d.error);
+      // 지난 봉을 보고 있으면(끌어 둔 상태) 새 봉이 붙어도 보던 자리를 지킨다
+      const prev = c.bars.length ? c.bars[c.bars.length - 1][0] : null;
+      if(c.end > 0 && prev != null) c.end += d.bars.filter(function(b){ return b[0] > prev; }).length;
+      c.bars = d.bars || []; c.err = ''; clampEnd();
+      stEl.textContent = c.bars.length ? '' : '봉이 없습니다.';
+    } catch(e){
+      if(seq !== c.seq) return;
+      c.err = e.message; stEl.textContent = '차트를 받지 못했습니다: ' + e.message;
+    }
+    draw();
+  }
+  function tick(){
+    if(!c.on) return;
+    if(!document.hidden) load();
+    c.timer = setTimeout(tick, chMinute(c.res) ? 3000 : 15000);
+  }
+  c.start = function(){ if(c.on) return; c.on = true; draw(); tick(); };
+  c.stop = function(){ c.on = false; clearTimeout(c.timer); };
+  window.addEventListener('resize', function(){ if(c.on) draw(); });
+  return c;
+}
+// 지수·환율 카드 → 팝업 차트. 코스피·코스닥 카드는 야간선물을 보여 줄 때도 지수 차트다(야간선물 봉은 공개 출처가 없다).
+const CH_CARD = { KOSPI: '코스피', KOSDAQ: '코스닥', NQ: '나스닥 선물 · Vantage NAS100FT', USDKRW: '달러/원' };
+function chCardId(name){ return /나스닥/.test(name) ? 'NQ' : /달러/.test(name) ? 'USDKRW' : /코스닥/.test(name) ? 'KOSDAQ' : /코스피/.test(name) ? 'KOSPI' : ''; }
+let CHPOP = null;
+function chOpen(id){
+  if(!CH_CARD[id]) return;
+  document.getElementById('chttl').textContent = CH_CARD[id];
+  if(CHPOP) CHPOP.stop();
+  CHPOP = makeChart(document.getElementById('chbox'), id, 2);
+  document.getElementById('chdlg').showModal();
+  CHPOP.start();
+}
+document.getElementById('chdlg').addEventListener('close', function(){ if(CHPOP){ CHPOP.stop(); CHPOP = null; } });
+document.getElementById('mktbody').addEventListener('click', function(e){
+  const m = e.target.closest('.m');
+  if(m && m.dataset.ch) chOpen(m.dataset.ch);
+});
+// ETF 상세 — 실시간 iNAV 아래 접힌 차트. 펼칠 때만 받기 시작하고 접으면 멈춘다.
+let CHETF = null;
+document.getElementById('chartcard').addEventListener('toggle', function(){
+  if(this.open){ if(!CHETF) CHETF = makeChart(document.getElementById('etfchart'), CODE, 0); CHETF.start(); }
+  else if(CHETF) CHETF.stop();
+});
 
 // ---------- 홈 섹션 순서 ----------
 // HTML5 drag&drop은 모바일 WebView에서 동작하지 않아 pointer 이벤트로 직접 옮긴다.
@@ -4446,6 +4798,15 @@ const handler = async (req, res) => {
     }
     return;
   }
+  if (u.pathname === '/api/chart') {
+    try {
+      send(req, res, JSON.stringify(await chartBars(u.searchParams.get('id') || '', u.searchParams.get('r') || '')), JSON_T);
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
   if (u.pathname === '/api/market') {
     try {
       send(req, res, JSON.stringify(await marketQuotes()), JSON_T);
@@ -4537,7 +4898,7 @@ const handler = async (req, res) => {
 // 안드로이드에서는 HTTP 서버가 없다 — 페이지가 이 함수들을 직접 부른다(에셋 index.html의 fetch shim).
 if (!NODE) {
   // 브리지가 실제로 부르는 것만 내놓는다 — 라우트 로직은 위의 공용 함수에 있다
-  globalThis.ENGINE = { computeINav, etfList, marketQuotes, stats, codesParam, pdfClear, pdfStatus, pxOf,
+  globalThis.ENGINE = { computeINav, etfList, marketQuotes, chartBars, stats, codesParam, pdfClear, pdfStatus, pxOf,
     kisStatus, kisSetKeys, kisClear, DEFAULT_CODE };
 } else {
 
@@ -4559,6 +4920,6 @@ if (require.main === module) {
     try { fs.writeFileSync(__dirname + '/server.pid', String(process.pid)); } catch (e) {}
   });
 }
-module.exports = { APP_VERSION, vtStatus, gapHistAt, gapBarAt, gapCombine, nqGapRatio, vtPush, vtHistAt, vtPick, vtQuote, kisKrDays, kisIndexAsNaver, kisEtfAsIg, idxFutCode, kisBody, kisStatus, kisSetKeys, kisClear, kisKrQuotes, kisUsDay, kisEtfPrevNav, kisTop30Pdf, futCodeOf, kisLastPx, keepOnLoad, bizStep, navTargetD, dig8, codesParam, pdfClear, pdfStatus, pxOf, server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, dropBadPdf, krSession, quoteSession, omOffHours, resolveTicker, idxSettled, fxMarketOpen, spotFirst, KR_PREOPEN, dayRef, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, resolveNavRef, nearestFxDate, parseMinClose, needRegFix, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
+module.exports = { APP_VERSION, vtStatus, chartBars, aggBars, nvTime, nvBar, gapHistAt, gapBarAt, gapCombine, nqGapRatio, vtPush, vtHistAt, vtPick, vtQuote, kisKrDays, kisIndexAsNaver, kisEtfAsIg, idxFutCode, kisBody, kisStatus, kisSetKeys, kisClear, kisKrQuotes, kisUsDay, kisEtfPrevNav, kisTop30Pdf, futCodeOf, kisLastPx, keepOnLoad, bizStep, navTargetD, dig8, codesParam, pdfClear, pdfStatus, pxOf, server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, dropBadPdf, krSession, quoteSession, omOffHours, resolveTicker, idxSettled, fxMarketOpen, spotFirst, KR_PREOPEN, dayRef, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, resolveNavRef, nearestFxDate, parseMinClose, needRegFix, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
 
 }

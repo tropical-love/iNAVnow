@@ -93,6 +93,7 @@ const SHIM = BRIDGE + `<script src="engine.js"></script>
       if(s.startsWith('/api/inav'))  return J(await ENGINE.computeINav(q.get('code') || ENGINE.DEFAULT_CODE));
       if(s.startsWith('/api/etfs'))  return J(await ENGINE.etfList());
       if(s.startsWith('/api/market'))return J(await ENGINE.marketQuotes());
+      if(s.startsWith('/api/chart')) return J(await ENGINE.chartBars(q.get('id') || '', q.get('r') || ''));
       // pdfinfo·px는 서버 라우트와 같은 엔진 함수를 부른다 — 로직을 여기에 다시 쓰지 않는다
       if(s.startsWith('/api/pdfinfo')){
         const only = ENGINE.codesParam(q.get('codes'));
