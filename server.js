@@ -1737,7 +1737,8 @@ async function marketQuotes() {
         return { name, value: ev, chg: ev - prev, chgPct: (ev / prev - 1) * 100, closed, est: true };
       }
     }
-    return { name, value: v, chg: prev ? v - prev : null, chgPct: prev ? (v / prev - 1) * 100 : null, closed };
+    // 여기까지 왔으면 선물은 10분 늦은 값 그대로다 — '지연'을 붙인다(환율은 늦지 않다)
+    return { name, value: v, chg: prev ? v - prev : null, chgPct: prev ? (v / prev - 1) * 100 : null, closed, delayed: !fx };
   };
   const jobs = [kr('KOSPI', '코스피', nf['^KS200'], '코스피200 야간선물'), kr('KOSDAQ', '코스닥', nf['^KQ150'], '코스닥150 야간선물')]
     .concat([['NQ=F', '나스닥 선물', false], ['KRW=X', '달러/원', true]].map(([s, n, fx]) => yf(s, n, fx)));
@@ -3960,7 +3961,7 @@ function mktRender(){
   if(!MKT) return;
   document.getElementById('mktbody').innerHTML = MKT.map(function(m){
     const amt = m.chg == null ? '—' : (m.chg>0?'▲':m.chg<0?'▼':'')+fmt(Math.abs(m.chg),2);
-    return '<div class="m"><div class="mn">'+esc(m.name)+(m.closed?'<span class="badge closed">마감</span>':m.vantage?'<span class="badge b추정" title="Vantage 나스닥100 선물 CFD(NAS100FT)의 실시간 값입니다. 등락은 CME 전일 정산가 기준입니다">Vantage</span>':m.est?'<span class="badge b추정" title="10분 늦은 선물 체결가에 그 뒤 움직임(나스닥100 추종 상품)을 반영한 추정값입니다">추정</span>':'')+'</div>'
+    return '<div class="m"><div class="mn">'+esc(m.name)+(m.closed?'<span class="badge closed">마감</span>':m.est?'<span class="badge b추정" title="10분 늦은 선물 체결가에 그 뒤 움직임(나스닥100 추종 상품)을 반영한 추정값입니다">추정</span>':m.delayed?'<span class="badge b추정" title="10분 늦은 시세입니다">지연</span>':'')+'</div>'
       + '<div class="mv">'+(m.value==null?'—':fmt(m.value,2))+'</div>'
       + '<div class="mc '+(m.chg?cls(m.chg):'muted')+'">'+amt+(m.chgPct==null?'':' '+sign(m.chgPct)+'%')+'</div></div>';
   }).join('');
