@@ -320,6 +320,11 @@ if (A) {
     assert.strictEqual(S.vtPick(26320, 26276, 26275), 26320, '같은 시각 야후와 수준이 맞으면 지금 값을 그대로 쓴다');
     assert.strictEqual(S.vtPick(26320, 26276, 26030), null, '0.3% 넘게 다르면(다른 월물) 쓰지 않는다');
     assert.strictEqual(S.vtPick(26320, null, 26275), null, '야후 체결 시각의 값을 모르면 쓰지 않는다');
+    { // 설정 창에 보이는 버전이 앱 버전과 같다
+      const g = require('path').join(__dirname, 'android/app/build.gradle');
+      if (require('fs').existsSync(g)) assert.strictEqual(S.APP_VERSION, /versionName '([^']+)'/.exec(require('fs').readFileSync(g, 'utf8'))[1], 'server.js APP_VERSION과 build.gradle versionName이 다르다');
+      assert.ok(S.HTML.includes('v' + S.APP_VERSION), '설정 창에 버전이 보여야 한다');
+    }
   }
   const kst = (d, hm) => Date.parse(d + 'T' + hm + ':00+09:00');
   assert.strictEqual(S.idxFutCode('01', kst('2026-11-26', '18:01')), 'A01612');

@@ -8,6 +8,8 @@
 // 안드로이드에서는 브라우저가 CORS로 외부 도메인을 막으므로 네이티브(OkHttp)가 대신 받아 준다.
 // 엔진을 <script src>로 싣기 전에 window.__net(url, opts) → Promise<Response>를 넣어 두면 된다.
 const NODE = typeof process !== 'undefined' && !!(process.versions && process.versions.node);
+// 설정 창 제목 옆에 보이는 버전. 안드로이드 versionName(android/app/build.gradle)과 같아야 한다(test.js가 본다).
+const APP_VERSION = '1.6.6';
 const http = NODE ? require('http') : null;
 const https = NODE ? require('https') : null;
 const zlib = NODE ? require('zlib') : null;
@@ -1853,9 +1855,10 @@ const VT_URL = 'wss://data.tradingview.com/socket.io/websocket?type=chart';
 const VT_IDLE_MS = 3 * 60e3;
 const VT_LIVE_MS = 45e3;     // 이보다 오래 아무 메시지(하트비트 포함)도 없으면 죽은 연결로 본다
 const VT_RETRY_MS = 60e3;    // 열기에 실패하거나 끊기면 이만큼은 다시 열지 않는다
-const VT_WAIT_MS = 2500;     // 처음 열 때 첫 시세·분봉을 이만큼 기다린다
+const VT_WAIT_MS = 4000;     // 처음 열 때 첫 시세·분봉을 이만큼 기다린다(폰은 TLS·첫 응답이 PC보다 느리다)
 const VT_MAX_GAP = 0.003;    // 같은 시각 야후 선물과 0.3% 넘게 다르면 다른 월물(또는 깨진 값)로 본다
-const vt = { ws: null, hist: [], bars: new Map(), msgAt: 0, failAt: 0, ready: null, idle: null };
+const vt = { ws: null, hist: [], bars: new Map(), msgAt: 0, failAt: 0, ready: null, idle: null,
+  why: '', usedAt: 0 }; // why·usedAt은 설정 창에 보여 줄 상태 — 왜 안 쓰였는지, 마지막으로 쓴 때
 function vtSocket() {
   if (NODE) return typeof WebSocket === 'function'
     ? new WebSocket(VT_URL, { headers: { Origin: 'https://www.tradingview.com' } }) : null;
@@ -1882,13 +1885,18 @@ function vtClose() {
 }
 function vtOpen() {
   let ws = null;
-  try { ws = vtSocket(); } catch (e) {}
-  if (!ws) { vt.failAt = Date.now(); return; }
+  try { ws = vtSocket(); } catch (e) { vt.why = '연결을 열지 못했습니다: ' + e.message; }
+  if (!ws) { vt.failAt = Date.now(); vt.why = vt.why || '이 환경에서는 웹소켓을 열 수 없습니다'; return; }
   vt.ws = ws; vt.hist = []; vt.bars = new Map(); vt.msgAt = Date.now();
   let done;
   vt.ready = new Promise(r => { done = r; });
   const send = (m, p) => { const s = JSON.stringify({ m, p }); ws.send(`~m~${s.length}~m~${s}`); };
-  const lost = () => { if (vt.ws !== ws) return; vtClose(); vt.failAt = Date.now(); done(); };
+  const lost = (why, e) => {
+    if (vt.ws !== ws) return;
+    const r = e && (e.reason || e.message || (e.error && e.error.message) || (e.code && 'code ' + e.code));
+    vt.why = why + (r ? ': ' + r : '');
+    vtClose(); vt.failAt = Date.now(); done();
+  };
   ws.onmessage = e => {
     if (vt.ws !== ws) return;
     vt.msgAt = Date.now();
@@ -1909,7 +1917,7 @@ function vtOpen() {
         send('create_series', ['cs_vt', 's1', 's1', 'sym', '1', 20, '']);
       } else if (j.m === 'qsd') {
         const q = j.p && j.p[1];
-        if (q && q.s === 'error') return lost(); // 심볼이 사라졌다
+        if (q && q.s === 'error') return lost('심볼을 받지 못했습니다'); // 심볼이 사라졌다
         if (q && q.v && q.v.lp > 0) vtPush(vt.hist, Date.now(), q.v.lp);
       } else if ((j.m === 'timescale_update' || j.m === 'du') && j.p && j.p[0] === 'cs_vt') {
         for (const b of (j.p[1] && j.p[1].s1 && j.p[1].s1.s) || []) {
@@ -1917,12 +1925,12 @@ function vtOpen() {
           vt.bars.set(t * 1e3, [t * 1e3, o, c]);
         }
         for (const t of vt.bars.keys()) if (Date.now() - t > 20 * 60e3) vt.bars.delete(t);
-      } else if (/error/.test(j.m || '')) return lost(); // critical_error·protocol_error·symbol_error
+      } else if (/error/.test(j.m || '')) return lost('트레이딩뷰 오류 ' + j.m); // critical_error·protocol_error·symbol_error
       if (vt.hist.length && vt.bars.size) done();
     }
   };
-  ws.onclose = lost;
-  ws.onerror = lost;
+  ws.onclose = e => lost('연결이 끊겼습니다', e);
+  ws.onerror = e => lost('연결 오류', e);
 }
 // 지금 값 cur를 쓸지 — 야후 체결 시각의 NAS100FT(base)가 야후 체결가(yv)와 같은 수준일 때만
 function vtPick(cur, base, yv) {
@@ -1932,10 +1940,10 @@ function vtPick(cur, base, yv) {
 // NAS100FT 지금 값. 모르거나 야후 선물(yt 시각 체결가 yv)과 수준이 다르면 null(→ 추종 상품 방식으로).
 async function vtQuote(yt, yv) {
   const now = Date.now();
-  if (!(yt > 0) || now - yt > GAP_MAX_AGE) return null;
-  if (vt.ws && now - vt.msgAt > VT_LIVE_MS) vtClose(); // 조용히 죽은 연결
+  if (!(yt > 0) || now - yt > GAP_MAX_AGE) { vt.why = 'CME 선물 시세가 15분 넘게 멈춰 있습니다'; return null; }
+  if (vt.ws && now - vt.msgAt > VT_LIVE_MS) { vtClose(); vt.why = '응답이 멈췄습니다'; } // 조용히 죽은 연결
   if (!vt.ws) {
-    if (now - vt.failAt < VT_RETRY_MS) return null;
+    if (now - vt.failAt < VT_RETRY_MS) return null; // 직전 실패 사유(vt.why)를 그대로 둔다
     vtOpen();
     if (!vt.ws) return null;
   }
@@ -1946,8 +1954,17 @@ async function vtQuote(yt, yv) {
     await Promise.race([vt.ready, new Promise(r => { const tm = setTimeout(r, VT_WAIT_MS); if (tm.unref) tm.unref(); })]);
   }
   const h = vt.hist;
-  if (!h.length) return null;
-  return vtPick(h[h.length - 1].v, vtHistAt(h, yt) ?? gapBarAt([...vt.bars.values()], yt), yv);
+  if (!h.length) { vt.why = vt.ws ? '첫 시세를 기다리는 중입니다' : vt.why; return null; }
+  const base = vtHistAt(h, yt) ?? gapBarAt([...vt.bars.values()], yt);
+  const v = vtPick(h[h.length - 1].v, base, yv);
+  if (v) { vt.why = ''; vt.usedAt = Date.now(); }
+  else vt.why = base > 0 ? `CME 선물과 ${(Math.abs(base / yv - 1) * 100).toFixed(2)}% 달라 쓰지 않습니다(다른 월물일 수 있음)`
+    : 'CME 체결 시각의 값을 아직 모릅니다';
+  return v;
+}
+// 설정 창용 상태 — 쓰고 있는지, 아니면 왜 안 쓰는지
+function vtStatus() {
+  return { used: !!vt.usedAt && Date.now() - vt.usedAt < 2 * 60e3, why: vt.why, open: !!vt.ws };
 }
 
 // ---------- 한국투자증권 Open API (선택) — 나스닥 선물 실시간 ----------
@@ -2186,7 +2203,7 @@ function futCodeOf(root, yahooName) {
 
 // 설정 창이 부르는 것들 — 상태에는 키 값을 넣지 않는다
 function kisStatus() {
-  return { set: !!kis, ok: kisLast.ok, error: kisLast.error, at: kisLast.at, fut: kisFut, refreshMs: kis ? KIS_REFRESH_MS : null };
+  return { set: !!kis, ok: kisLast.ok, error: kisLast.error, at: kisLast.at, fut: kisFut, refreshMs: kis ? KIS_REFRESH_MS : null, vt: vtStatus() };
 }
 async function kisSetKeys(b, probe = true) {
   const k = String(b?.appKey || '').trim(), s = String(b?.appSecret || '').trim();
@@ -3256,7 +3273,7 @@ const HTML = `<!doctype html>
 </details>
 <footer id="foot"></footer>
 <dialog id="cfgdlg"><div class="dlg">
-  <div class="row"><h2>설정</h2><button class="x" onclick="cfgdlg.close()">✕</button></div>
+  <div class="row"><h2>설정 <span class="muted" style="font-size:13px;font-weight:400">v${APP_VERSION}</span></h2><button class="x" onclick="cfgdlg.close()">✕</button></div>
   <div class="sec">
     <div class="muted">테마</div>
     <select id="theme">
@@ -3299,6 +3316,10 @@ const HTML = `<!doctype html>
       <button type="button" id="pdfrf" onclick="pdfReload()">지금 다시 받기</button>
     </div>
     <div class="hint">운용사가 올리는 때에 맞춰 <b>장 시작 전(08:00) · 마감 직후(15:40) · 저녁(19:00)</b> 세 번만 새로 받습니다. 리밸런싱이 늦게 반영됐을 때만 눌러 주세요.</div>
+  </div>
+  <div class="sec">
+    <div class="muted">나스닥 선물 실시간 (Vantage NAS100FT)</div>
+    <span class="hint" id="vtState" style="margin:0">확인 중…</span>
   </div>
   <div class="sec">
     <div class="muted">한국투자증권 Open API</div>
@@ -3481,6 +3502,10 @@ function syncCfgUI(){
 function openCfg(){ syncCfgUI(); document.getElementById('cfgdlg').showModal(); pdfInfo(); kisInfo(); }
 // 한국투자증권 키 — 저장된 키는 화면으로 돌아오지 않는다(있는지·마지막 호출 결과만 받는다)
 function kisShow(d){
+  // 나스닥 선물 카드가 Vantage 값을 쓰는지, 아니면 왜 못 쓰는지(그때는 추종 상품 '추정'·야후 '지연'으로 보인다)
+  const vs = document.getElementById('vtState'), v = d.vt || {};
+  vs.textContent = v.used ? '사용 중' : v.why ? '사용 안 함 · ' + v.why : '아직 받지 않았습니다(나스닥 선물 거래 시간에 받습니다)';
+  vs.className = !v.used && v.why ? 'hint up' : 'hint';
   const el = document.getElementById('kisState');
   document.getElementById('kisDelBtn').disabled = !d.set;
   if(d.error && !d.set){ el.textContent = d.error; el.className = 'hint up'; return; }
@@ -4534,6 +4559,6 @@ if (require.main === module) {
     try { fs.writeFileSync(__dirname + '/server.pid', String(process.pid)); } catch (e) {}
   });
 }
-module.exports = { gapHistAt, gapBarAt, gapCombine, nqGapRatio, vtPush, vtHistAt, vtPick, vtQuote, kisKrDays, kisIndexAsNaver, kisEtfAsIg, idxFutCode, kisBody, kisStatus, kisSetKeys, kisClear, kisKrQuotes, kisUsDay, kisEtfPrevNav, kisTop30Pdf, futCodeOf, kisLastPx, keepOnLoad, bizStep, navTargetD, dig8, codesParam, pdfClear, pdfStatus, pxOf, server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, dropBadPdf, krSession, quoteSession, omOffHours, resolveTicker, idxSettled, fxMarketOpen, spotFirst, KR_PREOPEN, dayRef, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, resolveNavRef, nearestFxDate, parseMinClose, needRegFix, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
+module.exports = { APP_VERSION, vtStatus, gapHistAt, gapBarAt, gapCombine, nqGapRatio, vtPush, vtHistAt, vtPick, vtQuote, kisKrDays, kisIndexAsNaver, kisEtfAsIg, idxFutCode, kisBody, kisStatus, kisSetKeys, kisClear, kisKrQuotes, kisUsDay, kisEtfPrevNav, kisTop30Pdf, futCodeOf, kisLastPx, keepOnLoad, bizStep, navTargetD, dig8, codesParam, pdfClear, pdfStatus, pxOf, server, handler, PORT, HTML, cached, cache, pdfCached, notePdfKey, pdfKeysOf, dropBadPdf, krSession, quoteSession, omOffHours, resolveTicker, idxSettled, fxMarketOpen, spotFirst, KR_PREOPEN, dayRef, marketPx, navIdxChg, pdfTtl, pdfTtlFor, pdfStdDt, pdfRetryTime, PDF_MARKS, notePdfSet, noteKrStatus, todayYmd, resolveNavRef, nearestFxDate, parseMinClose, needRegFix, parseKrDays, loadKrDays, isKrBiz, calClosedToday, SECTIGO_OV_CA };
 
 }

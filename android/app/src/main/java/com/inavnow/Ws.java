@@ -88,6 +88,7 @@ class Ws {
         Conn(String id) { this.id = id; }
 
         @Override public void run() {
+            String why = null; // 끊긴 이유 — 엔진이 설정 창에 보여 준다
             try {
                 Socket plain = new Socket();
                 raw = plain;
@@ -166,9 +167,10 @@ class Ws {
                 }
             } catch (Throwable t) {
                 if (!closed) android.util.Log.d("iNAVnow", "ws " + id + " 끊김: " + t);
+                why = t.getClass().getSimpleName() + (t.getMessage() != null ? " " + t.getMessage() : "");
             } finally {
                 close();
-                act.resolveWs(id, "close", null);
+                act.resolveWs(id, "close", why);
             }
         }
 

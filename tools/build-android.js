@@ -70,7 +70,7 @@ const BRIDGE = `<script>
     if(!o){ if(type !== 'close') try { AndroidNet.wsClose(id); } catch(e){} return; }
     if(type === 'open'){ o.readyState = 1; if(o.onopen) o.onopen({}); }
     else if(type === 'message'){ if(o.onmessage) o.onmessage({data: data}); }
-    else { socks.delete(id); o.readyState = 3; if(o.onclose) o.onclose({}); }
+    else { socks.delete(id); o.readyState = 3; if(o.onclose) o.onclose({reason: data || ''}); } // data = 네이티브가 본 끊긴 이유
   };
 })();
 </script>
