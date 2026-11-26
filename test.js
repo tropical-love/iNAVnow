@@ -317,6 +317,9 @@ if (A) {
     S.vtPush(vh, t0 + 20 * 60e3, 102);
     assert.strictEqual(vh.length, 2, '16분 넘은 기록은 버리되');
     assert.strictEqual(S.vtHistAt(vh, t0 + 15 * 60e3), 101, '그 뒤 값을 받치는 마지막 하나는 남겨야 한다');
+    assert.strictEqual(S.vtPick(26320, 26276, 26275), 26320, '같은 시각 야후와 수준이 맞으면 지금 값을 그대로 쓴다');
+    assert.strictEqual(S.vtPick(26320, 26276, 26030), null, '0.3% 넘게 다르면(다른 월물) 쓰지 않는다');
+    assert.strictEqual(S.vtPick(26320, null, 26275), null, '야후 체결 시각의 값을 모르면 쓰지 않는다');
   }
   const kst = (d, hm) => Date.parse(d + 'T' + hm + ':00+09:00');
   assert.strictEqual(S.idxFutCode('01', kst('2026-11-26', '18:01')), 'A01612');
